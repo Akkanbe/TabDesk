@@ -1,7 +1,7 @@
 import AppKit
 import ApplicationServices
 import AXShim
-import WTCCore
+import TabDeskCore
 
 /// v0 検証項目を実行するコントローラ。UI と URL スキームの両方から同じメソッドを叩く。
 @MainActor
@@ -485,7 +485,7 @@ final class PoCController {
         }
     }
 
-    // MARK: - URL スキーム(wtcpoc://command?key=value)
+    // MARK: - URL スキーム(tabdeskpoc://command?key=value)
 
     func handle(url: URL) {
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }

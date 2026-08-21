@@ -12,12 +12,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindow = mwc
         mwc.window.makeKeyAndOrderFront(nil)
         NSApp.activate()
-        logger.log("WTCPoC started. log file: \(logger.fileURL.path)")
+        logger.log("TabDeskPoC started. log file: \(logger.fileURL.path)")
         controller.status()
         controller.refresh()
     }
 
-    /// wtcpoc://... で届いたコマンドを処理する(起動時・起動中どちらも)。
+    /// tabdeskpoc://... で届いたコマンドを処理する(起動時・起動中どちらも)。
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
             controller.handle(url: url)
@@ -34,7 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appItem = NSMenuItem()
         mainMenu.addItem(appItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "Quit WTCPoC", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Quit TabDeskPoC", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
         let editItem = NSMenuItem()

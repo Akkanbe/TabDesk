@@ -1,6 +1,6 @@
 import AppKit
 import AXShim
-import WTCCore
+import TabDeskCore
 
 /// PoC の操作画面。ボタンはすべて PoCController のメソッドに 1 対 1 で対応する。
 @MainActor
@@ -25,7 +25,7 @@ final class MainWindowController: NSObject, NSTableViewDataSource, NSTableViewDe
             backing: .buffered, defer: false)
         super.init()
 
-        window.title = "WTC PoC (v0)"
+        window.title = "TabDesk PoC (v0)"
         window.center()
         window.contentView = buildContent()
 

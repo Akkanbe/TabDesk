@@ -4,7 +4,7 @@
 #   scripts/poc.sh 'add?set=A&wid=123,456'
 #   scripts/poc.sh 'show?set=B'
 #   scripts/poc.sh 'bench?rounds=10&parallel=1'
-# 結果は ~/Library/Logs/WTCPoC/poc.log に出る(scripts/poc.sh log で末尾表示)。
+# 結果は ~/Library/Logs/TabDeskPoC/poc.log に出る(scripts/poc.sh log で末尾表示)。
 set -euo pipefail
 cmd="${1:-}"
 if [[ -z "$cmd" ]]; then
@@ -12,7 +12,7 @@ if [[ -z "$cmd" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "log" ]]; then
-  tail -n "${2:-40}" "$HOME/Library/Logs/WTCPoC/poc.log"
+  tail -n "${2:-40}" "$HOME/Library/Logs/TabDeskPoC/poc.log"
   exit 0
 fi
-open -g "wtcpoc://$cmd"
+open -g "tabdeskpoc://$cmd"

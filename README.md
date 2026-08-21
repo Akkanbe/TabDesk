@@ -1,11 +1,12 @@
-# windows-tab-controller
+# TabDesk
 
 macOS で他アプリのウィンドウを「タブ」として管理するユーティリティ(開発中)。
+リポジトリ: https://github.com/Akkanbe/TabDesk
 仕様は [docs/01_spec.md](docs/01_spec.md) を参照。
 
 ## 現在の状態: v0 技術検証 PoC
 
-`WTCPoC` は、仕様書 §5 の v0 チェックリストを実機で確認するための検証アプリです。
+`TabDeskPoC` は、仕様書 §5 の v0 チェックリストを実機で確認するための検証アプリです。
 製品 UI ではありません。
 
 ### ビルドと起動
@@ -13,16 +14,17 @@ macOS で他アプリのウィンドウを「タブ」として管理するユ�
 フル Xcode は不要(Command Line Tools の Swift で足ります)。
 
 ```bash
-./scripts/build_app.sh      # swift build → build/WTCPoC.app を組み立て(ad-hoc 署名)
-open build/WTCPoC.app
+./scripts/build_app.sh      # swift build → build/TabDeskPoC.app を組み立て
+                            # 署名: CODESIGN_IDENTITY > 「WTC Dev」証明書があれば自動使用 > ad-hoc
+open build/TabDeskPoC.app
 ```
 
 初回起動時に「権限をリクエスト」を押し、システム設定 > プライバシーとセキュリティ >
-アクセシビリティ で WTCPoC を ON にしてください。
+アクセシビリティ で TabDeskPoC を ON にしてください。
 
 **注意(ad-hoc 署名の制約)**: 再ビルドすると署名ハッシュが変わり、設定上は ON のままでも
-権限が効かなくなります。OFF → ON では直らないので、アクセシビリティの一覧で WTCPoC を
-「−」で削除してから「+」で `build/WTCPoC.app` を追加し直してください。
+権限が効かなくなります。OFF → ON では直らないので、アクセシビリティの一覧で TabDeskPoC を
+「−」で削除してから「+」で `build/TabDeskPoC.app` を追加し直してください。
 
 #### 再ビルドごとの再付与を避ける(推奨): 自己署名証明書で署名する
 
@@ -30,8 +32,10 @@ TCC はアプリを「署名の識別情報」で覚えます。ad-hoc 署名は
 自己署名でも証明書で署名すれば識別情報が安定し、再ビルド後も権限が維持されます。
 
 1. キーチェーンアクセス.app を開く → メニュー「キーチェーンアクセス」>「証明書アシスタント」>「証明書を作成...」
-2. 名前: `WTC Dev` / 固有名のタイプ: 自己署名ルート / 証明書のタイプ: **コード署名** → 「作成」
-3. 以後は識別名を指定してビルドする:
+2. 名前: `WTC Dev`(任意の名前でよい。別名にした場合は `CODESIGN_IDENTITY` で指定)/
+   固有名のタイプ: 自己署名ルート / 証明書のタイプ: **コード署名** → 「作成」
+3. 作成した証明書をダブルクリック → 「信頼」>「コード署名」を「常に信頼」にする
+4. 以後は識別名を指定してビルドする(`WTC Dev` なら自動検出されるので指定不要):
 
 ```bash
 CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
@@ -49,11 +53,11 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
 6. 「スナップバック監視」ON にして、表示中のウィンドウを手でドラッグ → 元の位置に戻るか確認
 7. 「編集モード」ON の間は、動かした位置が新しい固定位置として記憶される
 
-ログは画面下部と `~/Library/Logs/WTCPoC/poc.log` に出ます。
+ログは画面下部と `~/Library/Logs/TabDeskPoC/poc.log` に出ます。
 
 ### URL スキームによる操作(自動化用)
 
-起動中のアプリに `wtcpoc://` で同じ操作を送れます。
+起動中のアプリに `tabdeskpoc://` で同じ操作を送れます。
 
 ```bash
 scripts/poc.sh status
@@ -72,8 +76,8 @@ scripts/poc.sh log                          # ログ末尾を表示
 
 ```text
 Sources/AXShim/    私有関数 _AXUIElementGetWindow を dlsym で解決する C シム(私有 API 依存はここだけ)
-Sources/WTCCore/   AX ラッパー(ウィンドウ操作・列挙・通知・座標変換)。v1 本体で再利用
-Sources/WTCPoC/    v0 検証アプリ
+Sources/TabDeskCore/   AX ラッパー(ウィンドウ操作・列挙・通知・座標変換)。v1 本体で再利用
+Sources/TabDeskPoC/    v0 検証アプリ
 Resources/PoC/     PoC の Info.plist
 scripts/           ビルド・操作スクリプト
 docs/              仕様書

@@ -5,13 +5,13 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>ja</string>
 	<key>CFBundleExecutable</key>
-	<string>WTCPoC</string>
+	<string>TabDeskPoC</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.wtc.poc</string>
+	<string>io.github.akkanbe.tabdesk.poc</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>WTCPoC</string>
+	<string>TabDeskPoC</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -28,10 +28,10 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>local.wtc.poc.command</string>
+			<string>io.github.akkanbe.tabdesk.poc.command</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>wtcpoc</string>
+				<string>tabdeskpoc</string>
 			</array>
 		</dict>
 	</array>

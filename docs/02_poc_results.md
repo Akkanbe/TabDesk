@@ -3,7 +3,8 @@
 実施日: 2026-08-20 / 環境: MacBook (Apple M5) macOS 26.5.2、Swift 6.3.3 (Command Line Tools)、
 主ディスプレイ = 内蔵 2880×1864(論理 1920×1200)、外部ディスプレイ 3 枚接続
 
-検証アプリ: `WTCPoC`(ad-hoc 署名の .app)。ログ: `~/Library/Logs/WTCPoC/poc.log`
+検証アプリ: `TabDeskPoC`(検証当時の名称は WTCPoC、ad-hoc 署名の .app)。
+本書の実測ログ: `~/Library/Logs/WTCPoC/poc.log`(検証当時のパス。改名後のビルドは `~/Library/Logs/TabDeskPoC/poc.log` に出力)
 
 ## 結果サマリ
 

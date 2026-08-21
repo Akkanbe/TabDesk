@@ -1,4 +1,4 @@
-# windows-tab-controller 仕様書 v1(ドラフト)
+# TabDesk 仕様書 v1(ドラフト)
 
 作成日: 2026-08-20 / 壁打ちセッションの決定事項を反映。未決事項は末尾に列挙。
 2026-08-20 更新: v0 技術検証(docs/02_poc_results.md)の実測結果で §2.3 / §3.3 / §3.5 / §4 / §5 を改訂。
@@ -139,7 +139,7 @@ macOS 上で他アプリのウィンドウを「タブ」として管理する�
 
 ### 3.8 永続化と復元
 
-- 保存先:`~/Library/Application Support/<AppName>/state.json`(変更時+定期保存)
+- 保存先:`~/Library/Application Support/TabDesk/state.json`(変更時+定期保存)
 - 保存内容:タブ定義(名前・並び)、各登録ウィンドウの
   {bundle ID, アプリ名, タイトル, 固定 frame, 登録時サイズ}
 - 実行中のウィンドウ同定は CGWindowID(セッション内でのみ有効)
@@ -158,6 +158,9 @@ macOS 上で他アプリのウィンドウを「タブ」として管理する�
 - 対応 OS:macOS 26 Tahoe(開発機 26.5)。将来的に 15 Sequoia も視野
 - 常駐時 CPU 負荷:アイドルでほぼ 0%(ポーリングは軽量な列挙のみ)
 - 権限:Accessibility のみ。初回起動時に `AXIsProcessTrustedWithOptions` で付与導線を出す
+- 識別子:bundle ID は `io.github.akkanbe.tabdesk`(PoC は `io.github.akkanbe.tabdesk.poc`)。
+  独自ドメインを持った場合は Info.plist の CFBundleIdentifier / CFBundleURLName と
+  scripts/build_app.sh の `codesign --identifier` の 3 箇所を変える
 - 配布形態:v1 はローカルビルド(.app バンドル)。v2 で Developer ID 署名+公証
 - 開発時の署名:ad-hoc 署名は再ビルドごとに TCC の権限が外れる(OFF→ON では直らず再登録が必要)ため、
   自己署名証明書「WTC Dev」(コード署名・常に信頼)で署名する。scripts/build_app.sh が自動検出する
@@ -194,7 +197,7 @@ macOS 上で他アプリのウィンドウを「タブ」として管理する�
 
 ## 6. 未決事項
 
-- [ ] アプリ名(仮: windows-tab-controller)
+- [x] アプリ名: **TabDesk**(GitHub: https://github.com/Akkanbe/TabDesk、bundle ID: `io.github.akkanbe.tabdesk`)
 - [ ] ホットキーのデフォルト割当(候補: Ctrl+1..9 でタブ切替、他は要検討)
 - [ ] サイドバーの幅・自動非表示オプションの要否
 - [ ] 除外アプリリスト(登録候補から常に外すアプリ)の要否

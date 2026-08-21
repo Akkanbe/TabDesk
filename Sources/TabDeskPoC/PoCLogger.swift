@@ -1,6 +1,6 @@
 import Foundation
 
-/// 画面のログ欄・標準出力・ファイル(~/Library/Logs/WTCPoC/poc.log)に同じ行を書く。
+/// 画面のログ欄・標準出力・ファイル(~/Library/Logs/TabDeskPoC/poc.log)に同じ行を書く。
 /// ファイルに残すのは、`open` で起動したアプリの stdout は誰にも見えないため。
 final class PoCLogger: @unchecked Sendable {
     typealias Sink = @MainActor @Sendable (String) -> Void
@@ -12,7 +12,7 @@ final class PoCLogger: @unchecked Sendable {
 
     init() {
         let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/WTCPoC", isDirectory: true)
+            .appendingPathComponent("Library/Logs/TabDeskPoC", isDirectory: true)
         fileURL = dir.appendingPathComponent("poc.log")
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

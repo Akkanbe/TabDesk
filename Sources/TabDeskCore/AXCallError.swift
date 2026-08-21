@@ -11,13 +11,13 @@ public struct AXCallError: Error, CustomStringConvertible, Sendable {
     }
 
     public var description: String {
-        "\(operation) failed: \(code.wtcDescription)"
+        "\(operation) failed: \(code.readableDescription)"
     }
 }
 
 extension AXError {
     /// 人間が読めるエラー名。apiDisabled は「Accessibility 権限なし」を意味するので特に重要。
-    public var wtcDescription: String {
+    public var readableDescription: String {
         switch self {
         case .success: return "success"
         case .failure: return "failure"

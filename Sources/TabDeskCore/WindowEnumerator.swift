@@ -61,8 +61,8 @@ public enum WindowEnumerator {
             do {
                 elements = try AXAttributes.elements(appElement, kAXWindowsAttribute)
             } catch let error as AXCallError {
-                stats.appFailures[error.code.wtcDescription, default: 0] += 1
-                stats.appFailureDetails.append("\(appName): \(error.code.wtcDescription)")
+                stats.appFailures[error.code.readableDescription, default: 0] += 1
+                stats.appFailureDetails.append("\(appName): \(error.code.readableDescription)")
                 continue
             } catch {
                 stats.appFailures["\(error)", default: 0] += 1
@@ -76,10 +76,10 @@ public enum WindowEnumerator {
                 do {
                     window = try AXWindow(element: element, pid: pid)
                 } catch let error as AXCallError {
-                    stats.windowIDFailures[error.code.wtcDescription, default: 0] += 1
+                    stats.windowIDFailures[error.code.readableDescription, default: 0] += 1
                     let role = (try? AXAttributes.string(element, kAXRoleAttribute)) ?? "?"
                     let subrole = (try? AXAttributes.string(element, kAXSubroleAttribute)) ?? "?"
-                    stats.windowIDFailureDetails.append("\(appName) [\(role)/\(subrole)]: \(error.code.wtcDescription)")
+                    stats.windowIDFailureDetails.append("\(appName) [\(role)/\(subrole)]: \(error.code.readableDescription)")
                     continue
                 } catch {
                     stats.windowIDFailures["\(error)", default: 0] += 1
