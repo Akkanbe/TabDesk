@@ -23,5 +23,11 @@ let package = Package(
             dependencies: ["TabDeskCore"],
             path: "Sources/TabDeskPoC"
         ),
+        // Accessibility 権限なしで動くユニットテスト(WindowDriver を偽物に差し替える)。
+        .testTarget(
+            name: "TabDeskCoreTests",
+            dependencies: ["TabDeskCore"],
+            path: "Tests/TabDeskCoreTests"
+        ),
     ]
 )

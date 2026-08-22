@@ -107,10 +107,19 @@ public enum WindowEnumerator {
     }
 
     /// CGWindowList 側から見た画面上のウィンドウ ID(_AXUIElementGetWindow の答え合わせ用)。
+    /// 最小化・別 Space・フルスクリーン中の窓は含まないので、`TabEngine.reconcile` には渡さないこと。
     public static func onScreenWindowIDs() -> Set<CGWindowID> {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-            as? [[String: Any]]
-        else { return [] }
+        windowIDs(options: [.optionOnScreenOnly, .excludeDesktopElements])
+    }
+
+    /// 存在する全ウィンドウの ID(最小化・別 Space・フルスクリーン中も含む)。`TabEngine.reconcile` に渡す用。
+    /// 列挙に失敗したときは空集合(reconcile 側は空集合なら削除しない)。
+    public static func existingWindowIDs() -> Set<CGWindowID> {
+        windowIDs(options: [.optionAll, .excludeDesktopElements])
+    }
+
+    private static func windowIDs(options: CGWindowListOption) -> Set<CGWindowID> {
+        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
         var ids = Set<CGWindowID>()
         for info in list {
             // layer 0 が通常ウィンドウ。メニューバー等のオーバーレイは除外。

@@ -43,6 +43,15 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
 
 証明書を切り替えた直後の 1 回だけは、上記の「−」→「+」で再登録が必要です。
 
+### テスト
+
+```bash
+./scripts/test.sh        # TabDeskCore のユニットテスト(Accessibility 権限不要)
+```
+
+エンジンは `WindowDriver` プロトコル越しにしかウィンドウを触らないので、テストでは偽のドライバを
+差し込んで切替・復元・整合性維持のロジックを検証している。設計は [docs/03_core_design.md](docs/03_core_design.md)。
+
 ### 画面の使い方
 
 1. 「ウィンドウ一覧を更新」で他アプリの標準ウィンドウを列挙(WID = CGWindowID)
@@ -76,7 +85,8 @@ scripts/poc.sh log                          # ログ末尾を表示
 
 ```text
 Sources/AXShim/    私有関数 _AXUIElementGetWindow を dlsym で解決する C シム(私有 API 依存はここだけ)
-Sources/TabDeskCore/   AX ラッパー(ウィンドウ操作・列挙・通知・座標変換)。v1 本体で再利用
+Sources/TabDeskCore/   コアモジュール: データモデル・TabEngine(切替/復元/整合性)・AX ラッパー
+Tests/TabDeskCoreTests/ エンジンのユニットテスト(偽ドライバ使用)
 Sources/TabDeskPoC/    v0 検証アプリ
 Resources/PoC/     PoC の Info.plist
 scripts/           ビルド・操作スクリプト

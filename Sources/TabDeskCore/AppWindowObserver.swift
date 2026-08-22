@@ -15,10 +15,13 @@ public final class AppWindowObserver {
     private let handler: Handler
     private var isValid = true
 
-    public init(pid: pid_t, notifications: [String], handler: @escaping Handler) throws {
+    /// - Parameter messagingTimeout: 登録(AXObserverAddNotification)は相手アプリへの同期 IPC で、
+    ///   無応答アプリだとメインスレッドが止まる。上限をここで切る(秒)。
+    public init(pid: pid_t, notifications: [String], messagingTimeout: Float = 1.0, handler: @escaping Handler) throws {
         self.pid = pid
         self.handler = handler
         self.appElement = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appElement, messagingTimeout)
 
         var created: AXObserver?
         let err = AXObserverCreate(pid, axObserverCallback, &created)
