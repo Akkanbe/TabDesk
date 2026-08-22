@@ -30,16 +30,26 @@ public final class AppWindowObserver {
         }
         self.observer = created
 
-        // C コールバックに self を渡すための生ポインタ。所有権は移さない(unretained)。
-        let refcon = Unmanaged.passUnretained(self).toOpaque()
         for name in notifications {
-            let addErr = AXObserverAddNotification(created, appElement, name as CFString, refcon)
-            guard addErr == .success else {
-                throw AXCallError(operation: "AXObserverAddNotification(\(name), pid \(pid))", code: addErr)
-            }
+            try addNotification(name)
         }
         // メインのランループに載せるので、コールバックは必ずメインスレッドで呼ばれる。
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .defaultMode)
+    }
+
+    /// 通知を追加する。`element` が nil ならアプリ要素(= そのアプリの全ウィンドウが対象)。
+    /// kAXUIElementDestroyed のようにウィンドウ要素ごとに登録が必要な通知は element を指定する。
+    public func addNotification(_ name: String, element: AXUIElement? = nil) throws {
+        // C コールバックに self を渡すための生ポインタ。所有権は移さない(unretained)。
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        let err = AXObserverAddNotification(observer, element ?? appElement, name as CFString, refcon)
+        guard err == .success || err == .notificationAlreadyRegistered else {
+            throw AXCallError(operation: "AXObserverAddNotification(\(name), pid \(pid))", code: err)
+        }
+    }
+
+    public func removeNotification(_ name: String, element: AXUIElement? = nil) {
+        AXObserverRemoveNotification(observer, element ?? appElement, name as CFString)
     }
 
     /// 購読を止める。deinit に頼らず明示的に呼ぶ(呼び忘れても二重解除にはならない)。

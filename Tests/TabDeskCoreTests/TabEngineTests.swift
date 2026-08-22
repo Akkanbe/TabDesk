@@ -617,3 +617,81 @@ struct ReviewFollowUpTests {
         #expect(driver.currentFrame(1) == content, "must not be left in the corner")
     }
 }
+
+@MainActor
+struct TerminationTests {
+    @Test func releaseAllParkedWindowsRestoresFramesWithoutChangingState() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        driver.add(2, frame: content)
+        let left = CGRect(x: 240, y: 30, width: 840, height: 1090)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
+        let wb = try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: left, into: b.id)
+        #expect(driver.currentFrame(2)?.origin == park)
+
+        await engine.releaseAllParkedWindows()
+        #expect(driver.currentFrame(2) == left, "parked window returned to its frame")
+        #expect(driver.currentFrame(1) == content, "visible window untouched")
+        #expect(engine.state.tabs.count == 2 && engine.state.activeTabID == a.id)
+        #expect(engine.state.managedWindow(id: wb.id) != nil, "registration kept")
+        #expect(!engine.parkedWindowIDs.contains(wb.id))
+    }
+}
+
+@MainActor
+struct ContentAreaClampTests {
+    @Test func registerAndSetFrameStayOutOfSidebarArea() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        let underSidebar = CGRect(x: 40, y: 10, width: 800, height: 600)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: underSidebar, into: a.id)
+        #expect(managed.frame.origin == content.origin, "pulled to the content area origin")
+        #expect(driver.currentFrame(1)?.origin == content.origin)
+
+        let actual = try await engine.setFrame(CGRect(x: 100, y: 500, width: 800, height: 600), of: managed.id)
+        #expect(actual.minX == content.minX)
+        #expect(actual.minY == 500)
+    }
+
+    @Test func editModeClampsRecordedFrameAndMovesWindow() async throws {
+        let (engine, driver) = makeEngine(debounceMs: 10)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        engine.editMode = true
+        driver.moveExternally(1, to: CGRect(x: 50, y: 100, width: 800, height: 600))
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(60))
+        let expected = CGRect(x: content.minX, y: 100, width: 800, height: 600)
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == expected)
+        #expect(driver.currentFrame(1) == expected, "window nudged out of the sidebar area")
+    }
+
+    @Test func oversizedWindowAlignsToContentOrigin() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: -500, y: -200, width: 2000, height: 1500))
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("big"), frame: CGRect(x: -500, y: -200, width: 2000, height: 1500), into: a.id)
+        #expect(managed.frame.origin == content.origin)
+        #expect(managed.frame.size == CGSize(width: 2000, height: 1500), "size is not changed by clamping")
+    }
+}
+
+@MainActor
+struct FlushTests {
+    @Test func flushRestoresImmediatelyWithoutWaitingForDebounce() async throws {
+        let (engine, driver) = makeEngine(debounceMs: 2000)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        driver.moveExternally(1, to: CGRect(x: 500, y: 300, width: 1680, height: 1090))
+        engine.windowFrameDidChange(windowID: 1)
+        engine.flushPendingRestores()  // マウスアップ相当
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(driver.currentFrame(1) == content)
+    }
+}

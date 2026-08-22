@@ -17,6 +17,12 @@ let package = Package(
             dependencies: ["AXShim"],
             path: "Sources/TabDeskCore"
         ),
+        // 本体アプリ(サイドバー UI + AX 配線)。
+        .executableTarget(
+            name: "TabDesk",
+            dependencies: ["TabDeskCore"],
+            path: "Sources/TabDesk"
+        ),
         // v0 技術検証用の GUI アプリ。
         .executableTarget(
             name: "TabDeskPoC",

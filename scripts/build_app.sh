@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# PoC をビルドして build/TabDeskPoC.app に .app バンドルとして組み立てる。
+# アプリをビルドして build/<PRODUCT>.app に .app バンドルとして組み立てる。
+#   ./scripts/build_app.sh              # 本体 TabDesk
+#   PRODUCT=TabDeskPoC ./scripts/build_app.sh   # v0 検証アプリ
 # Accessibility 権限(TCC)はバンドル単位で付与されるため、素のバイナリではなく .app にする。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONFIG="${CONFIG:-debug}"
-APP="build/TabDeskPoC.app"
+PRODUCT="${PRODUCT:-TabDesk}"
+PLIST="Resources/$PRODUCT/Info.plist"
+APP="build/$PRODUCT.app"
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$PLIST")"
 
-swift build -c "$CONFIG" --product TabDeskPoC
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/TabDeskPoC"
+swift build -c "$CONFIG" --product "$PRODUCT"
+BIN="$(swift build -c "$CONFIG" --show-bin-path)/$PRODUCT"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-cp "$BIN" "$APP/Contents/MacOS/TabDeskPoC"
-cp Resources/PoC/Info.plist "$APP/Contents/Info.plist"
+cp "$BIN" "$APP/Contents/MacOS/$PRODUCT"
+cp "$PLIST" "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # 署名 ID の決定: 環境変数 > 自己署名証明書 "WTC Dev"(あれば) > ad-hoc("-")。
@@ -27,7 +32,7 @@ if [[ -z "$IDENTITY" ]]; then
     IDENTITY="-"
   fi
 fi
-codesign --force --sign "$IDENTITY" --identifier io.github.akkanbe.tabdesk.poc "$APP"
+codesign --force --sign "$IDENTITY" --identifier "$BUNDLE_ID" "$APP"
 echo "signed with: $IDENTITY"
 
 echo "built: $APP"

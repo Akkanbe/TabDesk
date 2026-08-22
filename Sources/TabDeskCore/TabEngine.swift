@@ -71,7 +71,7 @@ public final class TabEngine {
     private let layout: any ScreenLayout
     private let config: Configuration
     private let executor = BlockingExecutor()
-    private var pendingRestores: [UUID: Task<Void, Never>] = [:]
+    private var pendingRestores: [UUID: (task: Task<Void, Never>, attempt: Int)] = [:]
     private var isBusy = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -148,6 +148,7 @@ public final class TabEngine {
             if let existing = state.managedWindow(forWindowID: windowID) {
                 throw EngineError.windowAlreadyRegistered(windowID: windowID, managedID: existing.window.id)
             }
+            let frame = clamped(frame)
             var managed = ManagedWindow(frame: frame, identity: identity, windowID: windowID, pid: pid)
             let driver = self.driver
             let intoActive = tabID == state.activeTabID
@@ -180,6 +181,16 @@ public final class TabEngine {
         }
     }
 
+    /// アプリ終了前に呼ぶ。退避中(および非アクティブタブ)の全ウィンドウを固定 frame に戻す。
+    /// 状態(タブ・登録)は変えない。切替が進行中なら順番を待つ。
+    public func releaseAllParkedWindows() async {
+        await serialized {
+            for tab in state.tabs {
+                await releaseAll(tab.windows, from: tab)
+            }
+        }
+    }
+
     /// AX の destroyed 通知から呼ぶ。実ウィンドウが消えたので登録を外す。
     public func noteWindowDestroyed(windowID: CGWindowID) {
         guard let found = state.managedWindow(forWindowID: windowID) else { return }
@@ -201,6 +212,7 @@ public final class TabEngine {
     public func setFrame(_ frame: CGRect, of id: UUID) async throws -> CGRect {
         try await serialized {
             guard let found = state.managedWindow(id: id) else { throw EngineError.unknownWindow(id) }
+            let frame = clamped(frame)
             cancelPendingRestore(id)
             guard let windowID = found.window.windowID, !parkedWindowIDs.contains(id),
                 found.tab.id == state.activeTabID
@@ -276,53 +288,61 @@ public final class TabEngine {
         guard let found = state.managedWindow(forWindowID: windowID) else { return }
         let managed = found.window
         // 退避操作そのものが通知を発火させる。退避中の通知は編集モードでも記録しない。
-        guard !parkedWindowIDs.contains(managed.id) else { return }
-
-        if editMode {
-            let driver = self.driver
-            let id = managed.id
-            Task { [weak self] in
-                guard let self else { return }
-                // 読み取りは IPC なのでロックの外で行い、記録の直前に退避されていないか確認する。
-                guard let current = try? await self.executor.run({ try driver.frame(of: windowID) }) else { return }
-                await self.serialized {
-                    guard self.editMode, !self.parkedWindowIDs.contains(id) else { return }
-                    self.updateFrame(id, current)
-                }
-            }
-            return
-        }
-        guard found.tab.id == state.activeTabID else { return }
+        guard !parkedWindowIDs.contains(managed.id), found.tab.id == state.activeTabID else { return }
+        // 通常モードは静止後に復元、編集モードは静止後に記録(どちらもデバウンス。ドラッグ中は触らない)。
         scheduleRestore(managed.id, attempt: 1)
     }
 
     private func scheduleRestore(_ id: UUID, attempt: Int) {
-        pendingRestores[id]?.cancel()
+        pendingRestores[id]?.task.cancel()
         let delay = config.debounce
-        pendingRestores[id] = Task { [weak self] in
+        let task = Task { [weak self] in
             do {
                 try await Task.sleep(for: delay)
             } catch {
-                return  // キャンセル(= 新しい通知で延長された)
+                return  // キャンセル(= 新しい通知で延長された、または flush で即時実行された)
             }
             await self?.performRestore(id, attempt: attempt)
+        }
+        pendingRestores[id] = (task, attempt)
+    }
+
+    /// デバウンス待ちの復元/記録を待たずに今すぐ実行する。
+    /// マウスボタンが離された瞬間に呼ぶと、ドラッグ終了と同時に窓が戻る(250 ms 待たない)。
+    public func flushPendingRestores() {
+        let pending = pendingRestores
+        pendingRestores.removeAll()
+        for (id, entry) in pending {
+            entry.task.cancel()
+            Task { [weak self] in await self?.performRestore(id, attempt: entry.attempt) }
         }
     }
 
     private func performRestore(_ id: UUID, attempt: Int) async {
         pendingRestores[id] = nil
         guard let found = state.managedWindow(id: id), let windowID = found.window.windowID,
-            !parkedWindowIDs.contains(id), found.tab.id == state.activeTabID, !editMode
+            !parkedWindowIDs.contains(id), found.tab.id == state.activeTabID
         else { return }
         let driver = self.driver
         // 読み取り(IPC)はロックの外。相手アプリが遅くても他の操作を待たせない。
         guard let current = try? await executor.run({ try driver.frame(of: windowID) }) else { return }
 
         await serialized {
-            // ロック待ちの間に切替・解除・編集が走っていることがあるので前提を見直す。
+            // ロック待ちの間に切替・解除が走っていることがあるので前提を見直す。
             guard let found = state.managedWindow(id: id), !parkedWindowIDs.contains(id),
-                found.tab.id == state.activeTabID, !editMode
+                found.tab.id == state.activeTabID
             else { return }
+            if editMode {
+                // 編集モード: 静止した位置を新しい固定 frame として記録する。
+                // サイドバー領域に置かれた場合はコンテンツ領域へ寄せ、窓もそこへ動かす。
+                let target = clamped(current)
+                updateFrame(id, target)
+                if !approximatelyEqual(target, current) {
+                    _ = try? await executor.run { try driver.setFrame(target, of: windowID) }
+                }
+                log("edit: recorded \(target) for \(found.window.identity.appName)")
+                return
+            }
             let recorded = found.window.frame
             if approximatelyEqual(current, recorded) { return }
             do {
@@ -582,7 +602,7 @@ public final class TabEngine {
     }
 
     private func cancelPendingRestore(_ id: UUID) {
-        pendingRestores[id]?.cancel()
+        pendingRestores[id]?.task.cancel()
         pendingRestores[id] = nil
     }
 
@@ -593,6 +613,17 @@ public final class TabEngine {
 
     private func tab(_ id: UUID) throws -> Tab {
         state.tabs[try tabIndex(id)]
+    }
+
+    /// 固定 frame をコンテンツ領域(サイドバーを除いた範囲)に収める。サイズは変えず位置だけ寄せる。
+    /// 領域より大きい窓は領域の原点に揃える(はみ出しは許容)。仕様 §3.2「サイドバー領域は配置領域から除外」。
+    private func clamped(_ frame: CGRect) -> CGRect {
+        let area = layout.contentArea
+        guard area.width > 0, area.height > 0 else { return frame }
+        var f = frame
+        f.origin.x = min(max(f.minX, area.minX), max(area.minX, area.maxX - f.width))
+        f.origin.y = min(max(f.minY, area.minY), max(area.minY, area.maxY - f.height))
+        return f
     }
 
     private func approximatelyEqual(_ a: CGRect, _ b: CGRect) -> Bool {

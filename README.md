@@ -4,27 +4,23 @@ macOS で他アプリのウィンドウを「タブ」として管理するユ�
 リポジトリ: https://github.com/Akkanbe/TabDesk
 仕様は [docs/01_spec.md](docs/01_spec.md) を参照。
 
-## 現在の状態: v0 技術検証 PoC
-
-`TabDeskPoC` は、仕様書 §5 の v0 チェックリストを実機で確認するための検証アプリです。
-製品 UI ではありません。
-
-### ビルドと起動
+## 現在の状態: v1 開発中(段階 2: サイドバー UI + AX 配線)
 
 フル Xcode は不要(Command Line Tools の Swift で足ります)。
 
 ```bash
-./scripts/build_app.sh      # swift build → build/TabDeskPoC.app を組み立て
+./scripts/build_app.sh      # swift build → build/TabDesk.app を組み立て
                             # 署名: CODESIGN_IDENTITY > 「WTC Dev」証明書があれば自動使用 > ad-hoc
-open build/TabDeskPoC.app
+open build/TabDesk.app
 ```
 
-初回起動時に「権限をリクエスト」を押し、システム設定 > プライバシーとセキュリティ >
-アクセシビリティ で TabDeskPoC を ON にしてください。
+TabDesk はメニューバー常駐アプリ(Dock には出ない)。起動すると主ディスプレイの左端にサイドバーが出る。
+初回起動時にシステムの権限ダイアログが自動で出るので、システム設定 > プライバシーとセキュリティ >
+アクセシビリティ で TabDesk を ON にする(ダイアログを閉じてしまった場合はサイドバー上部の「権限をリクエスト」で再表示できる)。
 
-**注意(ad-hoc 署名の制約)**: 再ビルドすると署名ハッシュが変わり、設定上は ON のままでも
-権限が効かなくなります。OFF → ON では直らないので、アクセシビリティの一覧で TabDeskPoC を
-「−」で削除してから「+」で `build/TabDeskPoC.app` を追加し直してください。
+**注意(ad-hoc 署名の制約)**: 「WTC Dev」証明書が無い環境では ad-hoc 署名になります(ビルド末尾に `signed with: -` と出ます)。
+この場合、再ビルドすると署名ハッシュが変わり、設定上は ON のままでも権限が効かなくなります(ログ先頭の `trusted=false` で分かります)。OFF → ON では直らないので、アクセシビリティの一覧で TabDesk を
+「−」で削除してから「+」で `build/TabDesk.app` を追加し直してください。
 
 #### 再ビルドごとの再付与を避ける(推奨): 自己署名証明書で署名する
 
@@ -43,7 +39,7 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
 
 証明書を切り替えた直後の 1 回だけは、上記の「−」→「+」で再登録が必要です。
 
-### テスト
+## テスト
 
 ```bash
 ./scripts/test.sh        # TabDeskCore のユニットテスト(Accessibility 権限不要)
@@ -52,7 +48,44 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
 エンジンは `WindowDriver` プロトコル越しにしかウィンドウを触らないので、テストでは偽のドライバを
 差し込んで切替・復元・整合性維持のロジックを検証している。設計は [docs/03_core_design.md](docs/03_core_design.md)。
 
-### 画面の使い方
+
+### サイドバーの使い方
+
+- 「＋」でタブを作成。タブはクリックで切替、ダブルクリックで改名、右クリックで削除
+- 「＋ ウィンドウを追加」で開いているウィンドウをアクティブタブに登録(主ディスプレイに引き込まれる)
+- ウィンドウ行の「×」で登録解除(退避中なら元の位置に戻してから解除)
+- 「編集モード」ON の間は、動かした位置・サイズがそのまま固定位置として記憶される。
+  OFF のときは、動かしても離して約 0.25 秒後に固定位置へ戻る
+- サイドバーをクリックしても作業中のアプリのフォーカスは奪わない
+
+ログ: `~/Library/Logs/TabDesk/tabdesk.log`(メニューバーの「ログを開く」)
+
+### URL スキームによる操作(動作確認・自動化用)
+
+```bash
+open -g 'tabdesk://status'
+open -g 'tabdesk://windows'                # 登録可能なウィンドウ一覧をログに出す
+open -g 'tabdesk://tab?name=Work'
+open -g 'tabdesk://add?wid=123&tab=Work'   # tab 省略時はアクティブタブ
+open -g 'tabdesk://activate?name=Work'
+open -g 'tabdesk://remove?wid=123'
+open -g 'tabdesk://edit?on=1'
+```
+
+## v0 技術検証 PoC(TabDeskPoC)
+
+`TabDeskPoC` は仕様書 §5 の v0 チェックリストを実機で確認した検証アプリ(結果は docs/02_poc_results.md)。
+ベンチ計測の再実行用に残している。
+
+```bash
+PRODUCT=TabDeskPoC ./scripts/build_app.sh
+open build/TabDeskPoC.app
+```
+
+署名と TCC の注意は上記 TabDesk と同じ(名前は TabDeskPoC / `build/TabDeskPoC.app` に読み替え)。
+PoC を証明書で署名し直す場合は `PRODUCT=TabDeskPoC CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh`。
+
+### PoC 画面の使い方
 
 1. 「ウィンドウ一覧を更新」で他アプリの標準ウィンドウを列挙(WID = CGWindowID)
 2. 行を選んで「セット A に追加」「セット B に追加」(A/B がタブに相当)
@@ -64,9 +97,9 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
 
 ログは画面下部と `~/Library/Logs/TabDeskPoC/poc.log` に出ます。
 
-### URL スキームによる操作(自動化用)
+### PoC の URL スキーム
 
-起動中のアプリに `tabdeskpoc://` で同じ操作を送れます。
+起動中の PoC に `tabdeskpoc://` で同じ操作を送れます。
 
 ```bash
 scripts/poc.sh status
@@ -85,10 +118,11 @@ scripts/poc.sh log                          # ログ末尾を表示
 
 ```text
 Sources/AXShim/    私有関数 _AXUIElementGetWindow を dlsym で解決する C シム(私有 API 依存はここだけ)
+Sources/TabDesk/       本体アプリ: サイドバー(NSPanel)・メニューバー・AX 通知とエンジンの配線
 Sources/TabDeskCore/   コアモジュール: データモデル・TabEngine(切替/復元/整合性)・AX ラッパー
 Tests/TabDeskCoreTests/ エンジンのユニットテスト(偽ドライバ使用)
 Sources/TabDeskPoC/    v0 検証アプリ
-Resources/PoC/     PoC の Info.plist
+Resources/<Product>/   各アプリの Info.plist(TabDesk / TabDeskPoC)
 scripts/           ビルド・操作スクリプト
 docs/              仕様書
 ```
