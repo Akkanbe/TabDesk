@@ -58,6 +58,11 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
   OFF のときは、動かしても離して約 0.25 秒後に固定位置へ戻る
 - サイドバーをクリックしても作業中のアプリのフォーカスは奪わない
 
+タブ構成は `~/Library/Application Support/TabDesk/state.json` に自動保存され、次回起動時に復元される。
+再起動後は bundle ID・タイトル・サイズで同じウィンドウを推定して紐付け直す。推定できなかったものは
+一覧に「(未復元)」とグレー表示され、クリックするといま開いているウィンドウを手で割り当てられる。
+登録したアプリを終了した場合も「未復元」として残り、アプリを起動し直すと自動で戻る(窓だけ閉じた場合は登録から外れる)。
+
 ログ: `~/Library/Logs/TabDesk/tabdesk.log`(メニューバーの「ログを開く」)
 
 ### URL スキームによる操作(動作確認・自動化用)
@@ -70,6 +75,10 @@ open -g 'tabdesk://add?wid=123&tab=Work'   # tab 省略時はアクティブタ�
 open -g 'tabdesk://activate?name=Work'
 open -g 'tabdesk://remove?wid=123'
 open -g 'tabdesk://edit?on=1'
+open -g 'tabdesk://restore'               # 未復元エントリの紐付けをやり直す(strict=1 で厳しめ)
+open -g 'tabdesk://save'                  # 今すぐ保存
+open -g 'tabdesk://dump'                  # 座標の突き合わせ(診断)
+open -g 'tabdesk://quit'
 ```
 
 ## v0 技術検証 PoC(TabDeskPoC)

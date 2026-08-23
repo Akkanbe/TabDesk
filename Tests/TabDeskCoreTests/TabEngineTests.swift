@@ -608,8 +608,10 @@ struct ReviewFollowUpTests {
         let wa = try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
         try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: content, into: b.id)
         driver.setThrowAfterApply(1)  // 退避は適用されるがタイムアウト扱い
-        try await engine.activate(b.id)
-        #expect(!engine.parkedWindowIDs.contains(wa.id))
+        let report = try await engine.activate(b.id)
+        // 読み戻しで隅への到達を確認できるので、失敗扱いにせずフラグを実位置に合わせる。
+        #expect(report.failures.isEmpty)
+        #expect(engine.parkedWindowIDs.contains(wa.id))
         #expect(driver.currentFrame(1)?.origin == park, "actually parked despite the error")
 
         driver.setThrowAfterApply(1, false)
@@ -693,5 +695,531 @@ struct FlushTests {
         engine.flushPendingRestores()  // マウスアップ相当
         try await Task.sleep(for: .milliseconds(50))
         #expect(driver.currentFrame(1) == content)
+    }
+}
+
+@MainActor
+struct PersistenceTests {
+    @Test func stateStoreRoundTripAndBackup() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tabdesk-test-\(UUID().uuidString)")
+        let store = StateStore(fileURL: dir.appendingPathComponent("state.json"))
+        #expect(try store.load() == nil)
+
+        var state = WorkspaceState(tabs: [Tab(name: "A", windows: [
+            ManagedWindow(frame: content, identity: identity("x"), windowID: 42, pid: 7),
+        ])])
+        state.activeTabID = state.tabs[0].id
+        try store.save(state)
+        let loaded = try store.load()
+        #expect(loaded?.tabs[0].name == "A")
+        #expect(loaded?.tabs[0].windows[0].isBound == false, "runtime binding is not persisted")
+        #expect(loaded?.activeTabID == state.activeTabID)
+
+        try store.backupCorruptFile()
+        #expect(try store.load() == nil)
+        #expect(FileManager.default.fileExists(atPath: dir.appendingPathComponent("state.bak.json").path))
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    @Test func bindAttachesWindowToUnboundEntry() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        driver.add(2, frame: content)
+        let wa = try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
+        let wb = try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: content, into: b.id)
+
+        // アプリ終了 → 未復元として保持
+        engine.unbindWindows(pid: 100)
+        engine.noteWindowDestroyed(windowID: 2, appTerminated: true)
+        #expect(engine.state.allWindows.count == 2)
+        #expect(engine.state.allWindows.allSatisfy { !$0.isBound })
+        #expect(engine.parkedWindowIDs.isEmpty)
+
+        // 再起動したアプリの新しい窓を紐付け
+        driver.add(11, frame: CGRect(x: 0, y: 0, width: 500, height: 400))
+        driver.add(12, frame: CGRect(x: 0, y: 0, width: 500, height: 400))
+        try await engine.bind(wa.id, windowID: 11, pid: 110, title: "new title")
+        try await engine.bind(wb.id, windowID: 12, pid: 120)
+        #expect(driver.currentFrame(11) == content, "active tab: frame applied")
+        #expect(driver.currentFrame(12)?.origin == park, "inactive tab: parked")
+        #expect(engine.parkedWindowIDs == [wb.id])
+        #expect(engine.state.managedWindow(id: wa.id)?.window.identity.title == "new title")
+        #expect(engine.state.managedWindow(forWindowID: 12)?.window.id == wb.id)
+
+        await #expect(throws: TabEngine.EngineError.self) {
+            try await engine.bind(wa.id, windowID: 12, pid: 120)  // 他のエントリに紐付いている窓
+        }
+    }
+
+    @Test func reconcileUnbindsWhenAppIsGoneButRemovesWhenWindowClosed() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        driver.add(2, frame: content)
+        let w1 = try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: content, into: a.id)
+        await engine.reconcile(liveWindowIDs: [], livePIDs: [100])  // 空集合 = 列挙失敗 → 何もしない
+        #expect(engine.state.allWindows.count == 2)
+        await engine.reconcile(liveWindowIDs: [3], livePIDs: [100])  // 1 は閉じられた、2 のアプリは終了
+        #expect(engine.state.managedWindow(id: w1.id) == nil)
+        let remaining = engine.state.allWindows
+        #expect(remaining.count == 1 && remaining[0].isBound == false)
+    }
+}
+
+struct WindowMatcherTests {
+    private func entry(_ app: String, title: String, size: CGSize = CGSize(width: 800, height: 600)) -> ManagedWindow {
+        ManagedWindow(
+            frame: content,
+            identity: WindowIdentity(bundleID: "test.\(app)", appName: app, title: title, registeredSize: size),
+            windowID: nil, pid: nil)
+    }
+
+    private func cand(_ id: CGWindowID, _ app: String, title: String, size: CGSize = CGSize(width: 800, height: 600)) -> WindowMatcher.Candidate {
+        WindowMatcher.Candidate(windowID: id, pid: pid_t(id), bundleID: "test.\(app)", title: title, size: size)
+    }
+
+    @Test func exactTitleWins() {
+        let e1 = entry("safari", title: "GitHub")
+        let e2 = entry("safari", title: "Docs")
+        let matches = WindowMatcher.match(
+            unbound: [e1, e2],
+            candidates: [cand(1, "safari", title: "Docs"), cand(2, "safari", title: "GitHub")],
+            strictness: .strict)
+        #expect(matches.count == 2)
+        #expect(matches.first { $0.managedID == e1.id }?.candidate.windowID == 2)
+        #expect(matches.first { $0.managedID == e2.id }?.candidate.windowID == 1)
+    }
+
+    @Test func uniqueAppMatchesDespiteTitleChangeOnlyWhenLenient() {
+        let e = entry("ghostty", title: "~", size: CGSize(width: 1080, height: 1890))
+        let c = cand(5, "ghostty", title: "vim main.swift", size: CGSize(width: 1080, height: 1890))
+        #expect(WindowMatcher.match(unbound: [e], candidates: [c], strictness: .lenient).count == 1)
+        #expect(WindowMatcher.match(unbound: [e], candidates: [c], strictness: .strict).isEmpty)
+    }
+
+    @Test func differentBundleNeverMatches() {
+        let e = entry("safari", title: "GitHub")
+        #expect(WindowMatcher.match(unbound: [e], candidates: [cand(1, "chrome", title: "GitHub")], strictness: .lenient).isEmpty)
+    }
+
+    @Test func ambiguousCandidatesAreNotGuessed() {
+        // 同じアプリの 2 窓がどちらもタイトル不一致・サイズ不一致 → どちらにも紐付けない
+        let e = entry("safari", title: "GitHub")
+        let matches = WindowMatcher.match(
+            unbound: [e],
+            candidates: [cand(1, "safari", title: "Mail", size: CGSize(width: 1, height: 1)), cand(2, "safari", title: "News", size: CGSize(width: 1, height: 1))],
+            strictness: .lenient)
+        #expect(matches.isEmpty)
+    }
+
+    @Test func partialTitleAndSizeReachLenientThreshold() {
+        let e = entry("textedit", title: "memo.txt")
+        let others = entry("textedit", title: "other.txt")
+        let matches = WindowMatcher.match(
+            unbound: [e, others],
+            candidates: [cand(1, "textedit", title: "memo.txt — 編集済み"), cand(2, "textedit", title: "zzz", size: CGSize(width: 1, height: 1))],
+            strictness: .lenient)
+        #expect(matches.count == 1)
+        #expect(matches[0].managedID == e.id && matches[0].candidate.windowID == 1)
+    }
+}
+
+@MainActor
+struct StrandedWindowInvariantTests {
+    @Test func registerIntoInactiveTabDoesNotStrandWindowWhenParkThrowsAfterApply() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        driver.setThrowAfterApply(1)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: b.id)
+        #expect(driver.currentFrame(1)?.origin == park, "park was applied despite the error")
+        #expect(engine.state.managedWindow(id: managed.id) != nil, "kept under management so it can be recovered")
+        #expect(engine.parkedWindowIDs.contains(managed.id))
+
+        driver.setThrowAfterApply(1, false)
+        try await engine.unregister(managed.id)
+        #expect(driver.currentFrame(1) == content, "recoverable: unregister restores it")
+    }
+
+    @Test func registerIntoInactiveTabFailsCleanlyWhenParkDidNotApply() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        driver.setFailWrites(1)
+        await #expect(throws: FakeWindowDriver.SimulatedTimeout.self) {
+            try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: b.id)
+        }
+        #expect(driver.currentFrame(1) == content, "window untouched")
+        #expect(engine.state.allWindows.isEmpty, "nothing committed")
+    }
+
+    @Test func registerIntoActiveTabAdoptsCurrentFrameWhenSetFrameThrowsAfterApply() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: 0, y: 0, width: 500, height: 400))
+        driver.setThrowAfterApply(1)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        #expect(managed.frame == content, "actual frame read back after the ambiguous error")
+        #expect(!engine.parkedWindowIDs.contains(managed.id))
+    }
+
+    @Test func unregisterKeepsRegistrationWhenRestoreFails() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: b.id)
+        driver.setFailWrites(1)  // 無応答アプリ
+        await #expect(throws: TabEngine.EngineError.self) { try await engine.unregister(managed.id) }
+        #expect(engine.state.managedWindow(id: managed.id) != nil, "registration kept")
+        #expect(engine.parkedWindowIDs.contains(managed.id), "still known to be parked")
+        #expect(driver.currentFrame(1)?.origin == park)
+
+        driver.setFailWrites(1, false)  // アプリ復帰
+        try await engine.unregister(managed.id)
+        #expect(engine.state.allWindows.isEmpty)
+        #expect(driver.currentFrame(1) == content)
+    }
+
+    @Test func unregisterSucceedsWhenRestoreThrowsAfterApply() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: b.id)
+        driver.setThrowAfterApply(1)
+        try await engine.unregister(managed.id)  // 読み戻しで到達を確認できるので成功
+        #expect(engine.state.allWindows.isEmpty)
+        #expect(driver.currentFrame(1) == content)
+    }
+
+    @Test func deleteTabIsAbortedWhenAnyWindowCannotBeReleased() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        driver.add(2, frame: content)
+        let w1 = try await engine.register(windowID: 1, pid: 100, identity: identity("ok"), frame: content, into: b.id)
+        let w2 = try await engine.register(windowID: 2, pid: 200, identity: identity("hung"), frame: content, into: b.id)
+        driver.setFailWrites(2)
+        await #expect(throws: TabEngine.EngineError.self) { try await engine.deleteTab(b.id) }
+        #expect(engine.state.tabs.map(\.id) == [a.id, b.id], "tab kept")
+        #expect(engine.state.managedWindow(id: w1.id) != nil && engine.state.managedWindow(id: w2.id) != nil)
+        #expect(engine.parkedWindowIDs.contains(w2.id), "unreleased window still flagged parked")
+
+        driver.setFailWrites(2, false)
+        try await engine.deleteTab(b.id)
+        #expect(engine.state.tabs.map(\.id) == [a.id])
+        #expect(driver.currentFrame(2) == content)
+    }
+
+    @Test func bindIntoInactiveTabCommitsWhenParkThrowsAfterApply() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: b.id)
+        engine.unbindWindows(pid: 100)
+        driver.add(5, frame: content)
+        driver.setThrowAfterApply(5)
+        try await engine.bind(managed.id, windowID: 5, pid: 500)
+        #expect(engine.state.managedWindow(id: managed.id)?.window.windowID == 5)
+        #expect(engine.parkedWindowIDs.contains(managed.id))
+        #expect(driver.currentFrame(5)?.origin == park)
+    }
+}
+
+@MainActor
+struct ShutdownTests {
+    @Test func releaseIsNotUndoneByInFlightReconcile() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        driver.add(2, frame: content, delay: 0.1)  // 退避中の遅いアプリ: reconcile の frame 読み取りが IPC 中になる
+        try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
+        let left = CGRect(x: 240, y: 30, width: 840, height: 1090)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: left, into: b.id)
+        #expect(driver.currentFrame(2)?.origin == park)
+
+        let reconcile = Task { await engine.reconcile(liveWindowIDs: [1, 2]) }
+        try await Task.sleep(for: .milliseconds(20))  // 読み取り中に終了処理が割り込む
+        await engine.releaseAllParkedWindows()
+        await reconcile.value
+        #expect(driver.currentFrame(2) == left, "reconcile must not re-park a window released for shutdown")
+        #expect(engine.isReleasingForShutdown)
+
+        await engine.reconcile(liveWindowIDs: [1, 2])  // 終了後の reconcile も何もしない
+        #expect(driver.currentFrame(2) == left)
+    }
+
+    @Test func terminationRepliesOnceAtDeadlineWhenCleanupHangs() async throws {
+        var replies: [String] = []
+        let coordinator = TerminationCoordinator(
+            deadline: .milliseconds(50),
+            cleanup: { try? await Task.sleep(for: .milliseconds(400)) },
+            reply: { replies.append($0) })
+        coordinator.requestTermination()
+        coordinator.requestTermination()  // 再要求は無視
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(replies.count == 1)
+        #expect(replies.first?.contains("deadline") == true)
+        try await Task.sleep(for: .milliseconds(350))
+        #expect(replies.count == 1, "cleanup finishing later must not reply again")
+    }
+
+    @Test func terminationRepliesImmediatelyWhenCleanupIsFast() async throws {
+        var replies: [String] = []
+        let coordinator = TerminationCoordinator(deadline: .seconds(5), cleanup: {}, reply: { replies.append($0) })
+        coordinator.requestTermination()
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(replies == ["cleanup finished"])
+        #expect(coordinator.isTerminating)
+    }
+}
+
+@MainActor
+struct ReconcileDriftTests {
+    @Test func reconcileRestoresActiveWindowMovedWithoutNotification() async throws {
+        let (engine, driver) = makeEngine(debounceMs: 10)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        driver.moveExternally(1, to: CGRect(x: 600, y: 300, width: 1680, height: 1090))  // 通知なしでずれた
+        await engine.reconcile(liveWindowIDs: [1])
+        try await Task.sleep(for: .milliseconds(60))  // デバウンス経路で戻る
+        #expect(driver.currentFrame(1) == content)
+    }
+
+    @Test func activateTreatsThrowAfterApplyAsSuccessViaReadBack() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        driver.add(2, frame: content)
+        let wa = try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
+        let wb = try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: content, into: b.id)
+        driver.setThrowAfterApply(1)
+        driver.setThrowAfterApply(2)
+        let report = try await engine.activate(b.id)
+        #expect(report.failures.isEmpty, "applied-but-threw is confirmed by read-back")
+        #expect(engine.parkedWindowIDs == [wa.id])
+        #expect(!engine.parkedWindowIDs.contains(wb.id))
+        #expect(driver.currentFrame(2) == content)
+    }
+}
+
+struct ObserverPolicyTests {
+    @Test func optionalFailureKeepsObserverRequiredFailureRejects() {
+        let ok = AppWindowObserver.RegistrationPolicy.evaluate(
+            required: ["AXWindowMoved": .success, "AXWindowResized": .notificationAlreadyRegistered],
+            optional: ["AXFocusedWindowChanged": .notificationUnsupported])
+        if case .success(let unavailable) = ok {
+            #expect(unavailable == ["AXFocusedWindowChanged"])
+        } else {
+            Issue.record("optional failure must not reject the observer")
+        }
+
+        let rejected = AppWindowObserver.RegistrationPolicy.evaluate(
+            required: ["AXWindowMoved": .success, "AXWindowResized": .cannotComplete],
+            optional: [:])
+        if case .failure(let error) = rejected {
+            #expect(error.code == .cannotComplete)
+            #expect(error.operation.contains("AXWindowResized"))
+        } else {
+            Issue.record("required failure must reject the observer")
+        }
+    }
+}
+
+@MainActor
+struct SnapBackGenerationTests {
+    @Test func staleSnapBackDoesNotOverwriteExplicitSetFrame() async throws {
+        let (engine, driver) = makeEngine(debounceMs: 10)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content, delay: 0.08)  // frame 読み取りに時間がかかるアプリ
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        engine.editMode = true
+
+        let stale = CGRect(x: 300, y: 100, width: 800, height: 600)
+        driver.moveExternally(1, to: stale)
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(30))  // 古い Task はいま frame 読み取り(IPC)の最中
+
+        let explicit = CGRect(x: 500, y: 200, width: 700, height: 500)
+        let actual = try await engine.setFrame(explicit, of: managed.id)  // 明示操作が後から入る
+        #expect(actual == explicit)
+        try await Task.sleep(for: .milliseconds(200))  // 古い Task が戻ってくるのを待つ
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == explicit, "stale task must not record the old position")
+        #expect(driver.currentFrame(1) == explicit)
+    }
+
+    @Test func staleRestoreDoesNotReplaceNewerReservation() async throws {
+        let (engine, driver) = makeEngine(debounceMs: 10)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content, delay: 0.05)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+
+        driver.moveExternally(1, to: CGRect(x: 300, y: 100, width: 1680, height: 1090))
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(20))  // 1 つ目の Task が IPC 中
+        driver.moveExternally(1, to: CGRect(x: 400, y: 150, width: 1680, height: 1090))
+        engine.windowFrameDidChange(windowID: 1)  // 新しい予約(世代が進む)
+        try await Task.sleep(for: .milliseconds(400))
+        #expect(driver.currentFrame(1) == content, "newer reservation restores; stale task neither interferes nor leaves it moved")
+    }
+}
+
+@MainActor
+struct EditModeActualFrameTests {
+    @Test func editModeAdoptsActualFrameAfterAppConstraint() async throws {
+        let (engine, driver) = makeEngine(debounceMs: 10)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content, minSize: CGSize(width: 900, height: 0))
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        engine.editMode = true
+        // サイドバー領域に置かれ、かつ幅 700 はアプリの最小幅 900 未満(寄せる setFrame で幅がクランプされる)
+        driver.moveExternally(1, to: CGRect(x: 50, y: 100, width: 700, height: 600))
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(60))
+        let recorded = engine.state.managedWindow(id: managed.id)?.window.frame
+        #expect(recorded == CGRect(x: content.minX, y: 100, width: 900, height: 600), "actual (clamped by app) frame is recorded, not the request")
+        #expect(driver.currentFrame(1) == recorded)
+    }
+
+    @Test func editModeDoesNotCommitTargetWhenClampMoveFails() async throws {
+        let (engine, driver) = makeEngine(debounceMs: 10)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        engine.editMode = true
+        driver.moveExternally(1, to: CGRect(x: 50, y: 100, width: 800, height: 600))
+        driver.setFailWrites(1)
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == content, "previous frame kept when the nudge fails")
+    }
+}
+
+struct ParallelEnumerationTests {
+    @MainActor
+    @Test func enumerationRunsPerAppInParallelAndKeepsMainActorResponsive() async throws {
+        let apps = (1...3).map { AppDescriptor(pid: pid_t($0 * 100), name: "app\($0)", bundleID: "test.app\($0)") }
+        let heartbeat = Locked(0)
+        let ticker = Task { @MainActor in
+            while !Task.isCancelled {
+                heartbeat.withValue { $0 += 1 }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        let sw = Stopwatch()
+        let (records, stats) = await WindowEnumerator.enumerateInParallel(apps) { app in
+            Thread.sleep(forTimeInterval: 0.15)  // 遅いアプリへの同期 IPC を模す
+            var s = EnumerationStats()
+            s.apps = 1
+            s.appFailureDetails = ["\(app.name): simulated"]
+            return AppEnumeration(records: [], stats: s)
+        }
+        ticker.cancel()
+        #expect(sw.elapsedMs < 300, "3 apps x 150 ms must not run sequentially (took \(sw.elapsedMs) ms)")
+        #expect(heartbeat.current >= 5, "MainActor must keep running while enumeration blocks background threads")
+        #expect(records.isEmpty)
+        #expect(stats.apps == 3)
+        #expect(stats.appFailureDetails.count == 3)
+    }
+}
+
+/// 値を差し替えられる layout(ディスプレイ構成の変更を模す)。
+final class MutableScreenLayout: ScreenLayout, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _parkPoint: CGPoint
+    private var _contentArea: CGRect
+
+    init(parkPoint: CGPoint, contentArea: CGRect) {
+        _parkPoint = parkPoint
+        _contentArea = contentArea
+    }
+
+    var parkPoint: CGPoint { lock.withLock { _parkPoint } }
+    var contentArea: CGRect { lock.withLock { _contentArea } }
+
+    func change(parkPoint: CGPoint, contentArea: CGRect) {
+        lock.withLock {
+            _parkPoint = parkPoint
+            _contentArea = contentArea
+        }
+    }
+}
+
+@MainActor
+struct LayoutReapplyTests {
+    @Test func reapplyLayoutMovesWindowsToNewContentAreaAndParkPoint() async throws {
+        let driver = FakeWindowDriver()
+        let layout = MutableScreenLayout(parkPoint: park, contentArea: content)
+        let engine = TabEngine(driver: driver, layout: layout)
+        let a = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        driver.add(2, frame: content)
+        let wa = try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: CGRect(x: 240, y: 30, width: 800, height: 600), into: a.id)
+        let wb = try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: content, into: b.id)
+        #expect(driver.currentFrame(2)?.origin == park)
+
+        // 外部ディスプレイを外して小さい画面になった、という状況
+        let newPark = CGPoint(x: 1439, y: 899)
+        let newArea = CGRect(x: 300, y: 30, width: 1140, height: 800)
+        layout.change(parkPoint: newPark, contentArea: newArea)
+        await engine.reapplyLayout()
+
+        #expect(driver.currentFrame(1)?.origin.x == 300, "active window pulled into the new content area")
+        #expect(engine.state.managedWindow(id: wa.id)?.window.frame.minX == 300)
+        #expect(driver.currentFrame(2)?.origin == newPark, "parked window moved to the new park point")
+        #expect(engine.parkedWindowIDs.contains(wb.id))
+    }
+}
+
+struct PersistedToggleTests {
+    @Test func defaultIsRegisteredBeforeFirstReadAndToggleIsPersisted() {
+        let suite = "tabdesk-test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let toggle = PersistedToggle(key: "SidebarAlwaysOnTop", defaultValue: true, defaults: defaults)
+        #expect(toggle.value == true, "empty defaults must read as the default, not false")
+        toggle.value = false
+        #expect(defaults.bool(forKey: "SidebarAlwaysOnTop") == false)
+        let again = PersistedToggle(key: "SidebarAlwaysOnTop", defaultValue: true, defaults: defaults)
+        #expect(again.value == false, "persisted value wins over the default")
+    }
+}
+
+@MainActor
+struct FocusTargetTests {
+    @Test func focusTargetIsChosenFromStateAfterOperations() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        driver.add(2, frame: content, delay: 0.08)
+        driver.add(3, frame: content)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("b-focused"), frame: content, into: b.id)
+        try await engine.register(windowID: 3, pid: 300, identity: identity("b-other"), frame: content, into: b.id)
+        engine.noteWindowFocused(windowID: 2)
+        try await engine.activate(b.id)
+        engine.noteWindowFocused(windowID: 2)
+        try await engine.activate(a.id)
+
+        var activated: [pid_t] = []
+        engine.activateApplication = { activated.append($0) }
+        let activation = Task { try await engine.activate(b.id) }
+        try await Task.sleep(for: .milliseconds(20))
+        engine.noteWindowDestroyed(windowID: 2)  // 切替の IPC 中に最終フォーカス窓が閉じられた
+        _ = try await activation.value
+        #expect(activated == [300], "must not activate the pid of a window that no longer exists")
     }
 }

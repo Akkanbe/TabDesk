@@ -38,6 +38,8 @@ public final class TabEngine {
         case unknownWindow(UUID)
         case windowAlreadyRegistered(windowID: CGWindowID, managedID: UUID)
         case invalidTabOrder
+        /// 退避中の窓を固定 frame に戻せなかった(登録は保持される。相手アプリが応答したら再試行できる)。
+        case releaseFailed(managedIDs: Set<UUID>)
 
         public var description: String {
             switch self {
@@ -45,6 +47,7 @@ public final class TabEngine {
             case .unknownWindow(let id): return "unknown managed window \(id)"
             case .windowAlreadyRegistered(let wid, let mid): return "window \(wid) already registered as \(mid)"
             case .invalidTabOrder: return "invalid tab order"
+            case .releaseFailed(let ids): return "could not restore \(ids.count) parked window(s); registration kept"
             }
         }
     }
@@ -63,6 +66,9 @@ public final class TabEngine {
     public var activateApplication: (@MainActor (pid_t) -> Void)?
     public var log: @Sendable (String) -> Void = { _ in }
 
+    /// 終了処理(`releaseAllParkedWindows`)が始まったら true。以降の reconcile は戻した窓を再び隅へ送らない。
+    public private(set) var isReleasingForShutdown = false
+
     /// 退避操作が成功した(= 画面隅にいるはずの)ウィンドウ。実行時の状態なので `WorkspaceState` には含めない。
     /// 操作が失敗したウィンドウはフラグが進まないため実位置とずれうる。ずれは `reconcile` が収束させる。
     public private(set) var parkedWindowIDs: Set<UUID> = []
@@ -71,7 +77,10 @@ public final class TabEngine {
     private let layout: any ScreenLayout
     private let config: Configuration
     private let executor = BlockingExecutor()
-    private var pendingRestores: [UUID: (task: Task<Void, Never>, attempt: Int)] = [:]
+    private var pendingRestores: [UUID: (task: Task<Void, Never>, attempt: Int, generation: UInt64)] = [:]
+    /// 窓ごとの復元予約の世代。Task.cancel は IPC 中の Task を止められないので、
+    /// 戻ってきた古い Task が「自分はまだ最新か」を世代で確かめてから状態を触る。
+    private var restoreGeneration: [UUID: UInt64] = [:]
     private var isBusy = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -117,7 +126,10 @@ public final class TabEngine {
     public func deleteTab(_ id: UUID) async throws {
         try await serialized {
             let tab = try self.tab(id)
-            await releaseAll(tab.windows, from: tab)
+            let unreleased = await releaseAll(tab.windows, from: tab)
+            // 1 枚でも戻せなければタブごと残す(隅に取り残した窓を追跡不能にしない)。
+            // 戻せた窓は非アクティブタブの未退避窓として reconcile が再び退避する。
+            guard unreleased.isEmpty else { throw EngineError.releaseFailed(managedIDs: unreleased) }
             // await をまたいだので index は引き直す(同期の moveTab が割り込みうる)。
             state.tabs.remove(at: try tabIndex(id))
             if state.activeTabID == id {
@@ -150,22 +162,17 @@ public final class TabEngine {
             }
             let frame = clamped(frame)
             var managed = ManagedWindow(frame: frame, identity: identity, windowID: windowID, pid: pid)
-            let driver = self.driver
             let intoActive = tabID == state.activeTabID
 
-            if intoActive {
-                let actual = try await executor.run { try driver.setFrame(frame, of: windowID) }
+            let outcome = try await place(windowID: windowID, frame: frame, intoActive: intoActive)
+            if case .placed(let actual) = outcome {
                 managed.frame = actual
-                log("register: \(identity.appName) → \(actual) (requested \(frame))")
-            } else {
-                let point = layout.parkPoint
-                try await executor.run { try driver.setPosition(point, of: windowID) }
-                log("register: \(identity.appName) → parked (inactive tab)")
             }
+            log("register: \(identity.appName) → \(outcome.description) (requested \(frame))")
             // await をまたいだので index は引き直す(タブが消えていれば unknownTab)。
             let index = try tabIndex(tabID)
             state.tabs[index].windows.append(managed)
-            if !intoActive {
+            if case .parked = outcome {
                 parkedWindowIDs.insert(managed.id)
             }
             return managed
@@ -176,24 +183,86 @@ public final class TabEngine {
     public func unregister(_ id: UUID) async throws {
         try await serialized {
             guard let found = state.managedWindow(id: id) else { throw EngineError.unknownWindow(id) }
-            await releaseAll([found.window], from: found.tab)
+            let unreleased = await releaseAll([found.window], from: found.tab)
+            // 固定 frame に戻せたことを確認できるまで登録は手放さない(隅に取り残さない)。
+            guard unreleased.isEmpty else { throw EngineError.releaseFailed(managedIDs: unreleased) }
             removeFromState(id)
+        }
+    }
+
+    /// 保存済み(未復元)エントリに実ウィンドウを紐付ける(再起動後の復元、手動割り当て)。
+    /// アクティブタブなら固定 frame を適用して到達 frame を採用、非アクティブタブなら即座に退避する。
+    public func bind(_ id: UUID, windowID: CGWindowID, pid: pid_t, title: String? = nil) async throws {
+        try await serialized {
+            guard let found = state.managedWindow(id: id) else { throw EngineError.unknownWindow(id) }
+            if let existing = state.managedWindow(forWindowID: windowID), existing.window.id != id {
+                throw EngineError.windowAlreadyRegistered(windowID: windowID, managedID: existing.window.id)
+            }
+            let intoActive = found.tab.id == state.activeTabID
+            let recorded = found.window.frame
+            let outcome = try await place(windowID: windowID, frame: recorded, intoActive: intoActive)
+            let frame: CGRect
+            if case .placed(let actual) = outcome { frame = actual } else { frame = recorded }
+            // await をまたいだので引き直す(解除されていれば unknownWindow)。
+            guard let again = state.managedWindow(id: id),
+                let ti = state.tabs.firstIndex(where: { $0.id == again.tab.id }),
+                let wi = state.tabs[ti].windows.firstIndex(where: { $0.id == id })
+            else { throw EngineError.unknownWindow(id) }
+            state.tabs[ti].windows[wi].windowID = windowID
+            state.tabs[ti].windows[wi].pid = pid
+            state.tabs[ti].windows[wi].frame = frame
+            if let title { state.tabs[ti].windows[wi].identity.title = title }
+            if intoActive {
+                parkedWindowIDs.remove(id)
+            } else {
+                parkedWindowIDs.insert(id)
+            }
+            log("bind: \(again.window.identity.appName) / \(title ?? again.window.identity.title) → \(intoActive ? "\(frame)" : "parked")")
+        }
+    }
+
+    /// アプリが終了したとき、その pid の窓を「未復元」に戻す(登録は保持し、再起動後の自動紐付けに備える)。
+    public func unbindWindows(pid: pid_t) {
+        var count = 0
+        for ti in state.tabs.indices {
+            for wi in state.tabs[ti].windows.indices where state.tabs[ti].windows[wi].pid == pid {
+                let id = state.tabs[ti].windows[wi].id
+                cancelPendingRestore(id)
+                parkedWindowIDs.remove(id)
+                state.tabs[ti].windows[wi].windowID = nil
+                state.tabs[ti].windows[wi].pid = nil
+                count += 1
+            }
+        }
+        if count > 0 {
+            log("unbind: pid \(pid) terminated, \(count) window(s) kept as unbound")
         }
     }
 
     /// アプリ終了前に呼ぶ。退避中(および非アクティブタブ)の全ウィンドウを固定 frame に戻す。
     /// 状態(タブ・登録)は変えない。切替が進行中なら順番を待つ。
     public func releaseAllParkedWindows() async {
+        // ロック取得前に立てる: ロック待ち中の reconcile にも、これから始まる reconcile にも効かせる。
+        isReleasingForShutdown = true
         await serialized {
+            var unreleased = Set<UUID>()
             for tab in state.tabs {
-                await releaseAll(tab.windows, from: tab)
+                unreleased.formUnion(await releaseAll(tab.windows, from: tab))
+            }
+            if !unreleased.isEmpty {
+                log("shutdown: \(unreleased.count) window(s) could not be restored and may remain parked")
             }
         }
     }
 
-    /// AX の destroyed 通知から呼ぶ。実ウィンドウが消えたので登録を外す。
-    public func noteWindowDestroyed(windowID: CGWindowID) {
+    /// AX の destroyed 通知から呼ぶ。窓だけが閉じられたなら登録を外し、
+    /// アプリごと終了したなら「未復元」として保持する(`appTerminated`)。
+    public func noteWindowDestroyed(windowID: CGWindowID, appTerminated: Bool = false) {
         guard let found = state.managedWindow(forWindowID: windowID) else { return }
+        if appTerminated, let pid = found.window.pid {
+            unbindWindows(pid: pid)
+            return
+        }
         log("window destroyed: \(found.window.identity.appName) / \(found.window.identity.title)")
         removeFromState(found.window.id)
     }
@@ -267,15 +336,46 @@ public final class TabEngine {
         let stopwatch = Stopwatch()
         let results = await run(ops)
         let elapsed = stopwatch.elapsedMs
-        let failures = apply(results)
+        let failures = await apply(results)
         state.activeTabID = tabID
 
-        if !alreadyActive, let pid = focusTargetPID(in: target) {
+        // IPC 中に最終フォーカス窓が閉じられていることがあるので、切替開始時の snapshot ではなく今の状態から選ぶ。
+        if !alreadyActive, let refreshed = state.tab(withID: tabID), let pid = focusTargetPID(in: refreshed) {
             activateApplication?(pid)
         }
         log("activate \(target.name): \(ops.count) ops in \(String(format: "%.1f", elapsed)) ms" +
             (failures.isEmpty ? "" : "; failures: \(failures.map(\.message))"))
         return SwitchReport(tabID: tabID, operationCount: ops.count, durationMs: elapsed, failures: failures)
+    }
+
+    // MARK: - レイアウトの再適用
+
+    /// ディスプレイ構成の変更・スリープ/ロック解除のあとに呼ぶ。
+    /// アクティブタブの窓を新しいコンテンツ領域に収め直し、非アクティブタブの窓を新しい退避点へ移す。
+    /// ユーザー操作との競合は想定しない(イベント起点)ので、デバウンスせず直接適用する。
+    public func reapplyLayout() async {
+        await serialized {
+            guard !isReleasingForShutdown else { return }
+            let point = layout.parkPoint
+            var ops: [WindowOp] = []
+            for tab in state.tabs {
+                let isActive = tab.id == state.activeTabID
+                for window in tab.windows {
+                    guard let windowID = window.windowID, let pid = window.pid else { continue }
+                    if isActive {
+                        let target = clamped(window.frame)
+                        if target != window.frame { updateFrame(window.id, target) }
+                        cancelPendingRestore(window.id)
+                        ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(target, raise: false)))
+                    } else {
+                        ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(point)))
+                    }
+                }
+            }
+            guard !ops.isEmpty else { return }
+            let failures = await apply(await run(ops))
+            log("reapplyLayout: \(ops.count) ops" + (failures.isEmpty ? "" : "; failures: \(failures.map(\.message))"))
+        }
     }
 
     // MARK: - スナップバック
@@ -293,8 +393,19 @@ public final class TabEngine {
         scheduleRestore(managed.id, attempt: 1)
     }
 
+    private func nextGeneration(for id: UUID) -> UInt64 {
+        let next = (restoreGeneration[id] ?? 0) + 1
+        restoreGeneration[id] = next
+        return next
+    }
+
+    private func isLatest(_ id: UUID, _ generation: UInt64) -> Bool {
+        restoreGeneration[id] == generation
+    }
+
     private func scheduleRestore(_ id: UUID, attempt: Int) {
         pendingRestores[id]?.task.cancel()
+        let generation = nextGeneration(for: id)
         let delay = config.debounce
         let task = Task { [weak self] in
             do {
@@ -302,9 +413,9 @@ public final class TabEngine {
             } catch {
                 return  // キャンセル(= 新しい通知で延長された、または flush で即時実行された)
             }
-            await self?.performRestore(id, attempt: attempt)
+            await self?.performRestore(id, attempt: attempt, generation: generation)
         }
-        pendingRestores[id] = (task, attempt)
+        pendingRestores[id] = (task, attempt, generation)
     }
 
     /// デバウンス待ちの復元/記録を待たずに今すぐ実行する。
@@ -314,39 +425,40 @@ public final class TabEngine {
         pendingRestores.removeAll()
         for (id, entry) in pending {
             entry.task.cancel()
-            Task { [weak self] in await self?.performRestore(id, attempt: entry.attempt) }
+            // 世代はそのまま(予約を前倒しするだけ)。
+            Task { [weak self] in await self?.performRestore(id, attempt: entry.attempt, generation: entry.generation) }
         }
     }
 
-    private func performRestore(_ id: UUID, attempt: Int) async {
-        pendingRestores[id] = nil
+    private func performRestore(_ id: UUID, attempt: Int, generation: UInt64) async {
+        // 自分より新しい予約・明示操作があれば何もしない(古い値を書き戻さない)。
+        guard isLatest(id, generation) else { return }
+        if pendingRestores[id]?.generation == generation {
+            pendingRestores[id] = nil
+        }
         guard let found = state.managedWindow(id: id), let windowID = found.window.windowID,
             !parkedWindowIDs.contains(id), found.tab.id == state.activeTabID
         else { return }
         let driver = self.driver
         // 読み取り(IPC)はロックの外。相手アプリが遅くても他の操作を待たせない。
         guard let current = try? await executor.run({ try driver.frame(of: windowID) }) else { return }
+        guard isLatest(id, generation) else { return }  // IPC 中に新しい通知や setFrame が入った
 
         await serialized {
-            // ロック待ちの間に切替・解除が走っていることがあるので前提を見直す。
-            guard let found = state.managedWindow(id: id), !parkedWindowIDs.contains(id),
+            // ロック待ちの間に切替・解除・新しい予約が走っていることがあるので前提を見直す。
+            guard isLatest(id, generation), let found = state.managedWindow(id: id), !parkedWindowIDs.contains(id),
                 found.tab.id == state.activeTabID
             else { return }
             if editMode {
-                // 編集モード: 静止した位置を新しい固定 frame として記録する。
-                // サイドバー領域に置かれた場合はコンテンツ領域へ寄せ、窓もそこへ動かす。
-                let target = clamped(current)
-                updateFrame(id, target)
-                if !approximatelyEqual(target, current) {
-                    _ = try? await executor.run { try driver.setFrame(target, of: windowID) }
-                }
-                log("edit: recorded \(target) for \(found.window.identity.appName)")
+                await recordEditedFrame(id: id, windowID: windowID, current: current, attempt: attempt, generation: generation,
+                    appName: found.window.identity.appName)
                 return
             }
             let recorded = found.window.frame
             if approximatelyEqual(current, recorded) { return }
             do {
                 let actual = try await executor.run { try driver.setFrame(recorded, of: windowID) }
+                guard isLatest(id, generation) else { return }
                 if approximatelyEqual(actual, recorded) {
                     log("snap-back: \(found.window.identity.appName) \(current) → \(actual) (attempt \(attempt))")
                     return
@@ -365,6 +477,33 @@ public final class TabEngine {
         }
     }
 
+    /// 編集モード: 静止した位置を新しい固定 frame として記録する。
+    /// サイドバー領域に置かれていればコンテンツ領域へ寄せてから、**到達した frame** を記録する(要求値は保存しない)。
+    /// 寄せる操作が失敗したら以前の固定 frame を維持し、再試行に回す。
+    private func recordEditedFrame(
+        id: UUID, windowID: CGWindowID, current: CGRect, attempt: Int, generation: UInt64, appName: String
+    ) async {
+        let target = clamped(current)
+        if approximatelyEqual(target, current) {
+            updateFrame(id, current)
+            log("edit: recorded \(current) for \(appName)")
+            return
+        }
+        let driver = self.driver
+        do {
+            let actual = try await executor.run { try driver.setFrame(target, of: windowID) }
+            guard isLatest(id, generation) else { return }
+            updateFrame(id, actual)
+            log("edit: nudged into content area and recorded \(actual) for \(appName)")
+        } catch {
+            guard isLatest(id, generation) else { return }
+            log("edit: could not nudge \(appName) (\(error)); keeping previous frame")
+            if attempt < config.maxRestoreAttempts {
+                scheduleRestore(id, attempt: attempt + 1)
+            }
+        }
+    }
+
     // MARK: - 整合性維持(リコンシリエーション)
 
     /// 低頻度ポーリング(2 秒間隔を想定)から呼び、実態を「あるべき状態」へ収束させる。
@@ -375,66 +514,81 @@ public final class TabEngine {
     /// - 過去の操作が失敗して実位置とフラグがずれた窓(アクティブタブなのに退避フラグ、非アクティブなのに未退避)を
     ///   復元/退避し直す。退避中の窓が隅から外れていれば戻す
     /// - frame の読み取り(IPC)はロックの外で pid 並列に行い、状態変更だけロック内で再検証して行う
-    public func reconcile(liveWindowIDs: Set<CGWindowID>) async {
+    /// - Parameter livePIDs: 実行中のアプリの pid。消えた窓の pid がここに無ければアプリごと終了したとみなし、
+    ///   除去ではなく「未復元」に戻す。nil なら常に除去する。
+    public func reconcile(liveWindowIDs: Set<CGWindowID>, livePIDs: Set<pid_t>? = nil) async {
+        guard !isReleasingForShutdown else { return }
         if !liveWindowIDs.isEmpty {
             for window in state.allWindows {
                 guard let windowID = window.windowID, !liveWindowIDs.contains(windowID) else { continue }
+                if let livePIDs, let pid = window.pid, !livePIDs.contains(pid) {
+                    unbindWindows(pid: pid)
+                    continue
+                }
                 log("reconcile: window gone: \(window.identity.appName) / \(window.identity.title)")
                 removeFromState(window.id)
             }
         }
 
         let point = layout.parkPoint
-        let drifted = await driftedParkedWindows(parkPoint: point)
+        let frames = await observedFrames()
 
         await serialized {
+            // ロック待ちの間に終了処理が走っていれば、戻された窓を隅へ送り返さない。
+            guard !isReleasingForShutdown else { return }
             var ops: [WindowOp] = []
             for tab in state.tabs {
                 let isActive = tab.id == state.activeTabID
                 for window in tab.windows {
                     guard let windowID = window.windowID, let pid = window.pid else { continue }
                     let flagged = parkedWindowIDs.contains(window.id)
+                    let current = frames[window.id]
                     if isActive, flagged {
                         // 復元に失敗したまま = 隅に残っているはずなので、復元をやり直す。
                         ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(window.frame, raise: false)))
-                    } else if !isActive, !flagged || drifted.contains(window.id) {
+                    } else if isActive, let current, !approximatelyEqual(current, window.frame), pendingRestores[window.id] == nil {
+                        // 通知を取りこぼして固定 frame からずれている。ドラッグ中かもしれないので
+                        // 即時には動かさず、通常のデバウンス復元(編集モードなら記録)に流す。
+                        log("reconcile: \(window.identity.appName) drifted to \(current); scheduling restore")
+                        scheduleRestore(window.id, attempt: 1)
+                    } else if !isActive, !flagged || (current.map { abs($0.minX - point.x) > 1 } ?? false) {
+                        // y は OS にクランプされて窓の高さごとに変わる(実測 1067〜1087)ので判定に使わない。
+                        // x = 画面幅 − 1 は通常のウィンドウでは起こらないので、x だけで「隅にいる」とみなす。
                         ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(point)))
                     }
                 }
             }
             guard !ops.isEmpty else { return }
             log("reconcile: \(ops.count) corrective ops")
-            let failures = apply(await run(ops))
+            let failures = await apply(await run(ops))
             for failure in failures {
                 log("reconcile: op failed for \(failure.managedID): \(failure.message)")
             }
         }
     }
 
-    /// 退避中のはずなのに隅にいない窓を探す。読み取りは pid ごとに並列(ロックの外で呼ぶこと)。
-    private func driftedParkedWindows(parkPoint point: CGPoint) async -> Set<UUID> {
-        let candidates = state.allWindows.filter { parkedWindowIDs.contains($0.id) && $0.isBound }
-        guard !candidates.isEmpty else { return [] }
+    /// 紐付いている全窓の現在 frame を読む。読み取りは pid ごとに並列(ロックの外で呼ぶこと)。
+    /// 読めない(消えた / 無応答)窓は含めない = 判断材料がないので触らない。
+    private func observedFrames() async -> [UUID: CGRect] {
+        let candidates = state.allWindows.filter(\.isBound)
+        guard !candidates.isEmpty else { return [:] }
         let driver = self.driver
         let executor = self.executor
         let groups = Dictionary(grouping: candidates, by: { $0.pid ?? 0 })
-        return await withTaskGroup(of: [UUID].self) { group in
+        return await withTaskGroup(of: [(UUID, CGRect)].self) { group in
             for (_, windows) in groups {
                 group.addTask {
                     await executor.run {
-                        windows.compactMap { window -> UUID? in
-                            // 読めない(消えた / 無応答)窓は判断材料がないので触らない。
+                        windows.compactMap { window -> (UUID, CGRect)? in
                             guard let wid = window.windowID, let current = try? driver.frame(of: wid) else { return nil }
-                            // y は OS にクランプされて窓の高さごとに変わる(実測 1067〜1087)ので判定に使わない。
-                            // x = 画面幅 − 1 は通常のウィンドウでは起こらないので、x だけで「隅にいる」とみなす。
-                            return abs(current.minX - point.x) <= 1 ? nil : window.id
+                            return (window.id, current)
                         }
                     }
                 }
             }
-            var all = Set<UUID>()
-            for await ids in group {
-                all.formUnion(ids)
+            var all: [UUID: CGRect] = [:]
+            for await pairs in group {
+                for (id, frame) in pairs { all[id] = frame }
             }
             return all
         }
@@ -523,17 +677,30 @@ public final class TabEngine {
     }
 
     /// 実行結果を状態に反映する。失敗した操作は実位置が不明なのでフラグを進めない。
-    private func apply(_ results: [OpResult]) -> [OperationFailure] {
+    /// ただし AX は「適用したあとで throw」することがあるので、失敗した op は読み戻して到達していれば成功扱いにする。
+    private func apply(_ results: [OpResult]) async -> [OperationFailure] {
         var failures: [OperationFailure] = []
-        for result in results {
+        let driver = self.driver
+        for var result in results {
             // 実行中に閉じられた(noteWindowDestroyed された)ウィンドウの結果は捨てる。
             guard state.managedWindow(id: result.op.managedID) != nil else { continue }
             if let note = result.note {
                 log("\(result.op.managedID): \(note)")
             }
             if let error = result.error {
-                failures.append(OperationFailure(managedID: result.op.managedID, message: error))
-                continue
+                let windowID = result.op.windowID
+                let current = try? await executor.run { try driver.frame(of: windowID) }
+                let reached: Bool
+                switch result.op.kind {
+                case .park(let point): reached = current.map { abs($0.minX - point.x) <= 1 } ?? false
+                case .restore(let frame, _): reached = current.map { approximatelyEqual($0, frame) } ?? false
+                }
+                guard reached, let current else {
+                    failures.append(OperationFailure(managedID: result.op.managedID, message: error))
+                    continue
+                }
+                log("\(result.op.managedID): reported \(error) but reached the target; treating as success")
+                result = OpResult(op: result.op, actual: current, error: nil, note: nil)
             }
             switch result.op.kind {
             case .park:
@@ -553,7 +720,9 @@ public final class TabEngine {
 
     /// 解除・タブ削除で手放す窓を固定 frame に戻す(画面隅に取り残さないため)。
     /// 退避フラグだけに頼らず、非アクティブタブの窓は実位置にかかわらず戻す(退避が「失敗扱いだが適用済み」でも拾う)。
-    private func releaseAll(_ windows: [ManagedWindow], from tab: Tab) async {
+    ///
+    /// 戻り値は復元を確認できなかった窓(退避フラグは維持する)。呼び出し側はこれが空のときだけ登録を手放す。
+    private func releaseAll(_ windows: [ManagedWindow], from tab: Tab) async -> Set<UUID> {
         let isActive = tab.id == state.activeTabID
         var ops: [WindowOp] = []
         for window in windows {
@@ -563,13 +732,78 @@ public final class TabEngine {
                 ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(window.frame, raise: false)))
             }
         }
-        guard !ops.isEmpty else { return }
+        guard !ops.isEmpty else { return [] }
+        let driver = self.driver
+        var unreleased = Set<UUID>()
         for result in await run(ops) {
             if let error = result.error {
-                log("release: could not restore \(result.op.managedID): \(error)")
+                // 適用後に throw した可能性があるので読み戻して確認する。到達していれば成功扱い。
+                let recorded: CGRect? = { if case .restore(let f, _) = result.op.kind { return f } else { return nil } }()
+                let windowID = result.op.windowID
+                if let recorded, let current = try? await executor.run({ try driver.frame(of: windowID) }),
+                    approximatelyEqual(current, recorded)
+                {
+                    log("release: \(result.op.managedID) reported \(error) but reached its frame")
+                } else {
+                    log("release: could not restore \(result.op.managedID): \(error)")
+                    unreleased.insert(result.op.managedID)
+                    continue
+                }
             }
             parkedWindowIDs.remove(result.op.managedID)
         }
+        return unreleased
+    }
+
+    private enum PlacementOutcome: CustomStringConvertible {
+        case placed(CGRect)
+        case parked
+
+        var description: String {
+            switch self {
+            case .placed(let f): return "\(f)"
+            case .parked: return "parked (inactive tab)"
+            }
+        }
+    }
+
+    /// 登録・紐付け時の配置。失敗しても窓の実状態を読み戻し、管理下に置けるなら結果を返す。
+    ///
+    /// AX は操作を適用したあとでタイムアウト等を返すことがある。そのとき未登録のまま捨てると
+    /// 隅へ動かした窓を誰も追跡できなくなるので、「動いていれば commit、動いていなければ throw」にする。
+    private func place(windowID: CGWindowID, frame: CGRect, intoActive: Bool) async throws -> PlacementOutcome {
+        let driver = self.driver
+        if intoActive {
+            do {
+                return .placed(try await executor.run { try driver.setFrame(frame, of: windowID) })
+            } catch {
+                // 読み戻せれば(部分適用でも)管理下に置く。読めない = 窓が消えた/無応答なので失敗させる。
+                if let current = try? await executor.run({ try driver.frame(of: windowID) }) {
+                    log("place: setFrame reported \(error); adopting current \(current)")
+                    return .placed(clamped(current))
+                }
+                throw error
+            }
+        }
+        let point = layout.parkPoint
+        do {
+            try await executor.run { try driver.setPosition(point, of: windowID) }
+            return .parked
+        } catch {
+            if await isProbablyParked(windowID, parkPoint: point) {
+                log("place: park reported \(error) but the window is at the corner; committing as parked")
+                return .parked
+            }
+            throw error
+        }
+    }
+
+    /// 退避の IPC が失敗したあと、実際に隅へ動いたかを読み戻して判定する。
+    /// 読めない場合は「動いたかもしれない」として true(見失うより管理下に置く方が安全。消えた窓は reconcile が外す)。
+    private func isProbablyParked(_ windowID: CGWindowID, parkPoint: CGPoint) async -> Bool {
+        let driver = self.driver
+        guard let current = try? await executor.run({ try driver.frame(of: windowID) }) else { return true }
+        return abs(current.minX - parkPoint.x) <= 1
     }
 
     // MARK: - 内部ヘルパー
@@ -604,6 +838,8 @@ public final class TabEngine {
     private func cancelPendingRestore(_ id: UUID) {
         pendingRestores[id]?.task.cancel()
         pendingRestores[id] = nil
+        // IPC 中で止められない Task が戻ってきても古い値を書かないよう、世代を進めて無効化する。
+        _ = nextGeneration(for: id)
     }
 
     private func tabIndex(_ id: UUID) throws -> Int {

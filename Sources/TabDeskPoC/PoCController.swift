@@ -397,7 +397,7 @@ final class PoCController {
             do {
                 observers[pid] = try AppWindowObserver(
                     pid: pid,
-                    notifications: [kAXWindowMovedNotification, kAXWindowResizedNotification]
+                    requiredNotifications: [kAXWindowMovedNotification, kAXWindowResizedNotification]
                 ) { [weak self] notification, element in
                     self?.handleWindowChange(notification, element)
                 }

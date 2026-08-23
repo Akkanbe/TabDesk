@@ -14,6 +14,8 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         var raiseFails = false
         /// 「適用はされたがタイムアウトで失敗扱いになった」を模す: 変更を反映したうえで throw する。
         var throwAfterApply = false
+        /// 書き込み(setFrame / setPosition / raise)だけ失敗し、読み取りは通る(無応答アプリに近い)。
+        var failWrites = false
     }
 
     private let lock = NSLock()
@@ -40,6 +42,10 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
 
     func setThrowAfterApply(_ id: CGWindowID, _ value: Bool = true) {
         lock.withLock { windows[id]?.throwAfterApply = value }
+    }
+
+    func setFailWrites(_ id: CGWindowID, _ value: Bool = true) {
+        lock.withLock { windows[id]?.failWrites = value }
     }
 
     struct SimulatedTimeout: Error {}
@@ -72,6 +78,7 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         if delay > 0 { Thread.sleep(forTimeInterval: delay) }
         return try lock.withLock {
             guard var w = windows[id], w.alive else { throw WindowDriverError.unknownWindow(id) }
+            if w.failWrites, name != "frame" { throw SimulatedTimeout() }
             let result = try body(&w)
             windows[id] = w
             if w.throwAfterApply, name != "frame" { throw SimulatedTimeout() }

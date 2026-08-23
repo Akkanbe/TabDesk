@@ -18,13 +18,14 @@ final class SidebarPanel: NSPanel {
     private let editModeCheck = NSButton(checkboxWithTitle: "編集モード(動かした位置を記憶)", target: nil, action: nil)
     private var permissionTimer: Timer?
 
-    static let alwaysOnTopDefaultsKey = "SidebarAlwaysOnTop"
+    /// 「常に最前面」設定。既定 true。メニューとパネルはこの値を唯一の真実として同期する。
+    static let alwaysOnTopSetting = PersistedToggle(key: "SidebarAlwaysOnTop", defaultValue: true)
 
     /// true: 常に最前面(他の窓に隠れない)。false: 通常の窓と同じ階層(隠れることがある。メニューバーから再表示)。
     var alwaysOnTop: Bool {
         didSet {
             level = alwaysOnTop ? .floating : .normal
-            UserDefaults.standard.set(alwaysOnTop, forKey: Self.alwaysOnTopDefaultsKey)
+            Self.alwaysOnTopSetting.value = alwaysOnTop
             if alwaysOnTop { orderFrontRegardless() }
         }
     }
@@ -32,8 +33,7 @@ final class SidebarPanel: NSPanel {
     init(manager: WindowManager, logger: FileLogger) {
         self.manager = manager
         self.logger = logger
-        UserDefaults.standard.register(defaults: [Self.alwaysOnTopDefaultsKey: true])
-        self.alwaysOnTop = UserDefaults.standard.bool(forKey: Self.alwaysOnTopDefaultsKey)
+        self.alwaysOnTop = Self.alwaysOnTopSetting.value
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: WindowManager.sidebarWidth, height: 600),
             styleMask: [.nonactivatingPanel, .borderless],
@@ -51,7 +51,7 @@ final class SidebarPanel: NSPanel {
         contentView = buildContent()
         reposition()
 
-        manager.engine.onStateChanged = { [weak self] _ in self?.render() }
+        manager.onStateChanged = { [weak self] _ in self?.render() }
         // 改名中に切替先アプリを前面化するとサイドバーがキーを失い、編集が即終了してしまう。
         manager.suppressAppActivation = { [weak self] in self?.isRenaming ?? false }
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -90,12 +90,25 @@ final class SidebarPanel: NSPanel {
         root.spacing = 6
         root.edgeInsets = NSEdgeInsets(top: 12, left: 10, bottom: 12, right: 10)
         root.translatesAutoresizingMaskIntoConstraints = false
-        background.addSubview(root)
+
+        // タブ・窓が増えても下部の操作に届くよう、内容全体を縦スクロールに入れる。
+        // NSClipView は既定で非 flipped(内容が短いと下寄せになる)ので flipped な ClipView を使う。
+        let scroll = NSScrollView()
+        scroll.contentView = FlippedClipView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = root
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        background.addSubview(scroll)
         NSLayoutConstraint.activate([
-            root.topAnchor.constraint(equalTo: background.topAnchor),
-            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: background.bottomAnchor),
+            scroll.topAnchor.constraint(equalTo: background.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            root.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            root.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            root.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
         ])
 
         // ヘッダ
@@ -202,6 +215,10 @@ final class SidebarPanel: NSPanel {
             for window in active.windows {
                 let row = WindowRowView(window: window)
                 row.onRemove = { [weak self] in self?.unregister(window.id) }
+                row.onAssignRequested = { [weak self, weak row] in
+                    guard let self, let row else { return }
+                    self.showAssignMenu(for: window, anchor: row)
+                }
                 windowsStack.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: windowsStack.widthAnchor).isActive = true
             }
@@ -234,8 +251,23 @@ final class SidebarPanel: NSPanel {
     }
 
     @objc private func showAddWindowMenu(_ sender: NSButton) {
+        // 列挙は全アプリへの IPC なのでバックグラウンドで行い、終わってからメニューを出す。
+        guard sender.isEnabled else { return }
+        let originalTitle = sender.title
+        sender.isEnabled = false
+        sender.title = "読み込み中…"
+        Task { [weak self, weak sender] in
+            guard let self else { return }
+            let candidates = await self.manager.availableWindows()
+            guard let sender else { return }
+            sender.title = originalTitle
+            sender.isEnabled = self.manager.engine.state.activeTabID != nil
+            self.presentAddWindowMenu(candidates, anchor: sender)
+        }
+    }
+
+    private func presentAddWindowMenu(_ candidates: [WindowRecord], anchor sender: NSView) {
         let menu = NSMenu()
-        let candidates = manager.availableWindows()
         if candidates.isEmpty {
             menu.addItem(withTitle: "登録できるウィンドウがありません", action: nil, keyEquivalent: "")
         }
@@ -260,6 +292,41 @@ final class SidebarPanel: NSPanel {
                 logger.log("register failed: \(error)")
             }
         }
+    }
+
+    /// 未復元エントリに窓を手で割り当てる。同じアプリの窓を先に並べる。
+    private func showAssignMenu(for window: ManagedWindow, anchor: NSView) {
+        Task { [weak self, weak anchor] in
+            guard let self else { return }
+            let candidates = await self.manager.availableWindows()
+            guard let anchor else { return }
+            self.presentAssignMenu(candidates, for: window, anchor: anchor)
+        }
+    }
+
+    private func presentAssignMenu(_ candidates: [WindowRecord], for window: ManagedWindow, anchor: NSView) {
+        let menu = NSMenu()
+        let sameApp = candidates.filter { $0.bundleID == window.identity.bundleID }
+        let others = candidates.filter { $0.bundleID != window.identity.bundleID }
+        if candidates.isEmpty {
+            menu.addItem(withTitle: "割り当てできるウィンドウがありません", action: nil, keyEquivalent: "")
+        }
+        for (index, record) in (sameApp + others).enumerated() {
+            if index == sameApp.count, !sameApp.isEmpty, !others.isEmpty {
+                menu.addItem(.separator())
+            }
+            let title = record.title.isEmpty ? record.appName : "\(record.appName) — \(record.title)"
+            let item = NSMenuItem(title: String(title.prefix(60)), action: #selector(assignWindow(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = AssignmentBox(record: record, managedID: window.id)
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.height), in: anchor)
+    }
+
+    @objc private func assignWindow(_ sender: NSMenuItem) {
+        guard let box = sender.representedObject as? AssignmentBox else { return }
+        Task { [manager] in await manager.bind(box.record, to: box.managedID) }
     }
 
     private func activate(_ tabID: UUID) {
@@ -312,7 +379,7 @@ final class SidebarPanel: NSPanel {
     private func delete(_ tabID: UUID) {
         Task { [manager, logger] in
             do {
-                try await manager.engine.deleteTab(tabID)
+                try await manager.deleteTab(tabID)  // Core 削除と AX 資源の清掃をまとめて行う
             } catch {
                 logger.log("delete failed: \(error)")
             }
@@ -330,10 +397,24 @@ final class SidebarPanel: NSPanel {
     }
 }
 
+/// 内容を上端から並べるための ClipView(既定は下寄せ)。
+private final class FlippedClipView: NSClipView {
+    override var isFlipped: Bool { true }
+}
+
 /// NSMenuItem.representedObject に載せるための箱(WindowRecord は struct なので)。
 private final class WindowRecordBox: NSObject {
     let record: WindowRecord
     init(_ record: WindowRecord) { self.record = record }
+}
+
+private final class AssignmentBox: NSObject {
+    let record: WindowRecord
+    let managedID: UUID
+    init(record: WindowRecord, managedID: UUID) {
+        self.record = record
+        self.managedID = managedID
+    }
 }
 
 // MARK: - 行ビュー
@@ -399,20 +480,25 @@ final class TabRowView: NSView {
     @objc private func deleteAction() { onDelete?() }
 }
 
-/// 登録ウィンドウ 1 行。
+/// 登録ウィンドウ 1 行。未復元(実ウィンドウに紐付いていない)ならグレー表示し、クリックで割り当てメニューを出す。
 @MainActor
 final class WindowRowView: NSView {
     var onRemove: (() -> Void)?
+    var onAssignRequested: (() -> Void)?
+
+    private let isBound: Bool
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     init(window: ManagedWindow) {
+        isBound = window.isBound
         super.init(frame: .zero)
         let title = window.identity.title.isEmpty ? window.identity.appName : "\(window.identity.appName) — \(window.identity.title)"
-        let label = NSTextField(labelWithString: title)
+        let label = NSTextField(labelWithString: isBound ? title : "\(title)(未復元)")
         label.font = NSFont.systemFont(ofSize: 11)
         label.lineBreakMode = .byTruncatingTail
-        label.toolTip = title
+        label.textColor = isBound ? .labelColor : .secondaryLabelColor
+        label.toolTip = isBound ? title : "\(title)\nクリックして、いま開いているウィンドウを割り当てます"
         let remove = NSButton(title: "×", target: self, action: #selector(removeAction))
         remove.bezelStyle = .inline
         remove.isBordered = false
@@ -432,6 +518,12 @@ final class WindowRowView: NSView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {
+        if !isBound {
+            onAssignRequested?()
+        }
+    }
 
     @objc private func removeAction() { onRemove?() }
 }

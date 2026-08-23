@@ -37,73 +37,164 @@ public struct EnumerationStats: Sendable, CustomStringConvertible {
     }
 }
 
+/// 列挙対象アプリの軽量な記述(NSWorkspace から MainActor 上で取る)。AX には触れない。
+public struct AppDescriptor: Sendable, Hashable {
+    public let pid: pid_t
+    public let name: String
+    public let bundleID: String
+
+    public init(pid: pid_t, name: String, bundleID: String) {
+        self.pid = pid
+        self.name = name
+        self.bundleID = bundleID
+    }
+}
+
+/// 1 アプリ分の列挙結果。
+public struct AppEnumeration: Sendable {
+    public var records: [WindowRecord]
+    public var stats: EnumerationStats
+
+    public init(records: [WindowRecord], stats: EnumerationStats) {
+        self.records = records
+        self.stats = stats
+    }
+}
+
+extension EnumerationStats {
+    mutating func merge(_ other: EnumerationStats) {
+        apps += other.apps
+        for (k, v) in other.appFailures { appFailures[k, default: 0] += v }
+        elements += other.elements
+        nonStandard += other.nonStandard
+        for (k, v) in other.windowIDFailures { windowIDFailures[k, default: 0] += v }
+        standard += other.standard
+        appFailureDetails += other.appFailureDetails
+        windowIDFailureDetails += other.windowIDFailureDetails
+    }
+}
+
 public enum WindowEnumerator {
     /// 列挙時の AX タイムアウト。応答しないアプリで UI が固まらないよう短くする。
     public static let messagingTimeout: Float = 0.5
 
-    /// 通常アプリ(Dock に出るアプリ)の標準ウィンドウを列挙する。
+    /// 通常アプリ(Dock に出るアプリ)の一覧。NSWorkspace なので MainActor、AX IPC は無い。
+    @MainActor
+    public static func regularApps(excludingPID excluded: pid_t = getpid()) -> [AppDescriptor] {
+        NSWorkspace.shared.runningApplications.compactMap { app in
+            guard app.activationPolicy == .regular, app.processIdentifier != excluded else { return nil }
+            return AppDescriptor(
+                pid: app.processIdentifier,
+                name: app.localizedName ?? "pid \(app.processIdentifier)",
+                bundleID: app.bundleIdentifier ?? "")
+        }
+    }
+
+    /// 1 アプリの標準ウィンドウを列挙する(相手アプリへの同期 IPC。バックグラウンドで呼ぶこと)。
     /// ダイアログ・シート・パネルは kAXStandardWindowSubrole でないので除外される。
+    public static func enumerateWindows(of app: AppDescriptor) -> AppEnumeration {
+        var result: [WindowRecord] = []
+        var stats = EnumerationStats()
+        stats.apps = 1
+        let pid = app.pid
+        let appName = app.name
+        let appElement = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appElement, messagingTimeout)
+
+        let elements: [AXUIElement]
+        do {
+            elements = try AXAttributes.elements(appElement, kAXWindowsAttribute)
+        } catch let error as AXCallError {
+            stats.appFailures[error.code.readableDescription, default: 0] += 1
+            stats.appFailureDetails.append("\(appName): \(error.code.readableDescription)")
+            return AppEnumeration(records: [], stats: stats)
+        } catch {
+            stats.appFailures["\(error)", default: 0] += 1
+            stats.appFailureDetails.append("\(appName): \(error)")
+            return AppEnumeration(records: [], stats: stats)
+        }
+        for element in elements {
+            stats.elements += 1
+            AXUIElementSetMessagingTimeout(element, messagingTimeout)
+            let window: AXWindow
+            do {
+                window = try AXWindow(element: element, pid: pid)
+            } catch let error as AXCallError {
+                stats.windowIDFailures[error.code.readableDescription, default: 0] += 1
+                let role = (try? AXAttributes.string(element, kAXRoleAttribute)) ?? "?"
+                let subrole = (try? AXAttributes.string(element, kAXSubroleAttribute)) ?? "?"
+                stats.windowIDFailureDetails.append("\(appName) [\(role)/\(subrole)]: \(error.code.readableDescription)")
+                continue
+            } catch {
+                stats.windowIDFailures["\(error)", default: 0] += 1
+                stats.windowIDFailureDetails.append("\(appName): \(error)")
+                continue
+            }
+            guard window.isStandard else {
+                stats.nonStandard += 1
+                continue
+            }
+            stats.standard += 1
+            result.append(
+                WindowRecord(
+                    window: window,
+                    appName: appName,
+                    bundleID: app.bundleID,
+                    title: window.title,
+                    frame: try? window.frame(),
+                    isMinimized: window.isMinimized
+                )
+            )
+        }
+        return AppEnumeration(records: result, stats: stats)
+    }
+
+    /// 複数アプリを pid ごとに並列で列挙し、結果を結合する(MainActor を塞がない)。
+    /// `enumerate` は差し替え可能(テストで遅延バックエンドを注入する)。
+    public static func enumerateInParallel(
+        _ apps: [AppDescriptor],
+        enumerate: @escaping @Sendable (AppDescriptor) -> AppEnumeration = enumerateWindows(of:)
+    ) async -> (records: [WindowRecord], stats: EnumerationStats) {
+        let executor = BlockingExecutor()
+        let results: [AppEnumeration] = await withTaskGroup(of: AppEnumeration.self) { group in
+            for app in apps {
+                group.addTask { await executor.run { enumerate(app) } }
+            }
+            var all: [AppEnumeration] = []
+            for await r in group { all.append(r) }
+            return all
+        }
+        var records: [WindowRecord] = []
+        var stats = EnumerationStats()
+        // 結果順を安定させる(pid 昇順)。TaskGroup の完了順は不定のため。
+        for r in results.sorted(by: { ($0.records.first?.window.pid ?? 0) < ($1.records.first?.window.pid ?? 0) }) {
+            records += r.records
+            stats.merge(r.stats)
+        }
+        return (records, stats)
+    }
+
+    /// 通常アプリの標準ウィンドウを pid 並列で列挙する(MainActor を塞がない版)。
+    @MainActor
+    public static func standardWindowsAsync(excludingPID excluded: pid_t = getpid())
+        async -> (records: [WindowRecord], stats: EnumerationStats)
+    {
+        await enumerateInParallel(regularApps(excludingPID: excluded))
+    }
+
+    /// 同期版(PoC 用)。MainActor 上で全アプリへ逐次 IPC するので本体では使わない。
     @MainActor
     public static func standardWindows(excludingPID excluded: pid_t = getpid())
         -> (records: [WindowRecord], stats: EnumerationStats)
     {
-        var result: [WindowRecord] = []
+        var records: [WindowRecord] = []
         var stats = EnumerationStats()
-        for app in NSWorkspace.shared.runningApplications {
-            guard app.activationPolicy == .regular, app.processIdentifier != excluded else { continue }
-            stats.apps += 1
-            let pid = app.processIdentifier
-            let appName = app.localizedName ?? "pid \(pid)"
-            let appElement = AXUIElementCreateApplication(pid)
-            AXUIElementSetMessagingTimeout(appElement, messagingTimeout)
-
-            let elements: [AXUIElement]
-            do {
-                elements = try AXAttributes.elements(appElement, kAXWindowsAttribute)
-            } catch let error as AXCallError {
-                stats.appFailures[error.code.readableDescription, default: 0] += 1
-                stats.appFailureDetails.append("\(appName): \(error.code.readableDescription)")
-                continue
-            } catch {
-                stats.appFailures["\(error)", default: 0] += 1
-                stats.appFailureDetails.append("\(appName): \(error)")
-                continue
-            }
-            for element in elements {
-                stats.elements += 1
-                AXUIElementSetMessagingTimeout(element, messagingTimeout)
-                let window: AXWindow
-                do {
-                    window = try AXWindow(element: element, pid: pid)
-                } catch let error as AXCallError {
-                    stats.windowIDFailures[error.code.readableDescription, default: 0] += 1
-                    let role = (try? AXAttributes.string(element, kAXRoleAttribute)) ?? "?"
-                    let subrole = (try? AXAttributes.string(element, kAXSubroleAttribute)) ?? "?"
-                    stats.windowIDFailureDetails.append("\(appName) [\(role)/\(subrole)]: \(error.code.readableDescription)")
-                    continue
-                } catch {
-                    stats.windowIDFailures["\(error)", default: 0] += 1
-                    stats.windowIDFailureDetails.append("\(appName): \(error)")
-                    continue
-                }
-                guard window.isStandard else {
-                    stats.nonStandard += 1
-                    continue
-                }
-                stats.standard += 1
-                result.append(
-                    WindowRecord(
-                        window: window,
-                        appName: appName,
-                        bundleID: app.bundleIdentifier ?? "",
-                        title: window.title,
-                        frame: try? window.frame(),
-                        isMinimized: window.isMinimized
-                    )
-                )
-            }
+        for app in regularApps(excludingPID: excluded) {
+            let r = enumerateWindows(of: app)
+            records += r.records
+            stats.merge(r.stats)
         }
-        return (result, stats)
+        return (records, stats)
     }
 
     /// CGWindowList 側から見た画面上のウィンドウ ID(_AXUIElementGetWindow の答え合わせ用)。

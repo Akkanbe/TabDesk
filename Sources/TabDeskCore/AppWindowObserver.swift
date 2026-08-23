@@ -9,15 +9,38 @@ import Foundation
 public final class AppWindowObserver {
     public typealias Handler = @MainActor (_ notification: String, _ window: AXUIElement) -> Void
 
+    /// 必須通知と任意通知の登録結果から「observer を成立させるか」を決める純粋なポリシー。
+    /// 必須(moved / resized = 位置固定の要)が 1 つでも失敗なら不成立、任意(focused 等)は失敗しても警告止まり。
+    public enum RegistrationPolicy {
+        public static func evaluate(required: [String: AXError], optional: [String: AXError]) -> Result<[String], AXCallError> {
+            if let failed = required.sorted(by: { $0.key < $1.key }).first(where: { $0.value != .success && $0.value != .notificationAlreadyRegistered }) {
+                return .failure(AXCallError(operation: "AXObserverAddNotification(\(failed.key))", code: failed.value))
+            }
+            let unavailable = optional.filter { $0.value != .success && $0.value != .notificationAlreadyRegistered }.keys.sorted()
+            return .success(unavailable)
+        }
+    }
+
     public let pid: pid_t
+    /// 登録できなかった任意通知(ログ用。位置固定には影響しない)。
+    public private(set) var unavailableNotifications: [String] = []
     private let observer: AXObserver
     private let appElement: AXUIElement
     private let handler: Handler
     private var isValid = true
 
-    /// - Parameter messagingTimeout: 登録(AXObserverAddNotification)は相手アプリへの同期 IPC で、
-    ///   無応答アプリだとメインスレッドが止まる。上限をここで切る(秒)。
-    public init(pid: pid_t, notifications: [String], messagingTimeout: Float = 1.0, handler: @escaping Handler) throws {
+    /// - Parameters:
+    ///   - requiredNotifications: 1 つでも登録できなければ throw する(observer は作らない)。
+    ///   - optionalNotifications: 登録できなくても observer は成立させ、`unavailableNotifications` に残す。
+    ///   - messagingTimeout: 登録(AXObserverAddNotification)は相手アプリへの同期 IPC で、
+    ///     無応答アプリだとメインスレッドが止まる。上限をここで切る(秒)。
+    public init(
+        pid: pid_t,
+        requiredNotifications: [String],
+        optionalNotifications: [String] = [],
+        messagingTimeout: Float = 1.0,
+        handler: @escaping Handler
+    ) throws {
         self.pid = pid
         self.handler = handler
         self.appElement = AXUIElementCreateApplication(pid)
@@ -30,8 +53,20 @@ public final class AppWindowObserver {
         }
         self.observer = created
 
-        for name in notifications {
-            try addNotification(name)
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        var required: [String: AXError] = [:]
+        var optional: [String: AXError] = [:]
+        for name in requiredNotifications {
+            required[name] = AXObserverAddNotification(created, appElement, name as CFString, refcon)
+        }
+        for name in optionalNotifications {
+            optional[name] = AXObserverAddNotification(created, appElement, name as CFString, refcon)
+        }
+        switch RegistrationPolicy.evaluate(required: required, optional: optional) {
+        case .failure(let error):
+            throw error
+        case .success(let unavailable):
+            unavailableNotifications = unavailable
         }
         // メインのランループに載せるので、コールバックは必ずメインスレッドで呼ばれる。
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .defaultMode)

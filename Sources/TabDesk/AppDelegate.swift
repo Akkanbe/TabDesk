@@ -11,9 +11,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         logger.log("TabDesk started. log: \(logger.fileURL.path) trusted=\(manager.isTrusted)")
-        installStatusItem()
+        // メニューの「常に最前面」表示はサイドバーの実状態から作るので、サイドバーを先に用意する。
         let panel = SidebarPanel(manager: manager, logger: logger)
         sidebar = panel
+        installStatusItem(alwaysOnTop: panel.alwaysOnTop)
         panel.orderFrontRegardless()
         logger.log("sidebar shown at \(panel.frame)")
         if !manager.isTrusted {
@@ -21,21 +22,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 終了前に退避中の窓を戻す。非同期なので一旦 terminateLater で保留し、完了後に返事をする。
-    private var terminationStarted = false
+    /// 終了前に退避中の窓を戻す。非同期なので terminateLater で保留し、cleanup 完了か 3 秒の期限で 1 回だけ返事する。
+    private lazy var termination = TerminationCoordinator(
+        deadline: .seconds(3),
+        cleanup: { [manager] in await manager.prepareForTermination() },
+        reply: { [logger] reason in
+            logger.log("terminate: \(reason)")
+            NSApp.reply(toApplicationShouldTerminate: true)
+        })
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard !terminationStarted else { return .terminateNow }
-        terminationStarted = true
-        Task { [manager] in
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { await manager.prepareForTermination() }
-                group.addTask { try? await Task.sleep(for: .seconds(3)) }  // 無応答アプリで終了が止まらないよう上限
-                await group.next()
-                group.cancelAll()
-            }
-            NSApp.reply(toApplicationShouldTerminate: true)
-        }
+        // cleanup 中の再要求も待たせる(terminateNow を返すと復元完了前に終了してしまう)。
+        termination.requestTermination()
         return .terminateLater
     }
 
@@ -48,13 +46,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - メニューバー
 
-    private func installStatusItem() {
+    private func installStatusItem(alwaysOnTop: Bool) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: "TabDesk")
         let menu = NSMenu()
         menu.addItem(withTitle: "サイドバーを表示", action: #selector(showSidebar), keyEquivalent: "")
         let onTop = NSMenuItem(title: "サイドバーを常に最前面にする", action: #selector(toggleAlwaysOnTop(_:)), keyEquivalent: "")
-        onTop.state = UserDefaults.standard.bool(forKey: SidebarPanel.alwaysOnTopDefaultsKey) ? .on : .off
+        onTop.state = alwaysOnTop ? .on : .off
         menu.addItem(onTop)
         menu.addItem(withTitle: "アクセシビリティ設定を開く", action: #selector(openAccessibilitySettings), keyEquivalent: "")
         menu.addItem(withTitle: "ログを開く", action: #selector(openLog), keyEquivalent: "")
@@ -114,22 +112,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch command {
         case "status":
             let s = engine.state
+            let unbound = s.allWindows.filter { !$0.isBound }
             logger.log("status: trusted=\(manager.isTrusted) tabs=\(s.tabs.map { "\($0.name)(\($0.windows.count))" }) " +
-                "active=\(s.activeTab?.name ?? "-") parked=\(engine.parkedWindowIDs.count) edit=\(engine.editMode)")
+                "active=\(s.activeTab?.name ?? "-") parked=\(engine.parkedWindowIDs.count) unbound=\(unbound.count) " +
+                "edit=\(engine.editMode) state=\(manager.store.fileURL.path)")
+            for w in unbound {
+                logger.log("  unbound: \(w.identity.appName) | \(w.identity.title) id=\(w.id)")
+            }
         case "windows":
-            for record in manager.availableWindows() {
-                logger.log("  wid=\(record.window.windowID) pid=\(record.window.pid) \(record.appName) | \(record.title)")
+            Task { [manager, logger] in
+                for record in await manager.availableWindows() {
+                    logger.log("  wid=\(record.window.windowID) pid=\(record.window.pid) \(record.appName) | \(record.title)")
+                }
             }
         case "tab":
             engine.createTab(name: q["name"] ?? "タブ\(engine.state.tabs.count + 1)")
         case "add":
-            guard let wid = CGWindowID(q["wid"] ?? ""), let target = tab(named: q["tab"]),
-                let record = manager.availableWindows().first(where: { $0.window.windowID == wid })
-            else {
+            guard let wid = CGWindowID(q["wid"] ?? ""), let target = tab(named: q["tab"]) else {
                 logger.log("url: add needs wid=<available window id> [&tab=name]")
                 return
             }
             Task { [manager, logger] in
+                guard let record = await manager.availableWindows().first(where: { $0.window.windowID == wid }) else {
+                    logger.log("url: add: wid \(wid) is not an available window")
+                    return
+                }
                 do { try await manager.register(record, into: target.id) } catch { logger.log("add failed: \(error)") }
             }
         case "activate":
@@ -152,6 +159,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             engine.editMode = (q["on"] ?? "1") != "0"
             sidebar?.render()
             logger.log("editMode=\(engine.editMode)")
+        case "restore":
+            Task { [manager] in await manager.restoreUnboundWindows(strictness: (q["strict"] ?? "0") == "1" ? .strict : .lenient) }
+        case "save":
+            manager.saveNow()
+            logger.log("saved to \(manager.store.fileURL.path)")
+        case "quit":
+            NSApp.terminate(nil)
         case "probe":
             // 座標系の切り分け用: 自アプリの赤い窓をコンテンツ領域の左上(サイドバーの右隣)に 15 秒出す。
             // これがサイドバーと被って見えるなら、描画がサイドバーの bounds からはみ出している。
