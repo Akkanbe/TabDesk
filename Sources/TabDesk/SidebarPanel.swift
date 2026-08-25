@@ -93,6 +93,10 @@ final class SidebarPanel: NSPanel {
 
         // タブ・窓が増えても下部の操作に届くよう、内容全体を縦スクロールに入れる。
         // NSClipView は既定で非 flipped(内容が短いと下寄せになる)ので flipped な ClipView を使う。
+        // 長いタイトルの行が Auto Layout 経由でパネルごと広げないよう、幅を固定する。
+        background.translatesAutoresizingMaskIntoConstraints = false
+        background.widthAnchor.constraint(equalToConstant: WindowManager.sidebarWidth).isActive = true
+
         let scroll = NSScrollView()
         scroll.contentView = FlippedClipView()
         scroll.drawsBackground = false
@@ -258,15 +262,15 @@ final class SidebarPanel: NSPanel {
         sender.title = "読み込み中…"
         Task { [weak self, weak sender] in
             guard let self else { return }
-            let candidates = await self.manager.availableWindows()
+            let (candidates, unavailable) = await self.manager.availableWindowsAndIssues()
             guard let sender else { return }
             sender.title = originalTitle
             sender.isEnabled = self.manager.engine.state.activeTabID != nil
-            self.presentAddWindowMenu(candidates, anchor: sender)
+            self.presentAddWindowMenu(candidates, unavailableApps: unavailable, anchor: sender)
         }
     }
 
-    private func presentAddWindowMenu(_ candidates: [WindowRecord], anchor sender: NSView) {
+    private func presentAddWindowMenu(_ candidates: [WindowRecord], unavailableApps: [String], anchor sender: NSView) {
         let menu = NSMenu()
         if candidates.isEmpty {
             menu.addItem(withTitle: "登録できるウィンドウがありません", action: nil, keyEquivalent: "")
@@ -277,6 +281,15 @@ final class SidebarPanel: NSPanel {
             item.target = self
             item.representedObject = WindowRecordBox(record)
             menu.addItem(item)
+        }
+        if !unavailableApps.isEmpty {
+            menu.addItem(.separator())
+            // AX を拒否するアプリは理由つきでグレー表示する(仕様 §3.3、段階 3)。
+            for detail in unavailableApps {
+                let item = NSMenuItem(title: "管理不可: \(String(detail.prefix(60)))", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+            }
         }
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
     }
@@ -332,7 +345,7 @@ final class SidebarPanel: NSPanel {
     private func activate(_ tabID: UUID) {
         Task { [manager, logger] in
             do {
-                try await manager.engine.activate(tabID)
+                try await manager.activate(tabID)  // フォーカス連動の抑止つき入口
             } catch {
                 logger.log("activate failed: \(error)")
             }
@@ -441,6 +454,7 @@ final class TabRowView: NSView {
         let label = NSTextField(labelWithString: tab.name)
         label.font = NSFont.systemFont(ofSize: 13, weight: isActive ? .semibold : .regular)
         label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let count = NSTextField(labelWithString: "\(tab.windows.count)")
         count.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         count.textColor = .secondaryLabelColor
@@ -497,6 +511,8 @@ final class WindowRowView: NSView {
         let label = NSTextField(labelWithString: isBound ? title : "\(title)(未復元)")
         label.font = NSFont.systemFont(ofSize: 11)
         label.lineBreakMode = .byTruncatingTail
+        // 幅が足りなければ末尾省略で縮む(サイドバーを押し広げない)。
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.textColor = isBound ? .labelColor : .secondaryLabelColor
         label.toolTip = isBound ? title : "\(title)\nクリックして、いま開いているウィンドウを割り当てます"
         let remove = NSButton(title: "×", target: self, action: #selector(removeAction))

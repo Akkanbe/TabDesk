@@ -58,6 +58,15 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
   OFF のときは、動かしても離して約 0.25 秒後に固定位置へ戻る
 - サイドバーをクリックしても作業中のアプリのフォーカスは奪わない
 
+### ホットキーとフォーカス連動
+
+- 既定のホットキー: **Ctrl+Option+1〜9** でタブ切替、**Ctrl+Option+R** でフォーカス中の窓をアクティブタブに登録、
+  **Ctrl+Option+E** で編集モード切替。割当は `~/Library/Application Support/TabDesk/hotkeys.json` を編集して
+  メニューバーの「ホットキーを再読み込み」で反映する(`"ctrl+alt+1"` のような表記。修飾キーは ctrl / alt / cmd / shift)
+- **フォーカスで自動切替**(既定 ON): Cmd-Tab などで非アクティブタブの窓にフォーカスが移ると、そのタブへ自動で切り替わる。
+  メニューバーで OFF にできる
+- メニューバーに「ログイン時に起動」トグルあり
+
 タブ構成は `~/Library/Application Support/TabDesk/state.json` に自動保存され、次回起動時に復元される。
 再起動後は bundle ID・タイトル・サイズで同じウィンドウを推定して紐付け直す。推定できなかったものは
 一覧に「(未復元)」とグレー表示され、クリックするといま開いているウィンドウを手で割り当てられる。

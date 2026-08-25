@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import TabDeskCore
 
 @MainActor
@@ -8,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sidebar: SidebarPanel?
     private var statusItem: NSStatusItem?
     private var probeWindow: NSWindow?
+    private lazy var hotkeys = HotkeyCenter(logger: logger)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         logger.log("TabDesk started. log: \(logger.fileURL.path) trusted=\(manager.isTrusted)")
@@ -17,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installStatusItem(alwaysOnTop: panel.alwaysOnTop)
         panel.orderFrontRegardless()
         logger.log("sidebar shown at \(panel.frame)")
+        installHotkeys()
         if !manager.isTrusted {
             manager.requestPermission()
         }
@@ -44,6 +47,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - ホットキー
+
+    private func installHotkeys() {
+        hotkeys.onAction = { [weak self] action in
+            guard let self else { return }
+            switch action {
+            case .activateTab(let number):
+                let tabs = self.manager.engine.state.tabs
+                guard tabs.indices.contains(number - 1) else { return }
+                let tabID = tabs[number - 1].id
+                Task { [weak self] in
+                    guard let self else { return }
+                    do {
+                        try await self.manager.activate(tabID)
+                    } catch {
+                        self.logger.log("hotkey activate failed: \(error)")
+                    }
+                }
+            case .registerFocusedWindow:
+                Task { [manager = self.manager] in await manager.registerFocusedWindow() }
+            case .toggleEditMode:
+                self.manager.engine.editMode.toggle()
+                self.sidebar?.render()
+                self.logger.log("editMode=\(self.manager.engine.editMode) (hotkey)")
+            }
+        }
+        hotkeys.reload()
+    }
+
     // MARK: - メニューバー
 
     private func installStatusItem(alwaysOnTop: Bool) {
@@ -54,6 +86,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let onTop = NSMenuItem(title: "サイドバーを常に最前面にする", action: #selector(toggleAlwaysOnTop(_:)), keyEquivalent: "")
         onTop.state = alwaysOnTop ? .on : .off
         menu.addItem(onTop)
+        let follow = NSMenuItem(title: "フォーカスで自動切替", action: #selector(toggleFocusFollows(_:)), keyEquivalent: "")
+        follow.state = manager.focusFollows.value ? .on : .off
+        menu.addItem(follow)
+        let login = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(login)
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "ホットキー設定を開く", action: #selector(openHotkeyConfig), keyEquivalent: "")
+        menu.addItem(withTitle: "ホットキーを再読み込み", action: #selector(reloadHotkeys), keyEquivalent: "")
         menu.addItem(withTitle: "アクセシビリティ設定を開く", action: #selector(openAccessibilitySettings), keyEquivalent: "")
         menu.addItem(withTitle: "ログを開く", action: #selector(openLog), keyEquivalent: "")
         menu.addItem(.separator())
@@ -70,6 +111,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sidebar.alwaysOnTop.toggle()
         sender.state = sidebar.alwaysOnTop ? .on : .off
         logger.log("alwaysOnTop=\(sidebar.alwaysOnTop)")
+    }
+
+    @objc private func toggleFocusFollows(_ sender: NSMenuItem) {
+        manager.focusFollows.value.toggle()
+        sender.state = manager.focusFollows.value ? .on : .off
+        logger.log("focusFollows=\(manager.focusFollows.value)")
+    }
+
+    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            logger.log("launch-at-login failed: \(error)")
+        }
+        sender.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        logger.log("launchAtLogin=\(SMAppService.mainApp.status == .enabled)")
+    }
+
+    @objc private func openHotkeyConfig() {
+        // 無ければ既定を書いてから開く(reload が生成する)。
+        if !FileManager.default.fileExists(atPath: HotkeyCenter.configURL.path) {
+            hotkeys.reload()
+        }
+        NSWorkspace.shared.open(HotkeyCenter.configURL)
+    }
+
+    @objc private func reloadHotkeys() {
+        hotkeys.reload()
     }
 
     @objc private func showSidebar() {
@@ -144,8 +217,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 logger.log("url: activate needs name=<tab>")
                 return
             }
-            Task { [logger] in
-                do { try await engine.activate(target.id) } catch { logger.log("activate failed: \(error)") }
+            Task { [manager, logger] in
+                do { try await manager.activate(target.id) } catch { logger.log("activate failed: \(error)") }
             }
         case "remove":
             guard let wid = CGWindowID(q["wid"] ?? ""), let found = engine.state.managedWindow(forWindowID: wid) else {

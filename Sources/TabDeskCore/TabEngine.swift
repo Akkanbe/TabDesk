@@ -40,6 +40,8 @@ public final class TabEngine {
         case invalidTabOrder
         /// 退避中の窓を固定 frame に戻せなかった(登録は保持される。相手アプリが応答したら再試行できる)。
         case releaseFailed(managedIDs: Set<UUID>)
+        /// エントリは既に別の実ウィンドウに紐付いている(上書きすると前の窓が追跡不能になる)。
+        case entryAlreadyBound(managedID: UUID, boundWindowID: CGWindowID)
 
         public var description: String {
             switch self {
@@ -48,6 +50,7 @@ public final class TabEngine {
             case .windowAlreadyRegistered(let wid, let mid): return "window \(wid) already registered as \(mid)"
             case .invalidTabOrder: return "invalid tab order"
             case .releaseFailed(let ids): return "could not restore \(ids.count) parked window(s); registration kept"
+            case .entryAlreadyBound(let mid, let wid): return "entry \(mid) is already bound to window \(wid)"
             }
         }
     }
@@ -165,8 +168,14 @@ public final class TabEngine {
             let intoActive = tabID == state.activeTabID
 
             let outcome = try await place(windowID: windowID, frame: frame, intoActive: intoActive)
-            if case .placed(let actual) = outcome {
+            switch outcome {
+            case .placed(let actual):
                 managed.frame = actual
+            case .unreached(let current):
+                // 新規登録は「今ある位置」を基準にしてよい(ユーザーがまだレイアウトを決めていない)。
+                managed.frame = clamped(current)
+            case .parked:
+                break
             }
             log("register: \(identity.appName) → \(outcome.description) (requested \(frame))")
             // await をまたいだので index は引き直す(タブが消えていれば unknownTab)。
@@ -198,11 +207,27 @@ public final class TabEngine {
             if let existing = state.managedWindow(forWindowID: windowID), existing.window.id != id {
                 throw EngineError.windowAlreadyRegistered(windowID: windowID, managedID: existing.window.id)
             }
+            // 既に別の窓に紐付いているエントリは上書きしない(前の窓が state から消えて追跡不能になる)。
+            // 同じ窓への再 bind は冪等に成功させる(緩め照合と厳しめ照合が同じ窓を選んだ場合など)。
+            if let bound = found.window.windowID {
+                guard bound == windowID else {
+                    throw EngineError.entryAlreadyBound(managedID: id, boundWindowID: bound)
+                }
+                return
+            }
             let intoActive = found.tab.id == state.activeTabID
             let recorded = found.window.frame
             let outcome = try await place(windowID: windowID, frame: recorded, intoActive: intoActive)
             let frame: CGRect
-            if case .placed(let actual) = outcome { frame = actual } else { frame = recorded }
+            switch outcome {
+            case .placed(let actual):
+                frame = actual
+            case .unreached:
+                // 復元では保存済みレイアウトこそ守るべき値。実窓は後の reconcile / スナップバックが寄せる。
+                frame = recorded
+            case .parked:
+                frame = recorded
+            }
             // await をまたいだので引き直す(解除されていれば unknownWindow)。
             guard let again = state.managedWindow(id: id),
                 let ti = state.tabs.firstIndex(where: { $0.id == again.tab.id }),
@@ -231,6 +256,7 @@ public final class TabEngine {
                 parkedWindowIDs.remove(id)
                 state.tabs[ti].windows[wi].windowID = nil
                 state.tabs[ti].windows[wi].pid = nil
+                vanished.removeValue(forKey: id)
                 count += 1
             }
         }
@@ -255,16 +281,69 @@ public final class TabEngine {
         }
     }
 
+    /// destroyed の瞬間は「窓だけ閉じた」のか「終了シーケンス中の窓クローズ」なのか区別できない
+    /// (Chrome 等は全窓を閉じてからプロセスを終えるため、その時点の isTerminated は false になりやすい)。
+    /// 猶予時間。この間に pid が消えたら「アプリごと終了」として未復元で保持、生きていれば除去する。
+    public var vanishGracePeriod: Duration = .seconds(3)
+    private var vanished: [UUID: (pid: pid_t, at: ContinuousClock.Instant)] = [:]
+
     /// AX の destroyed 通知から呼ぶ。窓だけが閉じられたなら登録を外し、
     /// アプリごと終了したなら「未復元」として保持する(`appTerminated`)。
+    /// どちらか確定できない場合は紐付けだけ外して保留し、判定は reconcile が行う。
     public func noteWindowDestroyed(windowID: CGWindowID, appTerminated: Bool = false) {
         guard let found = state.managedWindow(forWindowID: windowID) else { return }
         if appTerminated, let pid = found.window.pid {
             unbindWindows(pid: pid)
             return
         }
-        log("window destroyed: \(found.window.identity.appName) / \(found.window.identity.title)")
-        removeFromState(found.window.id)
+        let id = found.window.id
+        cancelPendingRestore(id)
+        parkedWindowIDs.remove(id)
+        guard let pid = found.window.pid else {
+            removeFromState(id)
+            return
+        }
+        // 実窓との紐付けだけ外す(以後の操作対象から外れる)。pid は生存判定に使うので残す。
+        setBinding(id, windowID: nil, pid: pid)
+        vanished[id] = (pid, ContinuousClock.now)
+        log("window vanished: \(found.window.identity.appName) / \(found.window.identity.title); deciding after grace")
+    }
+
+    /// 消滅保留の決着。アプリごと消えていれば未復元として保持、猶予を過ぎてもアプリが生きていれば
+    /// 「本当に閉じられた」として除去する。`livePIDs` が nil のときは猶予経過でのみ除去する。
+    private func resolveVanished(livePIDs: Set<pid_t>?) {
+        guard !vanished.isEmpty else { return }
+        let now = ContinuousClock.now
+        for (id, info) in vanished {
+            guard let found = state.managedWindow(id: id) else {
+                vanished.removeValue(forKey: id)
+                continue
+            }
+            if found.window.isBound {
+                // 保留中に(同じアプリの新しい窓へ)再紐付けされた。
+                vanished.removeValue(forKey: id)
+                continue
+            }
+            if let livePIDs, !livePIDs.contains(info.pid) {
+                setBinding(id, windowID: nil, pid: nil)
+                vanished.removeValue(forKey: id)
+                log("vanished: app of \(found.window.identity.appName) quit; kept as unbound")
+            } else if now - info.at >= vanishGracePeriod {
+                vanished.removeValue(forKey: id)
+                log("vanished: \(found.window.identity.appName) / \(found.window.identity.title) was closed; removing")
+                removeFromState(id)
+            }
+        }
+    }
+
+    private func setBinding(_ id: UUID, windowID: CGWindowID?, pid: pid_t?) {
+        for ti in state.tabs.indices {
+            if let wi = state.tabs[ti].windows.firstIndex(where: { $0.id == id }) {
+                state.tabs[ti].windows[wi].windowID = windowID
+                state.tabs[ti].windows[wi].pid = pid
+                return
+            }
+        }
     }
 
     /// フォーカスが移ったウィンドウを記録する(切替時に最前面へ戻すため)。
@@ -518,6 +597,7 @@ public final class TabEngine {
     ///   除去ではなく「未復元」に戻す。nil なら常に除去する。
     public func reconcile(liveWindowIDs: Set<CGWindowID>, livePIDs: Set<pid_t>? = nil) async {
         guard !isReleasingForShutdown else { return }
+        resolveVanished(livePIDs: livePIDs)
         if !liveWindowIDs.isEmpty {
             for window in state.allWindows {
                 guard let windowID = window.windowID, !liveWindowIDs.contains(windowID) else { continue }
@@ -682,8 +762,9 @@ public final class TabEngine {
         var failures: [OperationFailure] = []
         let driver = self.driver
         for var result in results {
-            // 実行中に閉じられた(noteWindowDestroyed された)ウィンドウの結果は捨てる。
-            guard state.managedWindow(id: result.op.managedID) != nil else { continue }
+            // 実行中に閉じられた・紐付けが外れた/変わったウィンドウの結果は捨てる
+            // (unbound になったエントリに退避フラグを立てない)。
+            guard state.managedWindow(id: result.op.managedID)?.window.windowID == result.op.windowID else { continue }
             if let note = result.note {
                 log("\(result.op.managedID): \(note)")
             }
@@ -756,12 +837,16 @@ public final class TabEngine {
     }
 
     private enum PlacementOutcome: CustomStringConvertible {
+        /// 要求 frame に到達した(制約によるサイズ差は含む)。
         case placed(CGRect)
+        /// setFrame が失敗し、読み戻した現在 frame は要求に到達していない(未適用または部分適用)。
+        case unreached(CGRect)
         case parked
 
         var description: String {
             switch self {
             case .placed(let f): return "\(f)"
+            case .unreached(let f): return "unreached (at \(f))"
             case .parked: return "parked (inactive tab)"
             }
         }
@@ -777,10 +862,14 @@ public final class TabEngine {
             do {
                 return .placed(try await executor.run { try driver.setFrame(frame, of: windowID) })
             } catch {
-                // 読み戻せれば(部分適用でも)管理下に置く。読めない = 窓が消えた/無応答なので失敗させる。
+                // 読み戻せれば(未適用・部分適用でも)管理下に置く。読めない = 窓が消えた/無応答なので失敗させる。
                 if let current = try? await executor.run({ try driver.frame(of: windowID) }) {
-                    log("place: setFrame reported \(error); adopting current \(current)")
-                    return .placed(clamped(current))
+                    if approximatelyEqual(current, frame) {
+                        log("place: setFrame reported \(error) but reached the frame")
+                        return .placed(current)
+                    }
+                    log("place: setFrame reported \(error); window is at \(current), not at the request")
+                    return .unreached(current)
                 }
                 throw error
             }
@@ -809,10 +898,13 @@ public final class TabEngine {
     // MARK: - 内部ヘルパー
 
     private func focusTargetPID(in tab: Tab) -> pid_t? {
-        if let focused = tab.lastFocusedWindowID, let w = tab.windows.first(where: { $0.id == focused }), let pid = w.pid {
+        // 未復元(実窓なし)のエントリは前面化の対象にしない(消滅保留中は pid だけ残っていることがある)。
+        if let focused = tab.lastFocusedWindowID, let w = tab.windows.first(where: { $0.id == focused }),
+            w.isBound, let pid = w.pid
+        {
             return pid
         }
-        return tab.windows.first(where: { $0.pid != nil })?.pid
+        return tab.windows.first(where: \.isBound)?.pid
     }
 
     private func removeFromState(_ id: UUID) {

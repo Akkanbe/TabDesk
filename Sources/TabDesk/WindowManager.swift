@@ -14,6 +14,8 @@ final class WindowManager {
     let engine: TabEngine
     let layout = PrimaryScreenLayout(sidebarWidth: WindowManager.sidebarWidth)
     let store: StateStore
+    /// Cmd-Tab 等で非アクティブタブの窓にフォーカスが移ったら、そのタブへ自動で切り替える(§3.6)。
+    let focusFollows = PersistedToggle(key: "FocusFollowsWindow", defaultValue: true)
     /// true を返す間は切替後のアプリ前面化を行わない(サイドバーで改名中など)。
     var suppressAppActivation: (@MainActor () -> Bool)?
     /// UI 向けの状態変更通知(エンジンの onStateChanged はここが占有し、保存とあわせて配る)。
@@ -31,8 +33,16 @@ final class WindowManager {
     private var elements: [CGWindowID: (pid: pid_t, element: AXUIElement)] = [:]
     private var reconcileTimer: Timer?
     private var mouseUpMonitor: Any?
-    /// engine.register の await 中のウィンドウ。同じ窓の二重登録を入口で弾く(state にはまだ載っていないため)。
-    private var registering: Set<CGWindowID> = []
+    private let executor = BlockingExecutor()
+    /// 自分の切替が起こすフォーカス変化で連鎖切替しないための抑止期限。
+    private var suppressFocusFollowUntil = ContinuousClock.now
+    /// engine.register / engine.bind の await 中の窓(windowID → pid)。二重登録を入口で弾くのに加え、
+    /// elements は commit 後にしか入らないため、その pid の observer を途中で捨てないための印でもある。
+    private var inFlight: [CGWindowID: pid_t] = [:]
+
+    private func observerIsUnused(pid: pid_t) -> Bool {
+        !elements.values.contains(where: { $0.pid == pid }) && !inFlight.values.contains(pid)
+    }
 
     enum RegistrationError: Error, CustomStringConvertible {
         case alreadyInProgress(CGWindowID)
@@ -147,7 +157,9 @@ final class WindowManager {
         }
         let matches = WindowMatcher.match(unbound: unbound, candidates: candidates, strictness: strictness)
         for match in matches {
-            guard let record = records.first(where: { $0.window.windowID == match.candidate.windowID }) else { continue }
+            guard let record = records.first(where: { $0.window.windowID == match.candidate.windowID }),
+                engine.state.managedWindow(id: match.managedID)?.window.isBound == false  // 列挙中に別経路が紐付けたら飛ばす
+            else { continue }
             await bind(record, to: match.managedID)
         }
         logger.log("restore(\(strictness)): bound \(matches.count) of \(unbound.count) unbound window(s)")
@@ -156,6 +168,11 @@ final class WindowManager {
     /// 手動割り当て・自動復元の共通経路。
     func bind(_ record: WindowRecord, to managedID: UUID) async {
         let windowID = record.window.windowID
+        guard inFlight[windowID] == nil else { return }
+        inFlight[windowID] = record.window.pid
+        defer { inFlight.removeValue(forKey: windowID) }
+        // 割り当て先が(自動復元との競合などで)既に紐付いていたら何もしない(bind は上書きを拒否する)。
+        guard engine.state.managedWindow(id: managedID)?.window.isBound == false else { return }
         let createdObserver: Bool
         do {
             createdObserver = try establishObserver(pid: record.window.pid)
@@ -192,18 +209,96 @@ final class WindowManager {
         try driver.frame(of: windowID)
     }
 
+    // MARK: - タブ切替とフォーカス連動
+
+    /// タブ切替の入口。切替が起こすフォーカスイベントで連鎖切替しないよう、前後で連動を抑止する。
+    func activate(_ tabID: UUID) async throws {
+        suppressFocusFollow(for: .milliseconds(500))
+        try await engine.activate(tabID)
+        suppressFocusFollow(for: .milliseconds(500))
+    }
+
+    private func suppressFocusFollow(for duration: Duration) {
+        suppressFocusFollowUntil = max(suppressFocusFollowUntil, ContinuousClock.now.advanced(by: duration))
+    }
+
+    /// 非アクティブタブの窓にフォーカスが移ったら、そのタブへ切り替える。
+    private func maybeFollowFocus(windowID: CGWindowID) {
+        guard focusFollows.value, !isTerminating else { return }
+        guard ContinuousClock.now >= suppressFocusFollowUntil else { return }
+        guard let found = engine.state.managedWindow(forWindowID: windowID),
+            found.window.isBound, found.tab.id != engine.state.activeTabID
+        else { return }
+        let tabID = found.tab.id
+        logger.log("focus-follow: switching to \(found.tab.name)")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.activate(tabID)
+            } catch {
+                self.logger.log("focus-follow activate failed: \(error)")
+            }
+        }
+    }
+
+    /// ホットキーから: いまフォーカスしている他アプリの窓をアクティブタブに登録する。
+    func registerFocusedWindow() async {
+        guard let tabID = engine.state.activeTabID else {
+            logger.log("register-focused: no active tab")
+            return
+        }
+        guard let app = NSWorkspace.shared.frontmostApplication, app != NSRunningApplication.current else {
+            logger.log("register-focused: no frontmost app")
+            return
+        }
+        let pid = app.processIdentifier
+        // フォーカス窓の特定は相手アプリへの IPC なのでバックグラウンドで行う。
+        let focused: AXWindow? = await executor.run {
+            let appElement = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(appElement, 1.0)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &value) == .success,
+                let value, CFGetTypeID(value) == AXUIElementGetTypeID()
+            else { return nil }
+            let element = unsafeDowncast(value, to: AXUIElement.self)
+            AXUIElementSetMessagingTimeout(element, 1.0)
+            return try? AXWindow(element: element, pid: pid)
+        }
+        guard let window = focused, window.isStandard else {
+            logger.log("register-focused: no standard focused window in \(app.localizedName ?? "pid \(pid)")")
+            return
+        }
+        guard engine.state.managedWindow(forWindowID: window.windowID) == nil else {
+            logger.log("register-focused: window \(window.windowID) is already registered")
+            return
+        }
+        let record = WindowRecord(
+            window: window, appName: app.localizedName ?? "pid \(pid)", bundleID: app.bundleIdentifier ?? "",
+            title: window.title, frame: try? window.frame(), isMinimized: window.isMinimized)
+        do {
+            try await register(record, into: tabID)
+            logger.log("register-focused: \(record.appName) — \(record.title)")
+        } catch {
+            logger.log("register-focused failed: \(error)")
+        }
+    }
+
     // MARK: - 登録候補
 
-    /// 登録できる標準ウィンドウ(自分自身と登録済みを除く)。
+    /// 登録できる標準ウィンドウ(自分自身と登録済みを除く)と、AX を拒否した管理不可アプリの一覧。
     /// 全アプリへの AX IPC を伴うのでバックグラウンドで pid 並列に行い、MainActor は待つだけにする。
-    func availableWindows() async -> [WindowRecord] {
+    func availableWindowsAndIssues() async -> (records: [WindowRecord], unavailableApps: [String]) {
         let (records, stats) = await WindowEnumerator.standardWindowsAsync()
         if !stats.appFailureDetails.isEmpty {
             logger.log("enumerate: unavailable apps: \(stats.appFailureDetails)")
         }
         // await の間に登録が進んでいることがあるので、除外判定は列挙後の状態で行う。
         let registered = Set(engine.state.allWindows.compactMap(\.windowID))
-        return records.filter { !registered.contains($0.window.windowID) }
+        return (records.filter { !registered.contains($0.window.windowID) }, stats.appFailureDetails)
+    }
+
+    func availableWindows() async -> [WindowRecord] {
+        await availableWindowsAndIssues().records
     }
 
     /// タブを削除する。Core の削除が成功したときだけ、その窓の AX 資源(driver / 要素 / observer)を片付ける。
@@ -231,9 +326,9 @@ final class WindowManager {
                 size: CGSize(width: min(current.width, area.width), height: min(current.height, area.height)))
         }
         let windowID = record.window.windowID
-        guard !registering.contains(windowID) else { throw RegistrationError.alreadyInProgress(windowID) }
-        registering.insert(windowID)
-        defer { registering.remove(windowID) }
+        guard inFlight[windowID] == nil else { throw RegistrationError.alreadyInProgress(windowID) }
+        inFlight[windowID] = record.window.pid
+        defer { inFlight.removeValue(forKey: windowID) }
 
         // 必須 observer(moved / resized)は窓に触れる前に確立する。取れないアプリは登録しない。
         let createdObserver = try establishObserver(pid: record.window.pid)
@@ -302,14 +397,19 @@ final class WindowManager {
 
     /// 登録が失敗したとき、この呼び出しで作ったばかりで他に使い手のない observer を片付ける。
     private func dropObserverIfUnused(pid: pid_t, createdNow: Bool) {
-        guard createdNow, !elements.values.contains(where: { $0.pid == pid }) else { return }
+        guard createdNow, observerIsUnused(pid: pid) else { return }
         observers[pid]?.invalidate()
         observers.removeValue(forKey: pid)
     }
 
     /// 消滅通知は任意(取れなくても 2 秒ポーリングで検知できる)。
+    /// 競合で observer が捨てられていた場合は作り直す(黙って未購読のままにしない)。
     private func watchDestroyed(of window: AXWindow) {
         do {
+            if observers[window.pid] == nil {
+                _ = try establishObserver(pid: window.pid)
+                logger.log("observer for pid \(window.pid) re-established")
+            }
             try observers[window.pid]?.addNotification(kAXUIElementDestroyedNotification, element: window.element)
         } catch {
             logger.log("destroyed notification for \(window.windowID) unavailable: \(error)")
@@ -326,6 +426,7 @@ final class WindowManager {
             var wid: CGWindowID = 0
             guard AXShimGetWindowID(element, &wid) == .success else { return }
             engine.noteWindowFocused(windowID: wid)
+            maybeFollowFocus(windowID: wid)
         case kAXUIElementDestroyedNotification:
             // 壊れた要素からは ID が取れないので、登録時の要素と比較する。
             guard let entry = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) }) else { return }
@@ -342,7 +443,8 @@ final class WindowManager {
         driver.forget(windowID)
         guard let entry = elements.removeValue(forKey: windowID) else { return }
         observers[entry.pid]?.removeNotification(kAXUIElementDestroyedNotification, element: entry.element)
-        if !elements.values.contains(where: { $0.pid == entry.pid }) {
+        // 同じ pid の登録/紐付けが await 中なら observer を残す(捨てると後から commit した窓が通知なしになる)。
+        if observerIsUnused(pid: entry.pid) {
             observers[entry.pid]?.invalidate()
             observers.removeValue(forKey: entry.pid)
         }
@@ -413,6 +515,7 @@ final class WindowManager {
         var wid: CGWindowID = 0
         if AXShimGetWindowID(element, &wid) == .success {
             engine.noteWindowFocused(windowID: wid)
+            maybeFollowFocus(windowID: wid)
         }
     }
 }

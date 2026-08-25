@@ -1,0 +1,145 @@
+import Foundation
+
+/// グローバルホットキー 1 つ(Carbon の keyCode + modifier ビット)。
+/// Carbon に依存しない値として Core に置き、パーサをテスト可能にする。
+public struct Hotkey: Sendable, Hashable {
+    /// Carbon 仮想キーコード(ANSI 配列)。
+    public let keyCode: UInt32
+    /// Carbon modifier ビット(cmdKey=256, shiftKey=512, optionKey=2048, controlKey=4096)。
+    public let modifiers: UInt32
+    /// 正規化した表記(ログ・メニュー表示用)。
+    public let display: String
+
+    public init(keyCode: UInt32, modifiers: UInt32, display: String) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers
+        self.display = display
+    }
+}
+
+/// "ctrl+alt+1" のような表記を Hotkey に変換する。
+public enum HotkeyParser {
+    public enum ParseError: Error, CustomStringConvertible, Equatable {
+        case empty
+        case unknownKey(String)
+        case unknownModifier(String)
+        case missingModifier(String)
+
+        public var description: String {
+            switch self {
+            case .empty: return "empty hotkey spec"
+            case .unknownKey(let k): return "unknown key '\(k)'"
+            case .unknownModifier(let m): return "unknown modifier '\(m)'"
+            case .missingModifier(let s): return "'\(s)' needs at least one modifier (ctrl/alt/cmd/shift)"
+            }
+        }
+    }
+
+    // Carbon modifier ビット(Carbon.HIToolbox の定数と同値)。
+    static let cmdKey: UInt32 = 0x0100
+    static let shiftKey: UInt32 = 0x0200
+    static let optionKey: UInt32 = 0x0800
+    static let controlKey: UInt32 = 0x1000
+
+    private static let modifierNames: [String: UInt32] = [
+        "cmd": cmdKey, "command": cmdKey,
+        "shift": shiftKey,
+        "alt": optionKey, "opt": optionKey, "option": optionKey,
+        "ctrl": controlKey, "control": controlKey,
+    ]
+
+    /// ANSI 配列の Carbon 仮想キーコード(数字は連番ではない点に注意)。
+    private static let keyCodes: [String: UInt32] = [
+        "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+        "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
+        "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "9": 25, "7": 26, "8": 28, "0": 29,
+        "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
+        "-": 27, "=": 24, "[": 33, "]": 30, ";": 41, "'": 39, ",": 43, ".": 47, "/": 44, "\\": 42, "`": 50,
+        "tab": 48, "space": 49, "return": 36, "escape": 53,
+        "left": 123, "right": 124, "down": 125, "up": 126,
+        "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
+        "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+    ]
+
+    public static func parse(_ spec: String) throws -> Hotkey {
+        let parts = spec.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let keyName = parts.last, !keyName.isEmpty else { throw ParseError.empty }
+        var modifiers: UInt32 = 0
+        var names: [String] = []
+        for part in parts.dropLast() {
+            guard let bit = modifierNames[part] else { throw ParseError.unknownModifier(part) }
+            if modifiers & bit == 0 { names.append(part) }
+            modifiers |= bit
+        }
+        guard let keyCode = keyCodes[keyName] else { throw ParseError.unknownKey(keyName) }
+        // 修飾キーなしのグローバルホットキーは通常のタイピングを乗っ取るので拒否する。
+        guard modifiers != 0 else { throw ParseError.missingModifier(spec) }
+        return Hotkey(keyCode: keyCode, modifiers: modifiers, display: (names + [keyName]).joined(separator: "+"))
+    }
+}
+
+/// ホットキーに割り当てる操作。
+public enum HotkeyAction: Sendable, Hashable {
+    /// 1 始まり(タブ 1 = 並び順の先頭)。
+    case activateTab(Int)
+    case registerFocusedWindow
+    case toggleEditMode
+}
+
+/// hotkeys.json の中身。ユーザーが手で編集できるよう、キーは "ctrl+alt+1" 形式の文字列で持つ。
+public struct HotkeyConfig: Codable, Sendable, Equatable {
+    public var activateTab: [String]
+    public var registerFocusedWindow: String?
+    public var toggleEditMode: String?
+
+    public init(activateTab: [String], registerFocusedWindow: String?, toggleEditMode: String?) {
+        self.activateTab = activateTab
+        self.registerFocusedWindow = registerFocusedWindow
+        self.toggleEditMode = toggleEditMode
+    }
+
+    public static let `default` = HotkeyConfig(
+        activateTab: (1...9).map { "ctrl+alt+\($0)" },
+        registerFocusedWindow: "ctrl+alt+r",
+        toggleEditMode: "ctrl+alt+e")
+
+    /// 設定を (Hotkey, HotkeyAction) の組に解決する。解釈できない項目はエラー文字列として返し、他は生かす。
+    public func resolve() -> (bindings: [(Hotkey, HotkeyAction)], errors: [String]) {
+        var bindings: [(Hotkey, HotkeyAction)] = []
+        var errors: [String] = []
+        var seen = Set<Hotkey>()
+
+        func add(_ spec: String, _ action: HotkeyAction, label: String) {
+            do {
+                let hotkey = try HotkeyParser.parse(spec)
+                guard !seen.contains(hotkey) else {
+                    errors.append("\(label): '\(spec)' は他の割り当てと重複しています")
+                    return
+                }
+                seen.insert(hotkey)
+                bindings.append((hotkey, action))
+            } catch {
+                errors.append("\(label): \(error)")
+            }
+        }
+
+        for (index, spec) in activateTab.prefix(9).enumerated() {
+            add(spec, .activateTab(index + 1), label: "activateTab[\(index)]")
+        }
+        if let spec = registerFocusedWindow { add(spec, .registerFocusedWindow, label: "registerFocusedWindow") }
+        if let spec = toggleEditMode { add(spec, .toggleEditMode, label: "toggleEditMode") }
+        return (bindings, errors)
+    }
+
+    public static func load(from url: URL) throws -> HotkeyConfig? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try JSONDecoder().decode(HotkeyConfig.self, from: try Data(contentsOf: url))
+    }
+
+    public func save(to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try encoder.encode(self).write(to: url, options: .atomic)
+    }
+}

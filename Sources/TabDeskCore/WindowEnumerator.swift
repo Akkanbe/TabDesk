@@ -9,6 +9,15 @@ public struct WindowRecord: Sendable {
     public let title: String
     public let frame: CGRect?
     public let isMinimized: Bool
+
+    public init(window: AXWindow, appName: String, bundleID: String, title: String, frame: CGRect?, isMinimized: Bool) {
+        self.window = window
+        self.appName = appName
+        self.bundleID = bundleID
+        self.title = title
+        self.frame = frame
+        self.isMinimized = isMinimized
+    }
 }
 
 /// 列挙の内訳。「0 件」のときに権限なし・ウィンドウなし・私有関数の不調のどれかを切り分けるために残す。

@@ -118,14 +118,19 @@ struct RegistrationTests {
         #expect(driver.currentFrame(1) == frame)
     }
 
-    @Test func destroyedWindowIsRemoved() async throws {
+    @Test func destroyedWindowIsRemovedAfterGraceWhenAppStaysAlive() async throws {
         let (engine, driver) = makeEngine()
+        engine.vanishGracePeriod = .milliseconds(40)
         let a = engine.createTab(name: "A")
         driver.add(1, frame: content)
         let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
         engine.noteWindowFocused(windowID: 1)
         #expect(engine.state.tabs[0].lastFocusedWindowID == managed.id)
         engine.noteWindowDestroyed(windowID: 1)
+        // 即削除ではなく保留(アプリごと終了の途中かもしれないため)。紐付けだけ外れる。
+        #expect(engine.state.managedWindow(id: managed.id)?.window.isBound == false)
+        try await Task.sleep(for: .milliseconds(70))
+        await engine.reconcile(liveWindowIDs: [99], livePIDs: [100])  // アプリは生きている → 本当に閉じられた
         #expect(engine.state.allWindows.isEmpty)
         #expect(engine.state.tabs[0].lastFocusedWindowID == nil)
     }
@@ -359,11 +364,12 @@ struct ConcurrencyTests {
 
         let activation = Task { try await engine.activate(b.id) }
         try await Task.sleep(for: .milliseconds(20))
-        engine.noteWindowDestroyed(windowID: 1)  // 退避中に閉じられた
+        engine.noteWindowDestroyed(windowID: 1)  // 退避中に閉じられた → 消滅保留(紐付けは外れる)
         _ = try await activation.value
 
-        #expect(engine.state.allWindows.map(\.windowID) == [2])
-        #expect(!engine.parkedWindowIDs.contains(wa.id))
+        #expect(engine.state.managedWindow(id: wa.id)?.window.isBound == false, "kept as pending-vanished")
+        #expect(!engine.parkedWindowIDs.contains(wa.id), "no parked flag on an unbound entry")
+        #expect(engine.state.allWindows.compactMap(\.windowID) == [2])
     }
 
     @Test func parksBeforeRestoresWithinSamePID() async throws {
@@ -1221,5 +1227,152 @@ struct FocusTargetTests {
         engine.noteWindowDestroyed(windowID: 2)  // 切替の IPC 中に最終フォーカス窓が閉じられた
         _ = try await activation.value
         #expect(activated == [300], "must not activate the pid of a window that no longer exists")
+    }
+}
+
+@MainActor
+struct BindGuardTests {
+    @Test func bindRejectsOverwritingABoundEntryAndKeepsTheOldWindowTracked() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: b.id)
+        engine.unbindWindows(pid: 100)
+        driver.add(11, frame: content)
+        driver.add(12, frame: content)
+        try await engine.bind(managed.id, windowID: 11, pid: 110)
+        #expect(driver.currentFrame(11)?.origin == park)
+
+        await #expect(throws: TabEngine.EngineError.self) {
+            try await engine.bind(managed.id, windowID: 12, pid: 120)  // 上書きは拒否
+        }
+        #expect(engine.state.managedWindow(forWindowID: 11)?.window.id == managed.id, "old window stays tracked")
+        try await engine.bind(managed.id, windowID: 11, pid: 110)  // 同じ窓への再 bind は冪等
+
+        await engine.releaseAllParkedWindows()
+        #expect(driver.currentFrame(11) == content, "still recoverable at shutdown")
+    }
+
+    @Test func bindKeepsSavedFrameWhenPlacementDoesNotReachIt() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        let saved = CGRect(x: 400, y: 100, width: 800, height: 600)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: saved, into: a.id)
+        engine.unbindWindows(pid: 100)
+
+        driver.add(11, frame: CGRect(x: 900, y: 500, width: 640, height: 480))
+        driver.setFailWrites(11)  // 復元先アプリが一時的に無応答(読みは通る)
+        try await engine.bind(managed.id, windowID: 11, pid: 110)
+        #expect(engine.state.managedWindow(id: managed.id)?.window.isBound == true)
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == saved, "saved layout must survive a failed placement")
+
+        driver.setFailWrites(11, false)
+        await engine.reconcile(liveWindowIDs: [11])  // ずれ検出 → デバウンス復元
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(driver.currentFrame(11) == saved)
+    }
+}
+
+@MainActor
+struct VanishedWindowTests {
+    @Test func windowClosedWhileAppAliveIsRemovedOnlyAfterGrace() async throws {
+        let (engine, driver) = makeEngine()
+        engine.vanishGracePeriod = .milliseconds(50)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        driver.kill(1)
+        engine.noteWindowDestroyed(windowID: 1)
+        #expect(engine.state.managedWindow(id: managed.id)?.window.isBound == false, "binding dropped immediately")
+
+        await engine.reconcile(liveWindowIDs: [99], livePIDs: [100])  // 猶予内: アプリは生きている
+        #expect(engine.state.managedWindow(id: managed.id) != nil, "kept during the grace period")
+
+        try await Task.sleep(for: .milliseconds(80))
+        await engine.reconcile(liveWindowIDs: [99], livePIDs: [100])  // 猶予経過 + アプリ生存 = 本当に閉じられた
+        #expect(engine.state.managedWindow(id: managed.id) == nil, "removed: the window alone was closed")
+    }
+
+    @Test func windowsClosedDuringAppQuitAreKeptAsUnbound() async throws {
+        let (engine, driver) = makeEngine()
+        engine.vanishGracePeriod = .seconds(3)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("chrome"), frame: content, into: a.id)
+        // Chrome 型の終了: 先に窓が閉じ、その時点ではプロセスがまだ生きている
+        driver.kill(1)
+        engine.noteWindowDestroyed(windowID: 1)
+        await engine.reconcile(liveWindowIDs: [99], livePIDs: [100, 999])  // まだ生きている → 保留
+        #expect(engine.state.managedWindow(id: managed.id) != nil)
+
+        await engine.reconcile(liveWindowIDs: [99], livePIDs: [999])  // プロセスが消えた → 未復元として保持
+        let kept = engine.state.managedWindow(id: managed.id)
+        #expect(kept != nil)
+        #expect(kept?.window.isBound == false)
+        #expect(kept?.window.pid == nil, "fully unbound so the matcher can rebind it later")
+    }
+
+    @Test func rebindDuringGraceCancelsTheVanishDecision() async throws {
+        let (engine, driver) = makeEngine()
+        engine.vanishGracePeriod = .milliseconds(30)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        driver.kill(1)
+        engine.noteWindowDestroyed(windowID: 1)
+        driver.add(2, frame: content)
+        try await engine.bind(managed.id, windowID: 2, pid: 100)  // 同じアプリの新しい窓に紐付け直した
+        try await Task.sleep(for: .milliseconds(60))
+        await engine.reconcile(liveWindowIDs: [2], livePIDs: [100])
+        #expect(engine.state.managedWindow(id: managed.id)?.window.windowID == 2, "must not be removed after rebinding")
+    }
+}
+
+struct HotkeyTests {
+    @Test func parserAcceptsAliasesAndNormalizes() throws {
+        let h = try HotkeyParser.parse("Control + Option + 1")
+        #expect(h.keyCode == 18)
+        #expect(h.modifiers == HotkeyParser.controlKey | HotkeyParser.optionKey)
+        let same = try HotkeyParser.parse("ctrl+alt+1")
+        #expect(h.keyCode == same.keyCode && h.modifiers == same.modifiers)
+        #expect(try HotkeyParser.parse("cmd+shift+r").modifiers == HotkeyParser.cmdKey | HotkeyParser.shiftKey)
+        // 数字の keyCode は連番ではない(5=23, 6=22 など)
+        #expect(try HotkeyParser.parse("ctrl+5").keyCode == 23)
+        #expect(try HotkeyParser.parse("ctrl+6").keyCode == 22)
+    }
+
+    @Test func parserRejectsInvalidSpecs() {
+        #expect(throws: HotkeyParser.ParseError.unknownKey("§")) { try HotkeyParser.parse("ctrl+§") }
+        #expect(throws: HotkeyParser.ParseError.unknownModifier("hyper")) { try HotkeyParser.parse("hyper+1") }
+        #expect(throws: HotkeyParser.ParseError.missingModifier("r")) { try HotkeyParser.parse("r") }
+    }
+
+    @Test func defaultConfigResolvesCompletely() {
+        let (bindings, errors) = HotkeyConfig.default.resolve()
+        #expect(errors.isEmpty)
+        #expect(bindings.count == 11)  // タブ 1..9 + 登録 + 編集モード
+        #expect(bindings.contains { $0.1 == .activateTab(9) })
+        #expect(bindings.contains { $0.1 == .registerFocusedWindow })
+    }
+
+    @Test func brokenEntriesAreReportedButOthersSurvive() throws {
+        var config = HotkeyConfig.default
+        config.activateTab[2] = "banana"
+        config.toggleEditMode = "ctrl+alt+1"  // タブ 1 と重複
+        let (bindings, errors) = config.resolve()
+        #expect(errors.count == 2)
+        #expect(bindings.count == 9)  // 11 - 壊れた 1 - 重複 1
+        #expect(!bindings.contains { $0.1 == .activateTab(3) })
+    }
+
+    @Test func configRoundTripsThroughJSON() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tabdesk-hotkeys-\(UUID().uuidString)")
+        let url = dir.appendingPathComponent("hotkeys.json")
+        #expect(try HotkeyConfig.load(from: url) == nil)
+        try HotkeyConfig.default.save(to: url)
+        #expect(try HotkeyConfig.load(from: url) == HotkeyConfig.default)
+        try? FileManager.default.removeItem(at: dir)
     }
 }
