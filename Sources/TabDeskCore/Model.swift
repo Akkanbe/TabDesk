@@ -51,12 +51,34 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
     public var windows: [ManagedWindow]
     /// このタブで最後にフォーカスされていたウィンドウ。切替時に最前面へ持ってくる。
     public var lastFocusedWindowID: UUID?
+    /// 配置方式(v2 段階 C)。
+    public var layout: TabLayout
 
-    public init(id: UUID = UUID(), name: String, windows: [ManagedWindow] = [], lastFocusedWindowID: UUID? = nil) {
+    public init(
+        id: UUID = UUID(), name: String, windows: [ManagedWindow] = [],
+        lastFocusedWindowID: UUID? = nil, layout: TabLayout = .free
+    ) {
         self.id = id
         self.name = name
         self.windows = windows
         self.lastFocusedWindowID = lastFocusedWindowID
+        self.layout = layout
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, windows, lastFocusedWindowID, layout
+    }
+
+    /// layout はキーが無い v1 の state.json も、将来の未知の値も `.free` として読む。
+    /// version を上げる移行(不一致で .bak 退避+初期化)を避けるための後方互換デコード(docs/04_v2_design.md)。
+    /// encode は合成のまま(layout も常に書く)。
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        windows = try c.decode([ManagedWindow].self, forKey: .windows)
+        lastFocusedWindowID = try c.decodeIfPresent(UUID.self, forKey: .lastFocusedWindowID)
+        layout = (try? c.decode(TabLayout.self, forKey: .layout)) ?? .free
     }
 }
 
