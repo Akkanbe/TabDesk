@@ -67,6 +67,10 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         lock.withLock { calls.filter { $0.hasPrefix(prefix) }.count }
     }
 
+    func totalCallCount() -> Int {
+        lock.withLock { calls.count }
+    }
+
     private func withWindow<T>(_ id: CGWindowID, _ name: String, _ body: (inout Window) throws -> T) throws -> T {
         let delay: TimeInterval = lock.withLock {
             calls.append("\(name):\(id)")

@@ -28,6 +28,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        controller.prepareForTermination()
+        return .terminateNow
+    }
+
     /// Storyboard を使わないので Cmd+Q 等の最低限のメニューを手で作る。
     private func installMenu() {
         let mainMenu = NSMenu()

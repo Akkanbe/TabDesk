@@ -23,9 +23,15 @@ final class WindowManager {
     private let driver = AXWindowDriver()
     private let logger: FileLogger
     private var saveTask: Task<Void, Never>?
+    private var saveRetryAttempt = 0
+    private var stateIsDirty = false
+    private var stateWritesEnabled = true
+    private var restoreTask: Task<Void, Never>?
+    /// 復元Task中に現れた窓の一度きりの appeared イベントを、Task完了後まで保持する。
+    private var strictRestorePending = false
     private var reconcileTask: Task<Void, Never>?
     private var layoutReapplyTask: Task<Void, Never>?
-    private var isTerminating = false
+    private(set) var isTerminating = false
     private var initialRestoreDone = false
     private var lastExistingIDs: Set<CGWindowID> = []
     private var observers: [pid_t: AppWindowObserver] = [:]
@@ -34,8 +40,13 @@ final class WindowManager {
     private var reconcileTimer: Timer?
     private var mouseUpMonitor: Any?
     private let executor = BlockingExecutor()
-    /// 自分の切替が起こすフォーカス変化で連鎖切替しないための抑止期限。
-    private var suppressFocusFollowUntil = ContinuousClock.now
+    /// フォーカス通知は最後に届いたものだけを処理する。切替中の通知も捨てず、完了後に再検証する。
+    private var focusFollowTask: Task<Void, Never>?
+    private var pendingFocusedWindowID: CGWindowID?
+    private var focusGeneration: UInt64 = 0
+    private var focusSwitchDepth = 0
+    /// focused-window 通知を購読できないアプリは、前面にいる間だけ reconcile で補完する。
+    private var focusPollingPIDs: Set<pid_t> = []
     /// engine.register / engine.bind の await 中の窓(windowID → pid)。二重登録を入口で弾くのに加え、
     /// elements は commit 後にしか入らないため、その pid の observer を途中で捨てないための印でもある。
     private var inFlight: [CGWindowID: pid_t] = [:]
@@ -69,7 +80,13 @@ final class WindowManager {
         } catch {
             // 読めないファイルは退避して初期状態から始める(履歴は .bak.json に残る)。
             logger.log("state load failed: \(error); backing up and starting fresh")
-            try? store.backupCorruptFile()
+            do {
+                try store.backupCorruptFile()
+            } catch {
+                // 壊れた原本を退避できないまま上書きすると、復旧材料まで失う。
+                stateWritesEnabled = false
+                logger.log("state backup failed: \(error); automatic writes disabled to preserve the original file")
+            }
         }
         engine = TabEngine(driver: driver, layout: layout, initialState: initial)
         engine.log = { logger.log($0) }
@@ -111,7 +128,7 @@ final class WindowManager {
             name: Notification.Name("com.apple.screenIsUnlocked"), object: nil)
         lastExistingIDs = WindowEnumerator.existingWindowIDs()
         if isTrusted {
-            Task { [weak self] in await self?.runInitialRestore() }
+            startInitialRestoreIfNeeded()
         }
     }
 
@@ -119,78 +136,169 @@ final class WindowManager {
 
     /// 変更が連続しても 0.5 秒にまとめて書く。
     private func scheduleSave() {
+        stateIsDirty = true
+        saveRetryAttempt = 0
+        guard stateWritesEnabled, !isTerminating else { return }
         saveTask?.cancel()
         saveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled, let self else { return }
-            self.saveNow()
+            self.saveTask = nil
+            _ = self.saveNow()
         }
     }
 
-    func saveNow() {
+    /// 現在状態を保存する。失敗時は通常運転中に限り、短い指数バックオフで最大 3 回再試行する。
+    @discardableResult
+    func saveNow(scheduleRetry: Bool = true) -> Bool {
         saveTask?.cancel()
         saveTask = nil
+        guard stateWritesEnabled else {
+            logger.log("save skipped: state writes are disabled because the corrupt original could not be backed up")
+            return false
+        }
         do {
             try store.save(engine.state)
+            stateIsDirty = false
+            saveRetryAttempt = 0
+            return true
         } catch {
+            stateIsDirty = true
             logger.log("save failed: \(error)")
+            if scheduleRetry, !isTerminating, saveRetryAttempt < 3 {
+                saveRetryAttempt += 1
+                let attempt = saveRetryAttempt
+                let delay = Duration.seconds(1 << (attempt - 1))
+                logger.log("save: retry \(attempt)/3 scheduled")
+                saveTask = Task { [weak self] in
+                    try? await Task.sleep(for: delay)
+                    guard !Task.isCancelled, let self, self.stateIsDirty, !self.isTerminating else { return }
+                    self.saveTask = nil
+                    _ = self.saveNow()
+                }
+            }
+            return false
         }
     }
 
     // MARK: - 復元(未復元エントリへの紐付け)
 
-    private func runInitialRestore() async {
-        guard !initialRestoreDone else { return }
-        initialRestoreDone = true
-        await restoreUnboundWindows(strictness: .lenient)
+    /// 起動直後は AX / 対象アプリがまだ準備中のことがあるため、未復元が残る間だけ 3 回まで試す。
+    private func startInitialRestoreIfNeeded() {
+        guard !initialRestoreDone, !isTerminating, restoreTask == nil else { return }
+        restoreTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.restoreTask = nil
+                self.startStrictRestoreIfNeeded()
+            }
+            for attempt in 1...3 {
+                if attempt > 1 {
+                    do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                }
+                guard !Task.isCancelled, !self.isTerminating else { return }
+                let remaining = await self.restoreUnboundWindows(strictness: .lenient)
+                guard remaining > 0 else { break }
+                self.logger.log("initial restore: \(remaining) window(s) still unbound after attempt \(attempt)/3")
+            }
+            guard !Task.isCancelled, !self.isTerminating else { return }
+            self.initialRestoreDone = true
+        }
+    }
+
+    /// 稼働中に新しい窓が現れたときの厳格照合。瞬間的な AX 失敗だけを救うため 2 回までに留める。
+    private func startStrictRestoreIfNeeded() {
+        guard initialRestoreDone, strictRestorePending, !isTerminating, restoreTask == nil else { return }
+        strictRestorePending = false
+        guard engine.state.allWindows.contains(where: { !$0.isBound }) else { return }
+        restoreTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.restoreTask = nil
+                // このTaskの列挙中に別の窓が現れたなら、そのイベントを捨てずもう一巡する。
+                self.startStrictRestoreIfNeeded()
+            }
+            for attempt in 1...2 {
+                if attempt > 1 {
+                    do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                }
+                guard !Task.isCancelled, !self.isTerminating else { return }
+                let remaining = await self.restoreUnboundWindows(strictness: .strict)
+                guard remaining > 0 else { break }
+            }
+        }
     }
 
     /// 未復元エントリに今ある窓を紐付ける。起動直後は緩め、稼働中は厳しめに照合する。
-    func restoreUnboundWindows(strictness: WindowMatcher.Strictness) async {
+    @discardableResult
+    func restoreUnboundWindows(strictness: WindowMatcher.Strictness) async -> Int {
+        guard !isTerminating, !Task.isCancelled else { return engine.state.allWindows.filter { !$0.isBound }.count }
         let unbound = engine.state.allWindows.filter { !$0.isBound }
-        guard !unbound.isEmpty else { return }
+        guard !unbound.isEmpty else { return 0 }
         let records = await availableWindows()
+        guard !isTerminating, !Task.isCancelled else { return engine.state.allWindows.filter { !$0.isBound }.count }
         let candidates = records.map {
             WindowMatcher.Candidate(
                 windowID: $0.window.windowID, pid: $0.window.pid, bundleID: $0.bundleID, title: $0.title,
                 size: $0.frame?.size ?? .zero)
         }
         let matches = WindowMatcher.match(unbound: unbound, candidates: candidates, strictness: strictness)
+        var boundCount = 0
         for match in matches {
+            guard !isTerminating, !Task.isCancelled else { break }
             guard let record = records.first(where: { $0.window.windowID == match.candidate.windowID }),
                 engine.state.managedWindow(id: match.managedID)?.window.isBound == false  // 列挙中に別経路が紐付けたら飛ばす
             else { continue }
-            await bind(record, to: match.managedID)
+            if await bind(record, to: match.managedID) { boundCount += 1 }
         }
-        logger.log("restore(\(strictness)): bound \(matches.count) of \(unbound.count) unbound window(s)")
+        let remaining = engine.state.allWindows.filter { !$0.isBound }.count
+        logger.log("restore(\(strictness)): bound \(boundCount) of \(unbound.count) unbound window(s); \(remaining) remaining")
+        return remaining
     }
 
     /// 手動割り当て・自動復元の共通経路。
-    func bind(_ record: WindowRecord, to managedID: UUID) async {
+    @discardableResult
+    func bind(_ record: WindowRecord, to managedID: UUID) async -> Bool {
+        guard !isTerminating else { return false }
         let windowID = record.window.windowID
-        guard inFlight[windowID] == nil else { return }
+        guard inFlight[windowID] == nil else { return false }
         inFlight[windowID] = record.window.pid
-        defer { inFlight.removeValue(forKey: windowID) }
-        // 割り当て先が(自動復元との競合などで)既に紐付いていたら何もしない(bind は上書きを拒否する)。
-        guard engine.state.managedWindow(id: managedID)?.window.isBound == false else { return }
-        let createdObserver: Bool
-        do {
-            createdObserver = try establishObserver(pid: record.window.pid)
-        } catch {
-            logger.log("bind skipped (no observer): \(error)")  // 次の自動復元で再試行される
-            return
-        }
-        driver.adopt(record.window)
-        do {
-            try await engine.bind(managedID, windowID: windowID, pid: record.window.pid, title: record.title)
-            elements[windowID] = (record.window.pid, record.window.element)
-            watchDestroyed(of: record.window)
-        } catch {
+        defer {
+            // observer の不要判定より先に in-flight 印を外す。逆順だと新規 observer が永遠に残る。
+            inFlight.removeValue(forKey: windowID)
             if engine.state.managedWindow(forWindowID: windowID) == nil {
                 driver.forget(windowID)
-                dropObserverIfUnused(pid: record.window.pid, createdNow: createdObserver)
+                dropObserverIfUnused(pid: record.window.pid)
             }
+        }
+        // 割り当て先が(自動復元との競合などで)既に紐付いていたら何もしない(bind は上書きを拒否する)。
+        guard engine.state.managedWindow(id: managedID)?.window.isBound == false else { return false }
+        do {
+            _ = try establishObserver(pid: record.window.pid)
+        } catch {
+            logger.log("bind skipped (no observer): \(error)")  // 次の自動復元で再試行される
+            return false
+        }
+        guard !isTerminating else { return false }
+        driver.adopt(record.window)
+        do {
+            let oldIdentity = engine.state.managedWindow(id: managedID)?.window.identity
+            let identity = WindowIdentity(
+                bundleID: record.bundleID,
+                appName: record.appName,
+                title: record.title,
+                registeredSize: record.frame?.size ?? oldIdentity?.registeredSize ?? .zero)
+            try await engine.bind(
+                managedID, windowID: windowID, pid: record.window.pid, identity: identity)
+            guard !isTerminating,
+                engine.state.managedWindow(id: managedID)?.window.windowID == windowID
+            else { return false }
+            elements[windowID] = (record.window.pid, record.window.element)
+            watchDestroyed(of: record.window)
+            return true
+        } catch {
             logger.log("bind failed: \(error)")
+            return false
         }
     }
 
@@ -211,38 +319,115 @@ final class WindowManager {
 
     // MARK: - タブ切替とフォーカス連動
 
-    /// タブ切替の入口。切替が起こすフォーカスイベントで連鎖切替しないよう、前後で連動を抑止する。
+    /// タブ切替の入口。切替中に届いたフォーカス通知は保留し、完了後に実際のフォーカスと照合する。
     func activate(_ tabID: UUID) async throws {
-        suppressFocusFollow(for: .milliseconds(500))
+        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        focusSwitchDepth += 1
+        defer {
+            focusSwitchDepth -= 1
+            if focusSwitchDepth == 0 { schedulePendingFocusFollow() }
+        }
         try await engine.activate(tabID)
-        suppressFocusFollow(for: .milliseconds(500))
     }
 
-    private func suppressFocusFollow(for duration: Duration) {
-        suppressFocusFollowUntil = max(suppressFocusFollowUntil, ContinuousClock.now.advanced(by: duration))
+    /// 隣のタブへ(ホットキー用)。ターゲット解決はエンジンの直列区間内で行うため、連打しても 1 押下 = 1 タブ進む。
+    func activateAdjacent(offset: Int) async throws {
+        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        focusSwitchDepth += 1
+        defer {
+            focusSwitchDepth -= 1
+            if focusSwitchDepth == 0 { schedulePendingFocusFollow() }
+        }
+        try await engine.activateAdjacent(offset: offset)
     }
 
     /// 非アクティブタブの窓にフォーカスが移ったら、そのタブへ切り替える。
     private func maybeFollowFocus(windowID: CGWindowID) {
-        guard focusFollows.value, !isTerminating else { return }
-        guard ContinuousClock.now >= suppressFocusFollowUntil else { return }
-        guard let found = engine.state.managedWindow(forWindowID: windowID),
-            found.window.isBound, found.tab.id != engine.state.activeTabID
-        else { return }
-        let tabID = found.tab.id
-        logger.log("focus-follow: switching to \(found.tab.name)")
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await self.activate(tabID)
-            } catch {
-                self.logger.log("focus-follow activate failed: \(error)")
+        guard !isTerminating else { return }
+        focusGeneration &+= 1
+        pendingFocusedWindowID = windowID
+        schedulePendingFocusFollow()
+    }
+
+    private func schedulePendingFocusFollow() {
+        guard focusSwitchDepth == 0, let windowID = pendingFocusedWindowID, !isTerminating else { return }
+        focusFollowTask?.cancel()
+        let generation = focusGeneration
+        focusFollowTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            await self.performFocusFollow(windowID: windowID, generation: generation)
+        }
+    }
+
+    private func performFocusFollow(windowID: CGWindowID, generation: UInt64) async {
+        // ユーザー起点の切替が進行中に割り込まれた場合は、通知を捨てずに保留へ残し、
+        // activate() 完了後の schedulePendingFocusFollow に再検証を委ねる。
+        var deferToPostSwitch = false
+        defer {
+            if focusGeneration == generation, !deferToPostSwitch {
+                pendingFocusedWindowID = nil
+                focusFollowTask = nil
             }
         }
+        guard focusGeneration == generation, focusFollows.value, !isTerminating,
+            let found = engine.state.managedWindow(forWindowID: windowID),
+            found.window.isBound, found.tab.id != engine.state.activeTabID,
+            let pid = found.window.pid,
+            NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+        else { return }
+        guard focusSwitchDepth == 0 else {
+            deferToPostSwitch = true
+            focusFollowTask = nil
+            return
+        }
+
+        // 遅れて届いた通知で古いタブへ戻らないよう、実際の最新フォーカスを AX で再確認する。
+        guard await focusedWindowID(pid: pid) == windowID,
+            focusGeneration == generation, focusFollows.value, !isTerminating,
+            NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+            let current = engine.state.managedWindow(forWindowID: windowID),
+            current.tab.id != engine.state.activeTabID
+        else { return }
+        // AX 再確認の await 中にユーザーの切替が始まっていたら、それを上書きせず保留に回す。
+        guard focusSwitchDepth == 0 else {
+            deferToPostSwitch = true
+            focusFollowTask = nil
+            return
+        }
+        logger.log("focus-follow: switching to \(current.tab.name)")
+        do {
+            try await activate(current.tab.id)
+        } catch {
+            logger.log("focus-follow activate failed: \(error)")
+        }
+    }
+
+    /// 相手アプリへの同期 AX IPC は MainActor 外で行う。
+    private func focusedWindowID(pid: pid_t) async -> CGWindowID? {
+        await executor.run {
+            let appElement = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(appElement, 0.5)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                appElement, kAXFocusedWindowAttribute as CFString, &value) == .success,
+                let value, CFGetTypeID(value) == AXUIElementGetTypeID()
+            else { return nil }
+            let element = unsafeDowncast(value, to: AXUIElement.self)
+            var windowID: CGWindowID = 0
+            guard AXShimGetWindowID(element, &windowID) == .success else { return nil }
+            return windowID
+        }
+    }
+
+    private func recordFocusedWindow(_ windowID: CGWindowID) {
+        engine.noteWindowFocused(windowID: windowID)
+        maybeFollowFocus(windowID: windowID)
     }
 
     /// ホットキーから: いまフォーカスしている他アプリの窓をアクティブタブに登録する。
     func registerFocusedWindow() async {
+        guard !isTerminating else { return }
         guard let tabID = engine.state.activeTabID else {
             logger.log("register-focused: no active tab")
             return
@@ -252,8 +437,10 @@ final class WindowManager {
             return
         }
         let pid = app.processIdentifier
-        // フォーカス窓の特定は相手アプリへの IPC なのでバックグラウンドで行う。
-        let focused: AXWindow? = await executor.run {
+        let appName = app.localizedName ?? "pid \(pid)"
+        let bundleID = app.bundleIdentifier ?? ""
+        // フォーカス窓の特定と属性読取はすべて相手アプリへの IPC なのでバックグラウンドで行う。
+        let record: WindowRecord? = await executor.run {
             let appElement = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(appElement, 1.0)
             var value: CFTypeRef?
@@ -262,19 +449,24 @@ final class WindowManager {
             else { return nil }
             let element = unsafeDowncast(value, to: AXUIElement.self)
             AXUIElementSetMessagingTimeout(element, 1.0)
-            return try? AXWindow(element: element, pid: pid)
+            guard let window = try? AXWindow(element: element, pid: pid), window.isStandard else { return nil }
+            return WindowRecord(
+                window: window,
+                appName: appName,
+                bundleID: bundleID,
+                title: window.title,
+                frame: try? window.frame(),
+                isMinimized: window.isMinimized)
         }
-        guard let window = focused, window.isStandard else {
-            logger.log("register-focused: no standard focused window in \(app.localizedName ?? "pid \(pid)")")
+        guard !isTerminating, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+        guard let record else {
+            logger.log("register-focused: no standard focused window in \(appName)")
             return
         }
-        guard engine.state.managedWindow(forWindowID: window.windowID) == nil else {
-            logger.log("register-focused: window \(window.windowID) is already registered")
+        guard engine.state.managedWindow(forWindowID: record.window.windowID) == nil else {
+            logger.log("register-focused: window \(record.window.windowID) is already registered")
             return
         }
-        let record = WindowRecord(
-            window: window, appName: app.localizedName ?? "pid \(pid)", bundleID: app.bundleIdentifier ?? "",
-            title: window.title, frame: try? window.frame(), isMinimized: window.isMinimized)
         do {
             try await register(record, into: tabID)
             logger.log("register-focused: \(record.appName) — \(record.title)")
@@ -304,8 +496,9 @@ final class WindowManager {
     /// タブを削除する。Core の削除が成功したときだけ、その窓の AX 資源(driver / 要素 / observer)を片付ける。
     /// 復元できない窓があって Core が throw した場合は何も片付けない(登録も資源も保持される)。
     func deleteTab(_ id: UUID) async throws {
-        let windowIDs = engine.state.tab(withID: id)?.windows.compactMap(\.windowID) ?? []
-        try await engine.deleteTab(id)
+        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        // 削除対象は engine の直列化区間で確定した値を使い、並行 bind の AX 資源を取りこぼさない。
+        let windowIDs = try await engine.deleteTab(id)
         for windowID in windowIDs {
             forgetWindow(windowID)
         }
@@ -315,8 +508,11 @@ final class WindowManager {
 
     /// ウィンドウをタブに登録する。主ディスプレイのコンテンツ領域に収まっていなければ引き込む。
     func register(_ record: WindowRecord, into tabID: UUID) async throws {
+        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
         let area = layout.contentArea
-        let current = try record.window.frame()
+        let window = record.window
+        let current = try await executor.run { try window.frame() }
+        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
         let frame: CGRect
         if area.contains(current) {
             frame = current
@@ -328,47 +524,60 @@ final class WindowManager {
         let windowID = record.window.windowID
         guard inFlight[windowID] == nil else { throw RegistrationError.alreadyInProgress(windowID) }
         inFlight[windowID] = record.window.pid
-        defer { inFlight.removeValue(forKey: windowID) }
+        defer {
+            inFlight.removeValue(forKey: windowID)
+            if engine.state.managedWindow(forWindowID: windowID) == nil {
+                driver.forget(windowID)
+                dropObserverIfUnused(pid: record.window.pid)
+            }
+        }
 
         // 必須 observer(moved / resized)は窓に触れる前に確立する。取れないアプリは登録しない。
-        let createdObserver = try establishObserver(pid: record.window.pid)
+        _ = try establishObserver(pid: record.window.pid)
         driver.adopt(record.window)
         let identity = WindowIdentity(
             bundleID: record.bundleID, appName: record.appName, title: record.title, registeredSize: current.size)
-        do {
-            _ = try await engine.register(
-                windowID: windowID, pid: record.window.pid, identity: identity, frame: frame, into: tabID)
-        } catch {
-            // windowAlreadyRegistered は「別の登録が成功済み」を意味する。そのドライバ登録を巻き添えにしない。
-            if engine.state.managedWindow(forWindowID: windowID) == nil {
-                driver.forget(windowID)
-                dropObserverIfUnused(pid: record.window.pid, createdNow: createdObserver)
-            }
-            throw error
+        let managed = try await engine.register(
+            windowID: windowID, pid: record.window.pid, identity: identity, frame: frame, into: tabID)
+        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        guard engine.state.managedWindow(id: managed.id)?.window.windowID == windowID else {
+            throw TabEngine.EngineError.unknownWindow(managed.id)
         }
         elements[windowID] = (record.window.pid, record.window.element)
         watchDestroyed(of: record.window)
     }
 
     func unregister(_ id: UUID) async throws {
-        guard let found = engine.state.managedWindow(id: id) else { return }
-        try await engine.unregister(id)
-        if let windowID = found.window.windowID {
+        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        if let windowID = try await engine.unregister(id) {
             forgetWindow(windowID)
         }
     }
 
-    /// TabDesk 終了前のクリーンアップ。退避中の窓を元の位置に戻す。
-    /// 先にポーリングを止める(止めないと reconcile が戻した窓を再び隅へ送ってしまう)。
-    func prepareForTermination() async {
+    /// 終了要求を受けた同期地点で barrier を立てる。cleanup Task の開始を待たない。
+    func beginTermination() {
+        guard !isTerminating else { return }
         isTerminating = true
+        engine.beginShutdown()
         reconcileTimer?.invalidate()
         reconcileTimer = nil
-        // 進行中の reconcile を待ってから戻す(エンジン側のフラグが二重の保険)。
-        await reconcileTask?.value
+        reconcileTask?.cancel()
+        layoutReapplyTask?.cancel()
+        restoreTask?.cancel()
+        focusFollowTask?.cancel()
+        focusGeneration &+= 1
+        pendingFocusedWindowID = nil
+        // 全窓解放が遅くても、最新の登録情報だけは期限前に保存しておく。
+        _ = saveNow(scheduleRetry: false)
+    }
+
+    /// TabDesk 終了前のクリーンアップ。退避中の窓を元の位置に戻す。
+    func prepareForTermination() async {
+        beginTermination()
         await engine.releaseAllParkedWindows()
-        saveNow()
-        logger.log("terminating: parked windows released, state saved")
+        let saved = saveNow(scheduleRetry: false)
+        // Core が窓ごとの復元失敗を個別に記録するため、ここでは成功を断定しない。
+        logger.log("terminating: parked-window release attempted; state \(saved ? "saved" : "save failed")")
     }
 
     // MARK: - AX 通知
@@ -388,6 +597,11 @@ final class WindowManager {
             if !observer.unavailableNotifications.isEmpty {
                 logger.log("observer for pid \(pid): optional notifications unavailable: \(observer.unavailableNotifications)")
             }
+            if observer.unavailableNotifications.contains(kAXFocusedWindowChangedNotification) {
+                focusPollingPIDs.insert(pid)
+            } else {
+                focusPollingPIDs.remove(pid)
+            }
             observers[pid] = observer
             return true
         } catch {
@@ -395,11 +609,12 @@ final class WindowManager {
         }
     }
 
-    /// 登録が失敗したとき、この呼び出しで作ったばかりで他に使い手のない observer を片付ける。
-    private func dropObserverIfUnused(pid: pid_t, createdNow: Bool) {
-        guard createdNow, observerIsUnused(pid: pid) else { return }
+    /// 登録・紐付けが失敗したとき、他に使い手のない observer を片付ける。
+    private func dropObserverIfUnused(pid: pid_t) {
+        guard observerIsUnused(pid: pid) else { return }
         observers[pid]?.invalidate()
         observers.removeValue(forKey: pid)
+        focusPollingPIDs.remove(pid)
     }
 
     /// 消滅通知は任意(取れなくても 2 秒ポーリングで検知できる)。
@@ -417,6 +632,7 @@ final class WindowManager {
     }
 
     private func handle(notification: String, element: AXUIElement, pid: pid_t) {
+        guard !isTerminating else { return }
         switch notification {
         case kAXWindowMovedNotification, kAXWindowResizedNotification:
             var wid: CGWindowID = 0
@@ -425,8 +641,7 @@ final class WindowManager {
         case kAXFocusedWindowChangedNotification:
             var wid: CGWindowID = 0
             guard AXShimGetWindowID(element, &wid) == .success else { return }
-            engine.noteWindowFocused(windowID: wid)
-            maybeFollowFocus(windowID: wid)
+            recordFocusedWindow(wid)
         case kAXUIElementDestroyedNotification:
             // 壊れた要素からは ID が取れないので、登録時の要素と比較する。
             guard let entry = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) }) else { return }
@@ -447,6 +662,7 @@ final class WindowManager {
         if observerIsUnused(pid: entry.pid) {
             observers[entry.pid]?.invalidate()
             observers.removeValue(forKey: entry.pid)
+            focusPollingPIDs.remove(entry.pid)
         }
     }
 
@@ -463,15 +679,29 @@ final class WindowManager {
             guard let self else { return }
             defer { self.reconcileTask = nil }
             await self.engine.reconcile(liveWindowIDs: live, livePIDs: livePIDs)
+            guard !Task.isCancelled, !self.isTerminating else { return }
             let after = Set(self.engine.state.allWindows.compactMap(\.windowID))
             for gone in before.subtracting(after) {
                 self.forgetWindow(gone)
             }
+            if !appeared.isEmpty, self.engine.state.allWindows.contains(where: { !$0.isBound }) {
+                // 復元中でもイベントを記憶し、現在の列挙完了後に必ず一度追走する。
+                self.strictRestorePending = true
+            }
             if !self.initialRestoreDone {
-                await self.runInitialRestore()  // 起動時に権限が無かった場合はここで初回復元
-            } else if !appeared.isEmpty, self.engine.state.allWindows.contains(where: { !$0.isBound }) {
+                self.startInitialRestoreIfNeeded()  // 起動時に権限が無かった場合はここで初回復元
+            } else {
                 // 新しい窓が現れたときだけ(列挙は全アプリへの IPC なので毎回はしない)厳しめに自動紐付け。
-                await self.restoreUnboundWindows(strictness: .strict)
+                self.startStrictRestoreIfNeeded()
+            }
+            // focused 通知を提供しないアプリでは、同一アプリ内の窓切替を低頻度で補完する。
+            if let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                self.focusPollingPIDs.contains(pid),
+                let windowID = await self.focusedWindowID(pid: pid),
+                !Task.isCancelled, !self.isTerminating,
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+            {
+                self.recordFocusedWindow(windowID)
             }
         }
     }
@@ -482,13 +712,14 @@ final class WindowManager {
         layoutReapplyTask?.cancel()
         layoutReapplyTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled, let self, self.isTrusted else { return }
+            guard !Task.isCancelled, let self, self.isTrusted, !self.isTerminating else { return }
             self.logger.log("layout change (\(notification.name.rawValue)): reapplying")
             await self.engine.reapplyLayout()
         }
     }
 
     @objc private func appDidTerminate(_ notification: Notification) {
+        guard !isTerminating else { return }
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         let pid = app.processIdentifier
         let gone = elements.filter { $0.value.pid == pid }.map(\.key)
@@ -501,21 +732,19 @@ final class WindowManager {
     }
 
     @objc private func appDidActivate(_ notification: Notification) {
+        guard !isTerminating else { return }
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
             observers[app.processIdentifier] != nil
         else { return }
         // アプリ切替でフォーカスが移った先の窓を記録する(同一アプリ内の切替は kAXFocusedWindowChanged が拾う)。
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(appElement, 0.5)
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &value) == .success,
-            let value, CFGetTypeID(value) == AXUIElementGetTypeID()
-        else { return }
-        let element = unsafeDowncast(value, to: AXUIElement.self)
-        var wid: CGWindowID = 0
-        if AXShimGetWindowID(element, &wid) == .success {
-            engine.noteWindowFocused(windowID: wid)
-            maybeFollowFocus(windowID: wid)
+        let pid = app.processIdentifier
+        Task { [weak self] in
+            guard let self, let windowID = await self.focusedWindowID(pid: pid),
+                !self.isTerminating,
+                self.observers[pid] != nil,
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+            else { return }
+            self.recordFocusedWindow(windowID)
         }
     }
 }

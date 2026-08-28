@@ -42,6 +42,8 @@ public final class TabEngine {
         case releaseFailed(managedIDs: Set<UUID>)
         /// エントリは既に別の実ウィンドウに紐付いている(上書きすると前の窓が追跡不能になる)。
         case entryAlreadyBound(managedID: UUID, boundWindowID: CGWindowID)
+        /// 終了時の全窓解放が始まっている。これ以降に実窓を動かす操作は受け付けない。
+        case shuttingDown
 
         public var description: String {
             switch self {
@@ -51,6 +53,7 @@ public final class TabEngine {
             case .invalidTabOrder: return "invalid tab order"
             case .releaseFailed(let ids): return "could not restore \(ids.count) parked window(s); registration kept"
             case .entryAlreadyBound(let mid, let wid): return "entry \(mid) is already bound to window \(wid)"
+            case .shuttingDown: return "TabDesk is shutting down"
             }
         }
     }
@@ -126,13 +129,16 @@ public final class TabEngine {
 
     /// タブを削除する。退避中だったウィンドウは固定 frame に戻してから解放する(画面隅に取り残さない)。
     /// アクティブタブを削除した場合は残りの先頭タブをアクティブにする。
-    public func deleteTab(_ id: UUID) async throws {
+    @discardableResult
+    public func deleteTab(_ id: UUID) async throws -> [CGWindowID] {
         try await serialized {
+            try rejectIfShuttingDown()
             let tab = try self.tab(id)
             let unreleased = await releaseAll(tab.windows, from: tab)
             // 1 枚でも戻せなければタブごと残す(隅に取り残した窓を追跡不能にしない)。
             // 戻せた窓は非アクティブタブの未退避窓として reconcile が再び退避する。
             guard unreleased.isEmpty else { throw EngineError.releaseFailed(managedIDs: unreleased) }
+            let removedWindowIDs = tab.windows.compactMap(\.windowID)
             // await をまたいだので index は引き直す(同期の moveTab が割り込みうる)。
             state.tabs.remove(at: try tabIndex(id))
             if state.activeTabID == id {
@@ -141,6 +147,7 @@ public final class TabEngine {
                     try await activateUnlocked(next.id)
                 }
             }
+            return removedWindowIDs
         }
     }
 
@@ -159,6 +166,7 @@ public final class TabEngine {
         into tabID: UUID
     ) async throws -> ManagedWindow {
         try await serialized {
+            try rejectIfShuttingDown()
             _ = try tabIndex(tabID)
             if let existing = state.managedWindow(forWindowID: windowID) {
                 throw EngineError.windowAlreadyRegistered(windowID: windowID, managedID: existing.window.id)
@@ -189,20 +197,30 @@ public final class TabEngine {
     }
 
     /// 登録を解除する。退避中なら固定 frame に戻してから手放す。
-    public func unregister(_ id: UUID) async throws {
+    @discardableResult
+    public func unregister(_ id: UUID) async throws -> CGWindowID? {
         try await serialized {
+            try rejectIfShuttingDown()
             guard let found = state.managedWindow(id: id) else { throw EngineError.unknownWindow(id) }
             let unreleased = await releaseAll([found.window], from: found.tab)
             // 固定 frame に戻せたことを確認できるまで登録は手放さない(隅に取り残さない)。
             guard unreleased.isEmpty else { throw EngineError.releaseFailed(managedIDs: unreleased) }
             removeFromState(id)
+            return found.window.windowID
         }
     }
 
     /// 保存済み(未復元)エントリに実ウィンドウを紐付ける(再起動後の復元、手動割り当て)。
     /// アクティブタブなら固定 frame を適用して到達 frame を採用、非アクティブタブなら即座に退避する。
-    public func bind(_ id: UUID, windowID: CGWindowID, pid: pid_t, title: String? = nil) async throws {
+    public func bind(
+        _ id: UUID,
+        windowID: CGWindowID,
+        pid: pid_t,
+        title: String? = nil,
+        identity: WindowIdentity? = nil
+    ) async throws {
         try await serialized {
+            try rejectIfShuttingDown()
             guard let found = state.managedWindow(id: id) else { throw EngineError.unknownWindow(id) }
             if let existing = state.managedWindow(forWindowID: windowID), existing.window.id != id {
                 throw EngineError.windowAlreadyRegistered(windowID: windowID, managedID: existing.window.id)
@@ -215,8 +233,12 @@ public final class TabEngine {
                 }
                 return
             }
+            // 消滅判定の猶予中に新しい窓への紐付けを開始した場合、place の IPC 待ち中に
+            // resolveVanished が entry を削除しないよう、この時点で古い消滅保留を取り消す。
+            vanished.removeValue(forKey: id)
             let intoActive = found.tab.id == state.activeTabID
-            let recorded = found.window.frame
+            // 保存時と画面構成が違っていても、最初の復元から現在のコンテンツ領域内へ収める。
+            let recorded = clamped(found.window.frame)
             let outcome = try await place(windowID: windowID, frame: recorded, intoActive: intoActive)
             let frame: CGRect
             switch outcome {
@@ -236,7 +258,11 @@ public final class TabEngine {
             state.tabs[ti].windows[wi].windowID = windowID
             state.tabs[ti].windows[wi].pid = pid
             state.tabs[ti].windows[wi].frame = frame
-            if let title { state.tabs[ti].windows[wi].identity.title = title }
+            if let identity {
+                state.tabs[ti].windows[wi].identity = identity
+            } else if let title {
+                state.tabs[ti].windows[wi].identity.title = title
+            }
             if intoActive {
                 parkedWindowIDs.remove(id)
             } else {
@@ -269,7 +295,7 @@ public final class TabEngine {
     /// 状態(タブ・登録)は変えない。切替が進行中なら順番を待つ。
     public func releaseAllParkedWindows() async {
         // ロック取得前に立てる: ロック待ち中の reconcile にも、これから始まる reconcile にも効かせる。
-        isReleasingForShutdown = true
+        beginShutdown()
         await serialized {
             var unreleased = Set<UUID>()
             for tab in state.tabs {
@@ -278,6 +304,16 @@ public final class TabEngine {
             if !unreleased.isEmpty {
                 log("shutdown: \(unreleased.count) window(s) could not be restored and may remain parked")
             }
+        }
+    }
+
+    /// 終了barrierを同期的に立てる。WindowManagerは終了要求を受けたその場で呼び、
+    /// cleanup Taskが実行されるまでの短い隙間にも新しいpark/bindを許さない。
+    public func beginShutdown() {
+        guard !isReleasingForShutdown else { return }
+        isReleasingForShutdown = true
+        for id in Array(pendingRestores.keys) {
+            cancelPendingRestore(id)
         }
     }
 
@@ -296,6 +332,11 @@ public final class TabEngine {
             unbindWindows(pid: pid)
             return
         }
+        markVanished(found)
+    }
+
+    /// 通知・ポーリング共通の「窓は消えたが、アプリ終了か単独closeか未確定」状態へ移す。
+    private func markVanished(_ found: (tab: Tab, window: ManagedWindow)) {
         let id = found.window.id
         cancelPendingRestore(id)
         parkedWindowIDs.remove(id)
@@ -351,6 +392,7 @@ public final class TabEngine {
         guard let found = state.managedWindow(forWindowID: windowID),
             let index = state.tabs.firstIndex(where: { $0.id == found.tab.id })
         else { return }
+        guard state.tabs[index].lastFocusedWindowID != found.window.id else { return }
         state.tabs[index].lastFocusedWindowID = found.window.id
     }
 
@@ -359,6 +401,7 @@ public final class TabEngine {
     @discardableResult
     public func setFrame(_ frame: CGRect, of id: UUID) async throws -> CGRect {
         try await serialized {
+            try rejectIfShuttingDown()
             guard let found = state.managedWindow(id: id) else { throw EngineError.unknownWindow(id) }
             let frame = clamped(frame)
             cancelPendingRestore(id)
@@ -381,7 +424,30 @@ public final class TabEngine {
     /// pid ごとに並列実行するので、1 アプリが遅くても他アプリは待たされない。
     @discardableResult
     public func activate(_ tabID: UUID) async throws -> SwitchReport {
-        try await serialized { try await activateUnlocked(tabID) }
+        try await serialized {
+            try rejectIfShuttingDown()
+            return try await activateUnlocked(tabID)
+        }
+    }
+
+    /// 隣のタブへ切り替える(offset +1 = 次、-1 = 前。端で循環)。
+    /// 相対ターゲットの解決を直列区間の**中**で行う。連打時、切替が確定する前の古い activeTabID から
+    /// 同じタブを選んでしまい「1 押下 = 1 タブ」にならない問題を防ぐ(押した回数ぶん確実に進む)。
+    @discardableResult
+    public func activateAdjacent(offset: Int) async throws -> SwitchReport? {
+        try await serialized {
+            try rejectIfShuttingDown()
+            let count = state.tabs.count
+            guard count > 0 else { return nil }
+            let index: Int
+            if let current = state.tabs.firstIndex(where: { $0.id == state.activeTabID }) {
+                index = ((current + offset) % count + count) % count
+            } else {
+                // アクティブタブが無い/消えている場合は方向によらず先頭へ。
+                index = 0
+            }
+            return try await activateUnlocked(state.tabs[index].id)
+        }
     }
 
     @discardableResult
@@ -398,7 +464,9 @@ public final class TabEngine {
                     // 既にアクティブなタブの窓には触らない。ドラッグ中の一時 frame を読み戻して
                     // 「到達 frame」として採用してしまうのを避けるため(ずれはスナップバックが直す)。
                     if !alreadyActive {
-                        restores.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(window.frame, raise: true)))
+                        let targetFrame = clamped(window.frame)
+                        if targetFrame != window.frame { updateFrame(window.id, targetFrame) }
+                        restores.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(targetFrame, raise: true)))
                     }
                 } else if !parkedWindowIDs.contains(window.id) {
                     parks.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(point)))
@@ -464,6 +532,7 @@ public final class TabEngine {
     /// ドラッグ中は通知が ~100ms 間隔で来続けるため、静止するまで待ってから復元する(デバウンス)。
     /// 掴まれている最中に復元すると一時状態を「制約」と誤認して基準を壊すので、即時復元はしない。
     public func windowFrameDidChange(windowID: CGWindowID) {
+        guard !isReleasingForShutdown else { return }
         guard let found = state.managedWindow(forWindowID: windowID) else { return }
         let managed = found.window
         // 退避操作そのものが通知を発火させる。退避中の通知は編集モードでも記録しない。
@@ -500,6 +569,7 @@ public final class TabEngine {
     /// デバウンス待ちの復元/記録を待たずに今すぐ実行する。
     /// マウスボタンが離された瞬間に呼ぶと、ドラッグ終了と同時に窓が戻る(250 ms 待たない)。
     public func flushPendingRestores() {
+        guard !isReleasingForShutdown else { return }
         let pending = pendingRestores
         pendingRestores.removeAll()
         for (id, entry) in pending {
@@ -601,12 +671,18 @@ public final class TabEngine {
         if !liveWindowIDs.isEmpty {
             for window in state.allWindows {
                 guard let windowID = window.windowID, !liveWindowIDs.contains(windowID) else { continue }
-                if let livePIDs, let pid = window.pid, !livePIDs.contains(pid) {
-                    unbindWindows(pid: pid)
-                    continue
+                if let livePIDs, let pid = window.pid {
+                    if !livePIDs.contains(pid) {
+                        unbindWindows(pid: pid)
+                    } else if let found = state.managedWindow(id: window.id) {
+                        // destroyed通知を取りこぼしても、通知経路と同じ猶予を通す。
+                        // Chrome型の「窓を閉じてからprocess終了」で登録を誤削除しない。
+                        markVanished(found)
+                    }
+                } else {
+                    log("reconcile: window gone: \(window.identity.appName) / \(window.identity.title)")
+                    removeFromState(window.id)
                 }
-                log("reconcile: window gone: \(window.identity.appName) / \(window.identity.title)")
-                removeFromState(window.id)
             }
         }
 
@@ -932,6 +1008,10 @@ public final class TabEngine {
         pendingRestores[id] = nil
         // IPC 中で止められない Task が戻ってきても古い値を書かないよう、世代を進めて無効化する。
         _ = nextGeneration(for: id)
+    }
+
+    private func rejectIfShuttingDown() throws {
+        if isReleasingForShutdown { throw EngineError.shuttingDown }
     }
 
     private func tabIndex(_ id: UUID) throws -> Int {

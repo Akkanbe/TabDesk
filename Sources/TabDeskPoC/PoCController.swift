@@ -118,6 +118,16 @@ final class PoCController {
                 logger.log("add: wid \(wid) not in list (refresh first?)")
                 continue
             }
+            if var existing = entries[wid] {
+                // 退避中の再追加で右下隅を固定frameとして上書きしない。所属と最新identityだけ更新する。
+                existing.window = r.window
+                existing.set = set
+                existing.appName = r.appName
+                existing.title = r.title
+                entries[wid] = existing
+                logger.log("add: wid \(wid) \(r.appName) → set \(set.rawValue), keeping \(fmt(existing.recordedFrame))")
+                continue
+            }
             guard let frame = try? r.window.frame() else {
                 logger.log("add: wid \(wid) frame unavailable")
                 continue
@@ -130,11 +140,44 @@ final class PoCController {
     }
 
     func remove(_ wids: [CGWindowID]) {
-        for wid in wids where entries.removeValue(forKey: wid) != nil {
+        for wid in wids {
+            guard let entry = entries[wid] else { continue }
+            // 退避位置のまま追跡を手放すと、以後戻す手段がなくなる。固定位置へ戻せたときだけ外す。
+            guard release(entry, windowID: wid, reason: "remove") else { continue }
+            pendingRestores.removeValue(forKey: wid)?.cancel()
+            entries.removeValue(forKey: wid)
             logger.log("remove: wid \(wid)")
         }
         refreshObserversIfWatching()
         onChanged?()
+    }
+
+    /// 追跡を手放す前に固定位置へ戻す。失敗時は entry を保持し、画面隅の窓を追跡不能にしない。
+    private func release(_ entry: Entry, windowID: CGWindowID, reason: String) -> Bool {
+        do {
+            let actual = try entry.window.setFrame(entry.recordedFrame)
+            // raise 不能でもframeが戻っていれば追跡を手放してよい。
+            try? entry.window.raise()
+            logger.log("\(reason): released wid \(windowID) to \(fmt(actual))")
+            return true
+        } catch {
+            logger.log("\(reason): release wid \(windowID) FAILED; keeping it tracked: \(error)")
+            return false
+        }
+    }
+
+    /// PoC 終了時にも、非アクティブセットや明示退避で画面隅にいる窓を戻す。
+    func prepareForTermination() {
+        watching = false
+        observers.values.forEach { $0.invalidate() }
+        observers.removeAll()
+        pendingRestores.values.forEach { $0.cancel() }
+        pendingRestores.removeAll()
+        for (wid, entry) in entries
+            where entry.isParked || (activeSet != nil && entry.set != activeSet)
+        {
+            _ = release(entry, windowID: wid, reason: "terminate")
+        }
     }
 
     // MARK: - 配置・退避・復元
@@ -186,11 +229,15 @@ final class PoCController {
             let sw = Stopwatch()
             do {
                 try entry.window.setPosition(point)
-                let actual = try entry.window.frame()
+                // 位置設定が成功した時点で実窓は画面隅にいる。readback失敗で状態だけ未退避に戻さない。
                 entry.isParked = true
                 entries[wid] = entry
-                logger.log("park: wid \(wid) \(entry.appName) in \(fmt(sw.elapsedMs)) ms; " +
-                    "requested \(fmt(point)) actual origin \(fmt(actual.origin)) size \(fmt(actual.size))")
+                if let actual = try? entry.window.frame() {
+                    logger.log("park: wid \(wid) \(entry.appName) in \(fmt(sw.elapsedMs)) ms; " +
+                        "requested \(fmt(point)) actual origin \(fmt(actual.origin)) size \(fmt(actual.size))")
+                } else {
+                    logger.log("park: wid \(wid) \(entry.appName) moved in \(fmt(sw.elapsedMs)) ms; readback unavailable")
+                }
             } catch {
                 logger.log("park: wid \(wid) \(entry.appName) FAILED: \(error)")
             }
@@ -204,7 +251,10 @@ final class PoCController {
             let sw = Stopwatch()
             do {
                 let actual = try entry.window.setFrame(entry.recordedFrame)
-                try entry.window.raise()
+                // 前面化に失敗してもframe復元は成功しているので、退避状態は解除する。
+                if (try? entry.window.raise()) == nil {
+                    logger.log("restore: wid \(wid) frame restored but raise unavailable")
+                }
                 entry.isParked = false
                 entries[wid] = entry
                 logger.log("restore: wid \(wid) \(entry.appName) in \(fmt(sw.elapsedMs)) ms; actual \(fmt(actual))" +
@@ -272,7 +322,10 @@ final class PoCController {
             }
         }
         // 退避を先に出すと、復元されたウィンドウの上に退避中ウィンドウが一瞬残らない。
-        ops.sort { lhs, _ in if case .park = lhs.kind { return true } else { return false } }
+        ops.sort { lhs, rhs in
+            if case .park = lhs.kind, case .restore = rhs.kind { return true }
+            return false
+        }
 
         let sw = Stopwatch()
         let failures: [(CGWindowID, String)]
@@ -310,7 +363,7 @@ final class PoCController {
             try op.window.setPosition(p)
         case .restore(let r):
             try op.window.setFrame(r)
-            try op.window.raise()
+            try? op.window.raise()
         }
     }
 

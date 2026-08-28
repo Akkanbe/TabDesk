@@ -48,14 +48,18 @@ public enum WindowMatcher {
     static let uniquenessScore = 2
     static let sizeTolerance: CGFloat = 2
 
-    /// スコア順に貪欲に割り当てる。各エントリ・各候補は 1 回しか使わない。
+    /// entry と候補の双方から見て、最高点が一意な組み合わせだけを割り当てる。
+    /// 同点を列挙順で決めると別の窓を動かすため、曖昧な組み合わせは未復元のまま残す。
     public static func match(unbound: [ManagedWindow], candidates: [Candidate], strictness: Strictness) -> [Match] {
         let entriesByBundle = Dictionary(grouping: unbound, by: \.identity.bundleID)
         let candidatesByBundle = Dictionary(grouping: candidates, by: \.bundleID)
 
-        var scored: [Match] = []
+        var allEdges: [Match] = []
         for entry in unbound {
             let bundleID = entry.identity.bundleID
+            // bundle ID は自動再同定の必須条件。空文字をひとつのアプリとして束ねると、
+            // bundle ID を取得できない別アプリ同士を誤って紐付けてしまう。
+            guard !bundleID.isEmpty else { continue }
             guard let sameApp = candidatesByBundle[bundleID] else { continue }
             // 「そのアプリの保存エントリも今の窓も 1 つだけ」なら、タイトルが変わっていても同じ窓とみなしやすい。
             let unique = entriesByBundle[bundleID]?.count == 1 && sameApp.count == 1
@@ -78,27 +82,28 @@ public enum WindowMatcher {
                 if unique {
                     score += uniquenessScore
                 }
-                if score >= strictness.threshold {
-                    scored.append(Match(managedID: entry.id, candidate: candidate, score: score))
-                }
+                allEdges.append(Match(managedID: entry.id, candidate: candidate, score: score))
             }
         }
 
-        // スコアが高い順、同点なら保存順(unbound の並び)で安定させる。
-        let order = Dictionary(uniqueKeysWithValues: unbound.enumerated().map { ($1.id, $0) })
-        scored.sort {
-            if $0.score != $1.score { return $0.score > $1.score }
-            return (order[$0.managedID] ?? 0) < (order[$1.managedID] ?? 0)
+        func uniqueBest<Key: Hashable>(
+            _ groups: [Key: [Match]]
+        ) -> [Key: Match] {
+            groups.compactMapValues { edges in
+                guard let highest = edges.map(\.score).max() else { return nil }
+                let best = edges.filter { $0.score == highest }
+                return best.count == 1 ? best[0] : nil
+            }
         }
 
-        var usedEntries = Set<UUID>()
-        var usedWindows = Set<CGWindowID>()
-        var result: [Match] = []
-        for match in scored where !usedEntries.contains(match.managedID) && !usedWindows.contains(match.candidate.windowID) {
-            usedEntries.insert(match.managedID)
-            usedWindows.insert(match.candidate.windowID)
-            result.append(match)
+        let bestForEntry = uniqueBest(Dictionary(grouping: allEdges, by: \.managedID))
+        let bestForCandidate = uniqueBest(Dictionary(grouping: allEdges, by: { $0.candidate.windowID }))
+
+        // allEdges は保存順で作っている。採用判断は順序に依存せず、返却順だけを安定させる。
+        return allEdges.filter { edge in
+            edge.score >= strictness.threshold
+                && bestForEntry[edge.managedID] == edge
+                && bestForCandidate[edge.candidate.windowID] == edge
         }
-        return result
     }
 }

@@ -50,9 +50,10 @@ public struct StateStore: Sendable {
     /// 読めなかったファイルを退避する(上書きして履歴を失わないため)。
     public func backupCorruptFile() throws {
         let backup = fileURL.deletingPathExtension().appendingPathExtension("bak.json")
-        if FileManager.default.fileExists(atPath: backup.path) {
-            try FileManager.default.removeItem(at: backup)
-        }
-        try FileManager.default.moveItem(at: fileURL, to: backup)
+        // 既存 backup を先に削除してから move すると、move 失敗時に新旧どちらの backup も失う。
+        // atomic write で置換を完了してから原本を消し、途中失敗でも少なくとも片方を残す。
+        let data = try Data(contentsOf: fileURL)
+        try data.write(to: backup, options: .atomic)
+        try FileManager.default.removeItem(at: fileURL)
     }
 }

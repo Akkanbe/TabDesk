@@ -3,11 +3,12 @@ import ServiceManagement
 import TabDeskCore
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let logger = FileLogger(directoryName: "TabDesk", fileName: "tabdesk.log")
     private lazy var manager = WindowManager(logger: logger)
     private var sidebar: SidebarPanel?
     private var statusItem: NSStatusItem?
+    private var loginItemMenuItem: NSMenuItem?
     private var probeWindow: NSWindow?
     private lazy var hotkeys = HotkeyCenter(logger: logger)
 
@@ -36,12 +37,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // cleanup 中の再要求も待たせる(terminateNow を返すと復元完了前に終了してしまう)。
+        // Task を起動する前に同期的に入口を閉じ、復元後に新しい操作が窓を再退避するのを防ぐ。
+        manager.beginTermination()
+        hotkeys.stop()
         termination.requestTermination()
         return .terminateLater
     }
 
     /// tabdesk://... で届いたコマンド(動作確認・自動化用)。
     func application(_ application: NSApplication, open urls: [URL]) {
+        guard !manager.isTerminating else {
+            logger.log("url: ignored \(urls.count) command(s) during termination")
+            return
+        }
         for url in urls {
             handle(url: url)
         }
@@ -63,6 +71,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         try await self.manager.activate(tabID)
                     } catch {
                         self.logger.log("hotkey activate failed: \(error)")
+                    }
+                }
+            case .nextTab, .previousTab:
+                // ブラウザ風のタブ順送り(末尾/先頭で回る)。ターゲットの解決はエンジンの直列区間内で
+                // 行う(ここで先に計算すると、切替中の連打が古い activeTabID から同じタブを選んでしまう)。
+                let offset = action == .nextTab ? 1 : -1
+                Task { [weak self] in
+                    guard let self else { return }
+                    do {
+                        try await self.manager.activateAdjacent(offset: offset)
+                    } catch {
+                        self.logger.log("hotkey cycle failed: \(error)")
                     }
                 }
             case .registerFocusedWindow:
@@ -90,7 +110,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         follow.state = manager.focusFollows.value ? .on : .off
         menu.addItem(follow)
         let login = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        loginItemMenuItem = login
+        updateLaunchAtLoginMenuItem()
         menu.addItem(login)
         menu.addItem(.separator())
         menu.addItem(withTitle: "ホットキー設定を開く", action: #selector(openHotkeyConfig), keyEquivalent: "")
@@ -102,8 +123,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for menuItem in menu.items where menuItem.action != #selector(NSApplication.terminate(_:)) {
             menuItem.target = self
         }
+        menu.delegate = self
         item.menu = menu
         statusItem = item
+    }
+
+    /// System Settings 側でログイン項目が変更されることがあるため、メニューを開くたびに実状態を読み直す。
+    func menuWillOpen(_ menu: NSMenu) {
+        updateLaunchAtLoginMenuItem()
     }
 
     @objc private func toggleAlwaysOnTop(_ sender: NSMenuItem) {
@@ -120,17 +147,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        let service = SMAppService.mainApp
         do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
+            switch service.status {
+            case .enabled:
+                try service.unregister()
+            case .notRegistered:
+                try service.register()
+            case .requiresApproval:
+                // この状態は登録済み。再登録では復旧しないため、ユーザーが承認できる画面へ案内する。
+                logger.log("launch-at-login requires approval; opening System Settings")
+                SMAppService.openSystemSettingsLoginItems()
+            case .notFound:
+                logger.log("launch-at-login unavailable: service not found")
+            @unknown default:
+                logger.log("launch-at-login unavailable: unknown status \(service.status.rawValue)")
             }
         } catch {
             logger.log("launch-at-login failed: \(error)")
         }
-        sender.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        logger.log("launchAtLogin=\(SMAppService.mainApp.status == .enabled)")
+        updateLaunchAtLoginMenuItem()
+        logger.log("launchAtLoginStatus=\(service.status.rawValue)")
+    }
+
+    private func updateLaunchAtLoginMenuItem() {
+        guard let item = loginItemMenuItem else { return }
+        item.isEnabled = true
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            item.title = "ログイン時に起動"
+            item.state = .on
+        case .notRegistered:
+            item.title = "ログイン時に起動"
+            item.state = .off
+        case .requiresApproval:
+            item.title = "ログイン時に起動（承認が必要）"
+            item.state = .mixed
+        case .notFound:
+            item.title = "ログイン時に起動（利用不可）"
+            item.state = .off
+            item.isEnabled = false
+        @unknown default:
+            item.title = "ログイン時に起動（状態不明）"
+            item.state = .off
+            item.isEnabled = false
+        }
     }
 
     @objc private func openHotkeyConfig() {
@@ -235,8 +296,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "restore":
             Task { [manager] in await manager.restoreUnboundWindows(strictness: (q["strict"] ?? "0") == "1" ? .strict : .lenient) }
         case "save":
-            manager.saveNow()
-            logger.log("saved to \(manager.store.fileURL.path)")
+            let saved = manager.saveNow()
+            logger.log(saved
+                ? "saved to \(manager.store.fileURL.path)"
+                : "save failed for \(manager.store.fileURL.path)")
         case "quit":
             NSApp.terminate(nil)
         case "probe":

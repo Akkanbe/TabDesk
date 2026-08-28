@@ -15,6 +15,17 @@ public struct Hotkey: Sendable, Hashable {
         self.modifiers = modifiers
         self.display = display
     }
+
+    public static func == (lhs: Hotkey, rhs: Hotkey) -> Bool {
+        lhs.keyCode == rhs.keyCode && lhs.modifiers == rhs.modifiers
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        // display はログ用の表記にすぎない。alias や修飾キーの記述順が違っても、
+        // Carbon に登録する物理キーが同じなら同一のホットキーとして扱う。
+        hasher.combine(keyCode)
+        hasher.combine(modifiers)
+    }
 }
 
 /// "ctrl+alt+1" のような表記を Hotkey に変換する。
@@ -82,6 +93,10 @@ public enum HotkeyParser {
 public enum HotkeyAction: Sendable, Hashable {
     /// 1 始まり(タブ 1 = 並び順の先頭)。
     case activateTab(Int)
+    /// 次のタブへ(末尾なら先頭へ回る)。
+    case nextTab
+    /// 前のタブへ(先頭なら末尾へ回る)。
+    case previousTab
     case registerFocusedWindow
     case toggleEditMode
 }
@@ -89,19 +104,41 @@ public enum HotkeyAction: Sendable, Hashable {
 /// hotkeys.json の中身。ユーザーが手で編集できるよう、キーは "ctrl+alt+1" 形式の文字列で持つ。
 public struct HotkeyConfig: Codable, Sendable, Equatable {
     public var activateTab: [String]
+    public var nextTab: String?
+    public var previousTab: String?
     public var registerFocusedWindow: String?
     public var toggleEditMode: String?
 
-    public init(activateTab: [String], registerFocusedWindow: String?, toggleEditMode: String?) {
+    public init(
+        activateTab: [String], nextTab: String?, previousTab: String?,
+        registerFocusedWindow: String?, toggleEditMode: String?
+    ) {
         self.activateTab = activateTab
+        self.nextTab = nextTab
+        self.previousTab = previousTab
         self.registerFocusedWindow = registerFocusedWindow
         self.toggleEditMode = toggleEditMode
     }
 
     public static let `default` = HotkeyConfig(
         activateTab: (1...9).map { "ctrl+alt+\($0)" },
+        nextTab: "ctrl+tab",
+        previousTab: "ctrl+shift+tab",
         registerFocusedWindow: "ctrl+alt+r",
         toggleEditMode: "ctrl+alt+e")
+
+    /// 古い hotkeys.json(キーが無い)は既定値で補い、明示的に null が書かれていれば「割り当てなし」と解釈する。
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = HotkeyConfig.default
+        activateTab = try c.decodeIfPresent([String].self, forKey: .activateTab) ?? d.activateTab
+        nextTab = c.contains(.nextTab) ? try c.decodeIfPresent(String.self, forKey: .nextTab) : d.nextTab
+        previousTab = c.contains(.previousTab) ? try c.decodeIfPresent(String.self, forKey: .previousTab) : d.previousTab
+        registerFocusedWindow = c.contains(.registerFocusedWindow)
+            ? try c.decodeIfPresent(String.self, forKey: .registerFocusedWindow) : d.registerFocusedWindow
+        toggleEditMode = c.contains(.toggleEditMode)
+            ? try c.decodeIfPresent(String.self, forKey: .toggleEditMode) : d.toggleEditMode
+    }
 
     /// 設定を (Hotkey, HotkeyAction) の組に解決する。解釈できない項目はエラー文字列として返し、他は生かす。
     public func resolve() -> (bindings: [(Hotkey, HotkeyAction)], errors: [String]) {
@@ -126,6 +163,8 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
         for (index, spec) in activateTab.prefix(9).enumerated() {
             add(spec, .activateTab(index + 1), label: "activateTab[\(index)]")
         }
+        if let spec = nextTab { add(spec, .nextTab, label: "nextTab") }
+        if let spec = previousTab { add(spec, .previousTab, label: "previousTab") }
         if let spec = registerFocusedWindow { add(spec, .registerFocusedWindow, label: "registerFocusedWindow") }
         if let spec = toggleEditMode { add(spec, .toggleEditMode, label: "toggleEditMode") }
         return (bindings, errors)

@@ -15,6 +15,7 @@ final class HotkeyCenter {
     private var handlerRef: EventHandlerRef?
     private var registeredRefs: [EventHotKeyRef] = []
     private var actionsByID: [UInt32: HotkeyAction] = [:]
+    private var isStopped = false
 
     init(logger: FileLogger) {
         self.logger = logger
@@ -28,11 +29,11 @@ final class HotkeyCenter {
 
     /// 設定を読み(無ければ既定を書き出し)、ホットキーを登録し直す。
     func reload() {
-        for ref in registeredRefs {
-            UnregisterEventHotKey(ref)
+        guard !isStopped else {
+            logger.log("hotkeys: reload ignored after stop")
+            return
         }
-        registeredRefs.removeAll()
-        actionsByID.removeAll()
+        unregisterHotkeys()
 
         var config = HotkeyConfig.default
         do {
@@ -67,8 +68,36 @@ final class HotkeyCenter {
         logger.log("hotkeys: \(registeredRefs.count) binding(s) active")
     }
 
+    /// 終了要求を受けたら、新しいホットキー操作が実窓の復元後に割り込まないよう同期的に停止する。
+    /// AppKit から終了要求が複数回来ても安全なよう、2 回目以降は何もしない。
+    func stop() {
+        guard !isStopped else { return }
+        isStopped = true
+        onAction = nil
+        unregisterHotkeys()
+        if let handlerRef {
+            let status = RemoveEventHandler(handlerRef)
+            if status != noErr {
+                logger.log("hotkeys: RemoveEventHandler failed (OSStatus \(status))")
+            }
+            self.handlerRef = nil
+        }
+        logger.log("hotkeys: stopped")
+    }
+
+    private func unregisterHotkeys() {
+        for ref in registeredRefs {
+            let status = UnregisterEventHotKey(ref)
+            if status != noErr {
+                logger.log("hotkeys: UnregisterEventHotKey failed (OSStatus \(status))")
+            }
+        }
+        registeredRefs.removeAll()
+        actionsByID.removeAll()
+    }
+
     fileprivate func dispatch(id: UInt32) {
-        guard let action = actionsByID[id] else { return }
+        guard !isStopped, let action = actionsByID[id] else { return }
         onAction?(action)
     }
 }

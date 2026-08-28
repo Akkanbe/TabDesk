@@ -4,7 +4,7 @@ macOS で他アプリのウィンドウを「タブ」として管理するユ�
 リポジトリ: https://github.com/Akkanbe/TabDesk
 仕様は [docs/01_spec.md](docs/01_spec.md) を参照。
 
-## 現在の状態: v1 開発中(段階 2: サイドバー UI + AX 配線)
+## 現在の状態: v1 開発中(段階 5 まで実装済み)
 
 フル Xcode は不要(Command Line Tools の Swift で足ります)。
 
@@ -60,8 +60,10 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
 
 ### ホットキーとフォーカス連動
 
-- 既定のホットキー: **Ctrl+Option+1〜9** でタブ切替、**Ctrl+Option+R** でフォーカス中の窓をアクティブタブに登録、
-  **Ctrl+Option+E** で編集モード切替。割当は `~/Library/Application Support/TabDesk/hotkeys.json` を編集して
+- 既定のホットキー: **Ctrl+Option+1〜9** でタブ切替、**Ctrl+Tab / Ctrl+Shift+Tab** でタブの順送り/逆送り、
+  **Ctrl+Option+R** でフォーカス中の窓をアクティブタブに登録、**Ctrl+Option+E** で編集モード切替。
+  注意: グローバルホットキーなので、TabDesk 起動中は Ctrl+Tab が他アプリ(ブラウザのタブ切替等)に届かなくなる。
+  不要なら hotkeys.json で `"nextTab": null` のように無効化できる。割当は `~/Library/Application Support/TabDesk/hotkeys.json` を編集して
   メニューバーの「ホットキーを再読み込み」で反映する(`"ctrl+alt+1"` のような表記。修飾キーは ctrl / alt / cmd / shift)
 - **フォーカスで自動切替**(既定 ON): Cmd-Tab などで非アクティブタブの窓にフォーカスが移ると、そのタブへ自動で切り替わる。
   メニューバーで OFF にできる
