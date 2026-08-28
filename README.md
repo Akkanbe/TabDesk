@@ -79,6 +79,10 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
 
 ### URL スキームによる操作(動作確認・自動化用)
 
+**既定では無効**です。`tabdesk://` は Accessibility 権限を持つ TabDesk への代理操作口になるため、
+使うときだけメニューバーの「URL コマンドを許可(自動化用)」を ON にしてください(設定は再起動後も維持されます)。
+無効のまま送ったコマンドはログに `URL commands are disabled` と出て無視されます。
+
 ```bash
 open -g 'tabdesk://status'
 open -g 'tabdesk://windows'                # 登録可能なウィンドウ一覧をログに出す

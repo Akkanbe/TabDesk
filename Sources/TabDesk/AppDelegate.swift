@@ -12,6 +12,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var probeWindow: NSWindow?
     private lazy var hotkeys = HotkeyCenter(logger: logger)
 
+    /// tabdesk:// コマンドの受け付け(既定 OFF)。Accessibility 権限を持つ本アプリへの代理操作口になるため、
+    /// メニューバーで明示的に有効化した場合のみ受け付ける(仕様 §5「配布前の必須対応」、docs/04_v2_design.md)。
+    static let urlCommandsEnabled = PersistedToggle(key: "URLCommandsEnabled", defaultValue: false)
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         logger.log("TabDesk started. log: \(logger.fileURL.path) trusted=\(manager.isTrusted)")
         // メニューの「常に最前面」表示はサイドバーの実状態から作るので、サイドバーを先に用意する。
@@ -46,6 +50,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// tabdesk://... で届いたコマンド(動作確認・自動化用)。
     func application(_ application: NSApplication, open urls: [URL]) {
+        guard Self.urlCommandsEnabled.value else {
+            logger.log("url: ignored \(urls.count) command(s); URL commands are disabled " +
+                "(メニューバーの「URL コマンドを許可(自動化用)」で有効化)")
+            return
+        }
         guard !manager.isTerminating else {
             logger.log("url: ignored \(urls.count) command(s) during termination")
             return
@@ -113,6 +122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItemMenuItem = login
         updateLaunchAtLoginMenuItem()
         menu.addItem(login)
+        let urlCommands = NSMenuItem(title: "URL コマンドを許可(自動化用)", action: #selector(toggleURLCommands(_:)), keyEquivalent: "")
+        urlCommands.state = Self.urlCommandsEnabled.value ? .on : .off
+        menu.addItem(urlCommands)
         menu.addItem(.separator())
         menu.addItem(withTitle: "ホットキー設定を開く", action: #selector(openHotkeyConfig), keyEquivalent: "")
         menu.addItem(withTitle: "ホットキーを再読み込み", action: #selector(reloadHotkeys), keyEquivalent: "")
@@ -144,6 +156,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         manager.focusFollows.value.toggle()
         sender.state = manager.focusFollows.value ? .on : .off
         logger.log("focusFollows=\(manager.focusFollows.value)")
+    }
+
+    @objc private func toggleURLCommands(_ sender: NSMenuItem) {
+        Self.urlCommandsEnabled.value.toggle()
+        sender.state = Self.urlCommandsEnabled.value ? .on : .off
+        logger.log("urlCommandsEnabled=\(Self.urlCommandsEnabled.value)")
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
