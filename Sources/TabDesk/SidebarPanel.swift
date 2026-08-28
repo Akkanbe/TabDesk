@@ -198,11 +198,14 @@ final class SidebarPanel: NSPanel {
         }
         lastRendered = (state, manager.engine.editMode)
         tabsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        for tab in state.tabs {
-            let row = TabRowView(tab: tab, isActive: tab.id == state.activeTabID)
+        for (index, tab) in state.tabs.enumerated() {
+            let row = TabRowView(
+                tab: tab, isActive: tab.id == state.activeTabID,
+                canMoveUp: index > 0, canMoveDown: index < state.tabs.count - 1)
             row.onSelect = { [weak self] in self?.activate(tab.id) }
             row.onRenameRequested = { [weak self] in self?.promptRename(tab) }
             row.onDelete = { [weak self] in self?.delete(tab.id) }
+            row.onMove = { [weak self] offset in self?.moveTab(tab.id, offset: offset) }
             tabsStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: tabsStack.widthAnchor).isActive = true
         }
@@ -389,6 +392,17 @@ final class SidebarPanel: NSPanel {
         }
     }
 
+    /// タブを 1 つ上/下へ移動する。index は render 時の値ではなくクリック時点で引き直す
+    /// (メニュー表示中に state が変わりうるため。範囲外は Core が invalidTabOrder で弾く)。
+    private func moveTab(_ tabID: UUID, offset: Int) {
+        guard let index = manager.engine.state.tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        do {
+            try manager.engine.moveTab(fromIndex: index, toIndex: index + offset)
+        } catch {
+            logger.log("moveTab failed: \(error)")
+        }
+    }
+
     private func delete(_ tabID: UUID) {
         Task { [manager, logger] in
             do {
@@ -438,14 +452,20 @@ final class TabRowView: NSView {
     var onSelect: (() -> Void)?
     var onRenameRequested: (() -> Void)?
     var onDelete: (() -> Void)?
+    /// 並べ替え(-1 = 上へ、+1 = 下へ)。
+    var onMove: ((Int) -> Void)?
 
     private let tab: Tab
+    private let canMoveUp: Bool
+    private let canMoveDown: Bool
 
     /// キーでないウィンドウへの最初のクリックも受け取る(既定では「キーにするためのクリック」として消費される)。
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    init(tab: Tab, isActive: Bool) {
+    init(tab: Tab, isActive: Bool, canMoveUp: Bool, canMoveDown: Bool) {
         self.tab = tab
+        self.canMoveUp = canMoveUp
+        self.canMoveDown = canMoveDown
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 6
@@ -485,6 +505,15 @@ final class TabRowView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         let menu = NSMenu()
+        // 端のタブでは移動項目を無効化する(自動 enable は端の判定を知らないので手動制御)。
+        menu.autoenablesItems = false
+        let up = menu.addItem(withTitle: "上へ移動", action: #selector(moveUpAction), keyEquivalent: "")
+        up.target = self
+        up.isEnabled = canMoveUp
+        let down = menu.addItem(withTitle: "下へ移動", action: #selector(moveDownAction), keyEquivalent: "")
+        down.target = self
+        down.isEnabled = canMoveDown
+        menu.addItem(.separator())
         menu.addItem(withTitle: "名前を変更", action: #selector(renameAction), keyEquivalent: "").target = self
         menu.addItem(withTitle: "タブを削除", action: #selector(deleteAction), keyEquivalent: "").target = self
         NSMenu.popUpContextMenu(menu, with: event, for: self)
@@ -492,6 +521,8 @@ final class TabRowView: NSView {
 
     @objc private func renameAction() { onRenameRequested?() }
     @objc private func deleteAction() { onDelete?() }
+    @objc private func moveUpAction() { onMove?(-1) }
+    @objc private func moveDownAction() { onMove?(1) }
 }
 
 /// 登録ウィンドウ 1 行。未復元(実ウィンドウに紐付いていない)ならグレー表示し、クリックで割り当てメニューを出す。
