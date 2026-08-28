@@ -59,11 +59,14 @@ final class WindowManager {
         case alreadyInProgress(CGWindowID)
         /// 移動・リサイズ通知(位置固定の要)を購読できないアプリ。登録は行わない(半端な登録を残さない)。
         case observerUnavailable(pid: pid_t, underlying: String)
+        /// フルスクリーン/最小化中の窓(列挙後にメニューが古くなっていた場合の直前再チェック)。
+        case notRegistrable(reason: String)
 
         var description: String {
             switch self {
             case .alreadyInProgress(let id): return "window \(id) is already being registered"
             case .observerUnavailable(let pid, let underlying): return "cannot observe pid \(pid): \(underlying)"
+            case .notRegistrable(let reason): return "window is not registrable: \(reason)"
             }
         }
     }
@@ -449,18 +452,21 @@ final class WindowManager {
             else { return nil }
             let element = unsafeDowncast(value, to: AXUIElement.self)
             AXUIElementSetMessagingTimeout(element, 1.0)
-            guard let window = try? AXWindow(element: element, pid: pid), window.isStandard else { return nil }
+            guard let window = try? AXWindow(element: element, pid: pid), window.isStandard,
+                !window.isFullscreen, !window.isMinimized
+            else { return nil }
             return WindowRecord(
                 window: window,
                 appName: appName,
                 bundleID: bundleID,
                 title: window.title,
                 frame: try? window.frame(),
-                isMinimized: window.isMinimized)
+                isMinimized: window.isMinimized,
+                fullscreenRaw: window.fullscreenRaw)
         }
         guard !isTerminating, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
         guard let record else {
-            logger.log("register-focused: no standard focused window in \(appName)")
+            logger.log("register-focused: no registrable focused window in \(appName) (standard かつ非フルスクリーン・非最小化が対象)")
             return
         }
         guard engine.state.managedWindow(forWindowID: record.window.windowID) == nil else {
@@ -483,6 +489,10 @@ final class WindowManager {
         let (records, stats) = await WindowEnumerator.standardWindowsAsync()
         if !stats.appFailureDetails.isEmpty {
             logger.log("enumerate: unavailable apps: \(stats.appFailureDetails)")
+        }
+        // 除外は必ずログに残す(AXFullScreen の実測と、誤検知で普通の窓が消えた場合の発見手段)。
+        if !stats.exclusionDetails.isEmpty {
+            logger.log("enumerate: excluded: \(stats.exclusionDetails)")
         }
         // await の間に登録が進んでいることがあるので、除外判定は列挙後の状態で行う。
         let registered = Set(engine.state.allWindows.compactMap(\.windowID))
@@ -511,8 +521,14 @@ final class WindowManager {
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
         let area = layout.contentArea
         let window = record.window
-        let current = try await executor.run { try window.frame() }
+        // メニュー表示中に状態が変わりうるので、frame と一緒にフルスクリーン/最小化も登録直前に読み直す。
+        let (current, fullscreen, minimized) = try await executor.run {
+            (try window.frame(), window.isFullscreen, window.isMinimized)
+        }
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        guard !fullscreen, !minimized else {
+            throw RegistrationError.notRegistrable(reason: fullscreen ? "fullscreen" : "minimized")
+        }
         let frame: CGRect
         if area.contains(current) {
             frame = current

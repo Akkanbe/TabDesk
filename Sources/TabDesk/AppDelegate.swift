@@ -254,9 +254,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 logger.log("  unbound: \(w.identity.appName) | \(w.identity.title) id=\(w.id)")
             }
         case "windows":
+            // fs / min は除外実装の実測用に生値を出す(fs=nil は属性なし。docs/04_v2_design.md)。
             Task { [manager, logger] in
                 for record in await manager.availableWindows() {
-                    logger.log("  wid=\(record.window.windowID) pid=\(record.window.pid) \(record.appName) | \(record.title)")
+                    logger.log("  wid=\(record.window.windowID) pid=\(record.window.pid) " +
+                        "fs=\(record.fullscreenRaw.map(String.init) ?? "nil") min=\(record.isMinimized) " +
+                        "\(record.appName) | \(record.title)")
                 }
             }
         case "tab":

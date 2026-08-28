@@ -43,7 +43,19 @@ Sparkle(依存ゼロを維持)、ScreenCaptureKit のタブサムネイル(画�
 
 ### AXFullScreen 実測記録(macOS 26.5)
 
-(段階 A2 のプローブで記録する)
+- 2026-08-28: CLI(swift スクリプト)からの読み取りは**環境要因で判定不能**だった。
+  `AXIsProcessTrusted()` は true なのに、全アプリで kAXSubroleAttribute すら
+  attributeUnsupported(-25205)を返す(ターミナル配下の未署名子プロセスでは AX が縮退する模様)。
+  署名済みアプリ内からの測定が必要
+- 実装は**安全側に倒してある**: `fullscreenRaw`(生値、nil = 属性なし)を `?? false` で判定するため、
+  属性が無い環境では「除外されない」= v1 と同じ挙動になるだけで害はない。
+  除外した窓は必ず `enumerate: excluded:` としてログに出るので、誤検知(普通の窓が除外される)も
+  実測(フルスクリーン窓が fs=true で除外される)もログで確認できる
+- **アプリ内実測の手順**(新ビルドの起動後に実施し、結果をここに追記する):
+  1. Safari 等を Mission Control のネイティブフルスクリーンにする
+  2. `open -g 'tabdesk://windows'`(段階 B 以降は URL コマンドの許可が必要)
+  3. `~/Library/Logs/TabDesk/tabdesk.log` で当該窓が `excluded: [... [fullscreen] ...]` に
+     入っていること、通常窓の行が `fs=false`(nil でなく)であることを確認
 
 ## 段階 B の判断
 

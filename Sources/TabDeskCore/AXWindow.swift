@@ -51,6 +51,17 @@ public struct AXWindow: @unchecked Sendable, Hashable {
         (try? AXAttributes.bool(element, kAXMinimizedAttribute)) ?? false
     }
 
+    /// ネイティブフルスクリーン属性の生値。SDK に公開定数が無いため属性名を直接使う
+    /// (yabai / AeroSpace も依存する業界慣行)。nil = 属性が無い/読めない。
+    /// 実測記録は docs/04_v2_design.md。
+    public var fullscreenRaw: Bool? {
+        try? AXAttributes.bool(element, "AXFullScreen")
+    }
+
+    public var isFullscreen: Bool {
+        fullscreenRaw ?? false
+    }
+
     /// AX 座標系(主画面左上原点・y 下向き)での frame。要素が無効なら throw。
     public func frame() throws -> CGRect {
         let p = try AXAttributes.point(element, kAXPositionAttribute)

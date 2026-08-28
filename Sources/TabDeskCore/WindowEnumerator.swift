@@ -9,15 +9,23 @@ public struct WindowRecord: Sendable {
     public let title: String
     public let frame: CGRect?
     public let isMinimized: Bool
+    /// 列挙時点の "AXFullScreen" 生値(nil = 属性なし)。判定には isFullscreen を使う。
+    public let fullscreenRaw: Bool?
 
-    public init(window: AXWindow, appName: String, bundleID: String, title: String, frame: CGRect?, isMinimized: Bool) {
+    public init(
+        window: AXWindow, appName: String, bundleID: String, title: String,
+        frame: CGRect?, isMinimized: Bool, fullscreenRaw: Bool? = nil
+    ) {
         self.window = window
         self.appName = appName
         self.bundleID = bundleID
         self.title = title
         self.frame = frame
         self.isMinimized = isMinimized
+        self.fullscreenRaw = fullscreenRaw
     }
+
+    public var isFullscreen: Bool { fullscreenRaw ?? false }
 }
 
 /// 列挙の内訳。「0 件」のときに権限なし・ウィンドウなし・私有関数の不調のどれかを切り分けるために残す。
@@ -27,21 +35,29 @@ public struct EnumerationStats: Sendable, CustomStringConvertible {
     public var appFailures: [String: Int] = [:]
     public var elements = 0
     public var nonStandard = 0
+    /// ネイティブフルスクリーン中のため除外した標準ウィンドウ数(v2 段階 A)。
+    public var fullscreen = 0
+    /// 最小化中のため除外した標準ウィンドウ数(v2 段階 A)。
+    public var minimized = 0
     /// _AXUIElementGetWindow が失敗した要素数と AXError の内訳。
     public var windowIDFailures: [String: Int] = [:]
     public var standard = 0
     /// 「どのアプリで」失敗したか(原因調査用)。
     public var appFailureDetails: [String] = []
     public var windowIDFailureDetails: [String] = []
+    /// フルスクリーン/最小化で除外した窓の内訳(実測とフィルタ誤検知の確認用。docs/04_v2_design.md)。
+    public var exclusionDetails: [String] = []
 
     public var description: String {
         func fmt(_ d: [String: Int]) -> String {
             d.isEmpty ? "0" : d.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ",")
         }
         var s = "apps=\(apps) appFailures=[\(fmt(appFailures))] elements=\(elements) " +
-            "nonStandard=\(nonStandard) windowIDFailures=[\(fmt(windowIDFailures))] standard=\(standard)"
+            "nonStandard=\(nonStandard) fullscreen=\(fullscreen) minimized=\(minimized) " +
+            "windowIDFailures=[\(fmt(windowIDFailures))] standard=\(standard)"
         if !appFailureDetails.isEmpty { s += " appFailureDetails=\(appFailureDetails)" }
         if !windowIDFailureDetails.isEmpty { s += " windowIDFailureDetails=\(windowIDFailureDetails)" }
+        if !exclusionDetails.isEmpty { s += " exclusionDetails=\(exclusionDetails)" }
         return s
     }
 }
@@ -76,10 +92,13 @@ extension EnumerationStats {
         for (k, v) in other.appFailures { appFailures[k, default: 0] += v }
         elements += other.elements
         nonStandard += other.nonStandard
+        fullscreen += other.fullscreen
+        minimized += other.minimized
         for (k, v) in other.windowIDFailures { windowIDFailures[k, default: 0] += v }
         standard += other.standard
         appFailureDetails += other.appFailureDetails
         windowIDFailureDetails += other.windowIDFailureDetails
+        exclusionDetails += other.exclusionDetails
     }
 }
 
@@ -143,6 +162,18 @@ public enum WindowEnumerator {
                 stats.nonStandard += 1
                 continue
             }
+            // フルスクリーン中は登録対象外(仕様 §3.3)。最小化中も除外する:
+            // frame は書けても raise で復帰せず、登録しても切替時に現れない死にエントリになるため。
+            guard !window.isFullscreen else {
+                stats.fullscreen += 1
+                stats.exclusionDetails.append("\(appName) [fullscreen]: \(window.title)")
+                continue
+            }
+            guard !window.isMinimized else {
+                stats.minimized += 1
+                stats.exclusionDetails.append("\(appName) [minimized]: \(window.title)")
+                continue
+            }
             stats.standard += 1
             result.append(
                 WindowRecord(
@@ -151,7 +182,8 @@ public enum WindowEnumerator {
                     bundleID: app.bundleID,
                     title: window.title,
                     frame: try? window.frame(),
-                    isMinimized: window.isMinimized
+                    isMinimized: window.isMinimized,
+                    fullscreenRaw: window.fullscreenRaw
                 )
             )
         }
