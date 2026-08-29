@@ -89,6 +89,10 @@ public final class TabEngine {
     private var restoreGeneration: [UUID: UInt64] = [:]
     private var isBusy = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+    /// 同期削除経路(destroyed / vanish)から立てる列再計算の予約。直近の reconcile が 1 回だけ消化する。
+    /// タイルの再計算を構造イベント時に限定するための仕組み(毎 reconcile で理想値を書き直すと、
+    /// 最小サイズ制約のあるアプリと「理想値→失敗→到達値採用→また理想値」の発振になる)。
+    private var pendingRetileTabIDs: Set<UUID> = []
 
     public init(
         driver: any WindowDriver,
@@ -125,6 +129,21 @@ public final class TabEngine {
         }
         let tab = state.tabs.remove(at: from)
         state.tabs.insert(tab, at: to)
+    }
+
+    /// タブのレイアウトを変更する。columns にした場合はその場で列を適用する。
+    /// free に戻した場合は現在のタイル rect がそのまま自由配置の固定 frame になる(旧配置は保存しない)。
+    public func setTabLayout(_ tabID: UUID, _ newLayout: TabLayout) async throws {
+        try await serialized {
+            try rejectIfShuttingDown()
+            let index = try tabIndex(tabID)
+            guard state.tabs[index].layout != newLayout else { return }
+            state.tabs[index].layout = newLayout
+            log("layout: \(state.tabs[index].name) → \(newLayout.rawValue)")
+            if newLayout == .columns {
+                await retileUnlocked(tabID)
+            }
+        }
     }
 
     /// タブを削除する。退避中だったウィンドウは固定 frame に戻してから解放する(画面隅に取り残さない)。
@@ -192,6 +211,9 @@ public final class TabEngine {
             if case .parked = outcome {
                 parkedWindowIDs.insert(managed.id)
             }
+            if state.tabs[index].layout == .columns {
+                await retileUnlocked(tabID)
+            }
             return managed
         }
     }
@@ -206,6 +228,7 @@ public final class TabEngine {
             // 固定 frame に戻せたことを確認できるまで登録は手放さない(隅に取り残さない)。
             guard unreleased.isEmpty else { throw EngineError.releaseFailed(managedIDs: unreleased) }
             removeFromState(id)
+            await retileUnlocked(found.tab.id)  // columns なら残りで列を組み直す(free なら何もしない)
             return found.window.windowID
         }
     }
@@ -269,6 +292,9 @@ public final class TabEngine {
                 parkedWindowIDs.insert(id)
             }
             log("bind: \(again.window.identity.appName) / \(title ?? again.window.identity.title) → \(intoActive ? "\(frame)" : "parked")")
+            if state.tabs[ti].layout == .columns {
+                await retileUnlocked(state.tabs[ti].id)
+            }
         }
     }
 
@@ -455,6 +481,7 @@ public final class TabEngine {
         let target = try tab(tabID)
         let alreadyActive = tabID == state.activeTabID
         let point = layout.parkPoint
+        let desired = desiredFrames(for: target)
         var parks: [WindowOp] = []
         var restores: [WindowOp] = []
         for tab in state.tabs {
@@ -464,7 +491,7 @@ public final class TabEngine {
                     // 既にアクティブなタブの窓には触らない。ドラッグ中の一時 frame を読み戻して
                     // 「到達 frame」として採用してしまうのを避けるため(ずれはスナップバックが直す)。
                     if !alreadyActive {
-                        let targetFrame = clamped(window.frame)
+                        let targetFrame = desired[window.id] ?? clamped(window.frame)
                         if targetFrame != window.frame { updateFrame(window.id, targetFrame) }
                         restores.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(targetFrame, raise: true)))
                     }
@@ -504,13 +531,15 @@ public final class TabEngine {
         await serialized {
             guard !isReleasingForShutdown else { return }
             let point = layout.parkPoint
+            // columns はコンテンツ領域の変化に追従して列を計算し直す(free は従来どおり位置 clamp のみ)。
+            let activeDesired = state.activeTab.map { desiredFrames(for: $0) } ?? [:]
             var ops: [WindowOp] = []
             for tab in state.tabs {
                 let isActive = tab.id == state.activeTabID
                 for window in tab.windows {
                     guard let windowID = window.windowID, let pid = window.pid else { continue }
                     if isActive {
-                        let target = clamped(window.frame)
+                        let target = activeDesired[window.id] ?? clamped(window.frame)
                         if target != window.frame { updateFrame(window.id, target) }
                         cancelPendingRestore(window.id)
                         ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(target, raise: false)))
@@ -598,7 +627,9 @@ public final class TabEngine {
             guard isLatest(id, generation), let found = state.managedWindow(id: id), !parkedWindowIDs.contains(id),
                 found.tab.id == state.activeTabID
             else { return }
-            if editMode {
+            // 編集モードで記録するのは free のタブだけ。columns では列が唯一の正なので、
+            // ドラッグは編集モードでも常にスナップバックさせる(記録すると列と記録がずれたまま残る)。
+            if editMode, found.tab.layout == .free {
                 await recordEditedFrame(id: id, windowID: windowID, current: current, attempt: attempt, generation: generation,
                     appName: found.window.identity.appName)
                 return
@@ -692,6 +723,15 @@ public final class TabEngine {
         await serialized {
             // ロック待ちの間に終了処理が走っていれば、戻された窓を隅へ送り返さない。
             guard !isReleasingForShutdown else { return }
+            // 同期削除経路(destroyed / vanish)で予約された列の再計算をここで 1 回だけ消化する。
+            // 予約を先に空にしてから実行する(失敗しても次の構造イベントまで繰り返さない = 発振させない)。
+            if !pendingRetileTabIDs.isEmpty {
+                let tabIDs = pendingRetileTabIDs
+                pendingRetileTabIDs.removeAll()
+                for tabID in tabIDs {
+                    await retileUnlocked(tabID)
+                }
+            }
             var ops: [WindowOp] = []
             for tab in state.tabs {
                 let isActive = tab.id == state.activeTabID
@@ -971,6 +1011,47 @@ public final class TabEngine {
         return abs(current.minX - parkPoint.x) <= 1
     }
 
+    // MARK: - タイルレイアウト(段階 C)
+
+    /// アクティブ化・再適用時の「あるべき frame」。free は clamped(記録 frame)、columns は等幅カラム。
+    /// columns では未復元(unbound)の窓は列数に入らず、エントリも返らない(呼び手が記録 frame に fallback)。
+    private func desiredFrames(for tab: Tab) -> [UUID: CGRect] {
+        switch tab.layout {
+        case .free:
+            return Dictionary(uniqueKeysWithValues: tab.windows.map { ($0.id, clamped($0.frame)) })
+        case .columns:
+            return Tiler.columnFrames(for: tab.windows, in: layout.contentArea)
+        }
+    }
+
+    /// columns タブの列を計算し直して記録し、アクティブタブなら実窓にも適用する。冪等。
+    /// 登録・解除・bind・レイアウト変更などの構造イベントからだけ呼ぶ(定常の reconcile からは呼ばない。
+    /// 呼ぶと最小サイズ制約のあるアプリで発振する — pendingRetileTabIDs のコメント参照)。
+    private func retileUnlocked(_ tabID: UUID) async {
+        pendingRetileTabIDs.remove(tabID)  // 直接消化した予約は reconcile に残さない
+        guard let index = state.tabs.firstIndex(where: { $0.id == tabID }),
+            state.tabs[index].layout == .columns
+        else { return }
+        let tab = state.tabs[index]
+        let desired = Tiler.columnFrames(for: tab.windows, in: layout.contentArea)
+        guard !desired.isEmpty else { return }
+        let isActive = tab.id == state.activeTabID
+        var ops: [WindowOp] = []
+        for window in tab.windows {
+            guard let target = desired[window.id] else { continue }  // unbound は列に入らない
+            if target != window.frame { updateFrame(window.id, target) }
+            guard isActive, let windowID = window.windowID, let pid = window.pid,
+                !parkedWindowIDs.contains(window.id)
+            else { continue }
+            cancelPendingRestore(window.id)
+            ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(target, raise: false)))
+        }
+        guard !ops.isEmpty else { return }
+        let failures = await apply(await run(ops))
+        log("retile: \(tab.name): \(ops.count) op(s)" +
+            (failures.isEmpty ? "" : "; failures: \(failures.map(\.message))"))
+    }
+
     // MARK: - 内部ヘルパー
 
     private func focusTargetPID(in tab: Tab) -> pid_t? {
@@ -987,7 +1068,13 @@ public final class TabEngine {
         cancelPendingRestore(id)
         parkedWindowIDs.remove(id)
         for index in state.tabs.indices {
+            let before = state.tabs[index].windows.count
             state.tabs[index].windows.removeAll { $0.id == id }
+            // 同期経路(destroyed / vanish)からは retile の IPC を挟めないので予約だけ立てる。
+            // unregister のような直列区間内の呼び手は、この直後に直接 retileUnlocked して予約を消化する。
+            if state.tabs[index].windows.count != before, state.tabs[index].layout == .columns {
+                pendingRetileTabIDs.insert(state.tabs[index].id)
+            }
             if state.tabs[index].lastFocusedWindowID == id {
                 state.tabs[index].lastFocusedWindowID = nil
             }

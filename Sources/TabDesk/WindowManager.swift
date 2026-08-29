@@ -503,6 +503,12 @@ final class WindowManager {
         await availableWindowsAndIssues().records
     }
 
+    /// タブのレイアウト(自由配置 / 縦の等幅カラム)を変更する。
+    func setTabLayout(_ tabID: UUID, _ layout: TabLayout) async throws {
+        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        try await engine.setTabLayout(tabID, layout)
+    }
+
     /// タブを削除する。Core の削除が成功したときだけ、その窓の AX 資源(driver / 要素 / observer)を片付ける。
     /// 復元できない窓があって Core が throw した場合は何も片付けない(登録も資源も保持される)。
     func deleteTab(_ id: UUID) async throws {
