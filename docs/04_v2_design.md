@@ -51,11 +51,11 @@ Sparkle(依存ゼロを維持)、ScreenCaptureKit のタブサムネイル(画�
   属性が無い環境では「除外されない」= v1 と同じ挙動になるだけで害はない。
   除外した窓は必ず `enumerate: excluded:` としてログに出るので、誤検知(普通の窓が除外される)も
   実測(フルスクリーン窓が fs=true で除外される)もログで確認できる
-- **アプリ内実測の手順**(新ビルドの起動後に実施し、結果をここに追記する):
-  1. Safari 等を Mission Control のネイティブフルスクリーンにする
-  2. `open -g 'tabdesk://windows'`(段階 B 以降は URL コマンドの許可が必要)
-  3. `~/Library/Logs/TabDesk/tabdesk.log` で当該窓が `excluded: [... [fullscreen] ...]` に
-     入っていること、通常窓の行が `fs=false`(nil でなく)であることを確認
+- **2026-08-29 実機実測(macOS 26.5、`tabdesk://windows`)**: 属性は**正常に機能する**。
+  - ネイティブフルスクリーン中の Safari の窓が `excluded: [... [fullscreen] ...]` として除外された
+  - 通常の窓は全アプリで `fs=false`(nil ではない)。確認できたアプリ: Finder / LINE /
+    Docker Desktop(Electron 系)/ Google Chrome / システム設定 / Claude / Slack / Ghostty
+  - 結論: フォールバックヒューリスティック(frame == 画面全体)は不要。属性ベースの判定を正式採用
 
 ## 段階 B の判断
 
