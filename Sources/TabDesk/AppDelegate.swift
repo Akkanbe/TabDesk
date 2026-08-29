@@ -346,17 +346,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 座標系の突き合わせ用。AX 座標(主画面左上原点)と CGWindowList の bounds は同じはずだが、
             // サイドバーと窓の見た目が食い違うときにここで確認する。
             for screen in NSScreen.screens {
-                logger.log("screen '\(screen.localizedName)': frame=\(screen.frame) visible=\(screen.visibleFrame) scale=\(screen.backingScaleFactor)")
+                logger.log("screen '\(screen.localizedName)': frame=\(screen.frame) visible=\(screen.visibleFrame) " +
+                    "scale=\(screen.backingScaleFactor) id=\(ScreenGeometry.displayID(of: screen))")
             }
             if let sidebar {
                 logger.log("sidebar: cocoa=\(sidebar.frame) cg=\(cgBounds(CGWindowID(sidebar.windowNumber)).map { "\($0)" } ?? "?")")
             }
-            logger.log("contentArea(AX)=\(manager.layout.contentArea) park=\(manager.layout.parkPoint)")
+            for display in manager.layout.displays {
+                logger.log("display \(display.id): frame(AX)=\(display.frame) content=\(display.contentArea) park=\(display.parkPoint)")
+            }
             for window in engine.state.allWindows {
                 guard let wid = window.windowID else { continue }
                 let ax = (try? manager.currentFrame(of: wid)).map { "\($0)" } ?? "?"
                 let cg = cgBounds(wid).map { "\($0)" } ?? "?"
-                logger.log("window \(window.identity.appName) wid=\(wid): recorded=\(window.frame) ax=\(ax) cg=\(cg)")
+                logger.log("window \(window.identity.appName) wid=\(wid): recorded=\(window.frame) ax=\(ax) cg=\(cg) " +
+                    "display=\(window.displayID ?? "primary")")
             }
         default:
             logger.log("url: unknown command '\(command)'")

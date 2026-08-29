@@ -531,7 +531,6 @@ final class WindowManager {
     /// ウィンドウをタブに登録する。主ディスプレイのコンテンツ領域に収まっていなければ引き込む。
     func register(_ record: WindowRecord, into tabID: UUID) async throws {
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
-        let area = layout.contentArea
         let window = record.window
         // メニュー表示中に状態が変わりうるので、frame と一緒にフルスクリーン/最小化も登録直前に読み直す。
         let (current, fullscreen, minimized) = try await executor.run {
@@ -541,6 +540,8 @@ final class WindowManager {
         guard !fullscreen, !minimized else {
             throw RegistrationError.notRegistrable(reason: fullscreen ? "fullscreen" : "minimized")
         }
+        // 窓がいまいるディスプレイのコンテンツ領域に収める(v1 の「主ディスプレイへ引き込み」は段階 D で廃止)。
+        let area = layout.display(containing: current)?.contentArea ?? layout.contentArea
         let frame: CGRect
         if area.contains(current) {
             frame = current

@@ -211,17 +211,22 @@ public final class TabEngine {
             if let existing = state.managedWindow(forWindowID: windowID) {
                 throw EngineError.windowAlreadyRegistered(windowID: windowID, managedID: existing.window.id)
             }
-            let frame = clamped(frame)
-            var managed = ManagedWindow(frame: frame, identity: identity, windowID: windowID, pid: pid)
+            // 窓がいたディスプレイに留める(主ディスプレイへの引き込みは段階 D で廃止)。
+            let display = layout.display(containing: frame) ?? layout.primaryDisplay
+            let frame = clamped(frame, in: display?.contentArea ?? layout.contentArea)
+            var managed = ManagedWindow(
+                frame: frame, identity: identity, windowID: windowID, pid: pid, displayID: display?.id)
             let intoActive = tabID == state.activeTabID
 
-            let outcome = try await place(windowID: windowID, frame: frame, intoActive: intoActive)
+            let outcome = try await place(
+                windowID: windowID, frame: frame, intoActive: intoActive,
+                parkPoint: display?.parkPoint ?? layout.parkPoint)
             switch outcome {
             case .placed(let actual):
                 managed.frame = actual
             case .unreached(let current):
                 // 新規登録は「今ある位置」を基準にしてよい(ユーザーがまだレイアウトを決めていない)。
-                managed.frame = clamped(current)
+                managed.frame = clamped(current, in: display?.contentArea ?? layout.contentArea)
             case .parked:
                 break
             }
@@ -281,9 +286,12 @@ public final class TabEngine {
             // resolveVanished が entry を削除しないよう、この時点で古い消滅保留を取り消す。
             vanished.removeValue(forKey: id)
             let intoActive = found.tab.id == state.activeTabID
-            // 保存時と画面構成が違っていても、最初の復元から現在のコンテンツ領域内へ収める。
-            let recorded = clamped(found.window.frame)
-            let outcome = try await place(windowID: windowID, frame: recorded, intoActive: intoActive)
+            // 保存時と画面構成が違っていても、最初の復元から現在のコンテンツ領域内へ収める
+            // (窓のディスプレイが切断中なら主ディスプレイへ)。退避先も窓のディスプレイの隅。
+            let recorded = clamped(found.window.frame, for: found.window)
+            let outcome = try await place(
+                windowID: windowID, frame: recorded, intoActive: intoActive,
+                parkPoint: parkPoint(for: found.window))
             let frame: CGRect
             switch outcome {
             case .placed(let actual):
@@ -450,7 +458,7 @@ public final class TabEngine {
         try await serialized {
             try rejectIfShuttingDown()
             guard let found = state.managedWindow(id: id) else { throw EngineError.unknownWindow(id) }
-            let frame = clamped(frame)
+            let frame = clamped(frame, for: found.window)
             cancelPendingRestore(id)
             guard let windowID = found.window.windowID, !parkedWindowIDs.contains(id),
                 found.tab.id == state.activeTabID
@@ -501,7 +509,6 @@ public final class TabEngine {
     private func activateUnlocked(_ tabID: UUID) async throws -> SwitchReport {
         let target = try tab(tabID)
         let alreadyActive = tabID == state.activeTabID
-        let point = layout.parkPoint
         let desired = desiredFrames(for: target)
         var parks: [WindowOp] = []
         var restores: [WindowOp] = []
@@ -512,12 +519,13 @@ public final class TabEngine {
                     // 既にアクティブなタブの窓には触らない。ドラッグ中の一時 frame を読み戻して
                     // 「到達 frame」として採用してしまうのを避けるため(ずれはスナップバックが直す)。
                     if !alreadyActive {
-                        let targetFrame = desired[window.id] ?? clamped(window.frame)
+                        let targetFrame = desired[window.id] ?? clamped(window.frame, for: window)
                         if targetFrame != window.frame { updateFrame(window.id, targetFrame) }
                         restores.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(targetFrame, raise: true)))
                     }
                 } else if !parkedWindowIDs.contains(window.id) {
-                    parks.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(point)))
+                    // 退避は同じ画面の隅へ(ディスプレイ間の移動は 1 桁 ms でなく 50〜270ms かかる)。
+                    parks.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(parkPoint(for: window))))
                 }
             }
         }
@@ -551,8 +559,8 @@ public final class TabEngine {
     public func reapplyLayout() async {
         await serialized {
             guard !isReleasingForShutdown else { return }
-            let point = layout.parkPoint
             // columns はコンテンツ領域の変化に追従して列を計算し直す(free は従来どおり位置 clamp のみ)。
+            // 窓のディスプレイが切断されていれば主ディスプレイへ clamp される(段階 D の消失ポリシー)。
             let activeDesired = state.activeTab.map { desiredFrames(for: $0) } ?? [:]
             var ops: [WindowOp] = []
             for tab in state.tabs {
@@ -560,12 +568,12 @@ public final class TabEngine {
                 for window in tab.windows {
                     guard let windowID = window.windowID, let pid = window.pid else { continue }
                     if isActive {
-                        let target = activeDesired[window.id] ?? clamped(window.frame)
+                        let target = activeDesired[window.id] ?? clamped(window.frame, for: window)
                         if target != window.frame { updateFrame(window.id, target) }
                         cancelPendingRestore(window.id)
                         ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(target, raise: false)))
                     } else {
-                        ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(point)))
+                        ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(parkPoint(for: window))))
                     }
                 }
             }
@@ -681,12 +689,15 @@ public final class TabEngine {
     /// 編集モード: 静止した位置を新しい固定 frame として記録する。
     /// サイドバー領域に置かれていればコンテンツ領域へ寄せてから、**到達した frame** を記録する(要求値は保存しない)。
     /// 寄せる操作が失敗したら以前の固定 frame を維持し、再試行に回す。
+    /// 別ディスプレイに置かれた場合は所属もそのディスプレイへ更新する(段階 D)。
     private func recordEditedFrame(
         id: UUID, windowID: CGWindowID, current: CGRect, attempt: Int, generation: UInt64, appName: String
     ) async {
-        let target = clamped(current)
+        let display = layout.display(containing: current) ?? layout.primaryDisplay
+        let target = clamped(current, in: display?.contentArea ?? layout.contentArea)
         if approximatelyEqual(target, current) {
             updateFrame(id, current)
+            updateDisplayID(id, display?.id)
             log("edit: recorded \(current) for \(appName)")
             return
         }
@@ -695,6 +706,7 @@ public final class TabEngine {
             let actual = try await executor.run { try driver.setFrame(target, of: windowID) }
             guard isLatest(id, generation) else { return }
             updateFrame(id, actual)
+            updateDisplayID(id, display?.id)
             log("edit: nudged into content area and recorded \(actual) for \(appName)")
         } catch {
             guard isLatest(id, generation) else { return }
@@ -738,7 +750,6 @@ public final class TabEngine {
             }
         }
 
-        let point = layout.parkPoint
         let frames = await observedFrames()
 
         await serialized {
@@ -768,10 +779,14 @@ public final class TabEngine {
                         // 即時には動かさず、通常のデバウンス復元(編集モードなら記録)に流す。
                         log("reconcile: \(window.identity.appName) drifted to \(current); scheduling restore")
                         scheduleRestore(window.id, attempt: 1)
-                    } else if !isActive, !flagged || (current.map { abs($0.minX - point.x) > 1 } ?? false) {
+                    } else if !isActive {
                         // y は OS にクランプされて窓の高さごとに変わる(実測 1067〜1087)ので判定に使わない。
-                        // x = 画面幅 − 1 は通常のウィンドウでは起こらないので、x だけで「隅にいる」とみなす。
-                        ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(point)))
+                        // x = その窓の画面の幅 − 1 は通常のウィンドウでは起こらないので、x だけで「隅にいる」とみなす。
+                        // 比較は必ずその窓のディスプレイの隅と行う(他画面の隅 x と比べると誤検知する。段階 D)。
+                        let point = parkPoint(for: window)
+                        if !flagged || (current.map { abs($0.minX - point.x) > 1 } ?? false) {
+                            ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(point)))
+                        }
                     }
                 }
             }
@@ -993,7 +1008,8 @@ public final class TabEngine {
     ///
     /// AX は操作を適用したあとでタイムアウト等を返すことがある。そのとき未登録のまま捨てると
     /// 隅へ動かした窓を誰も追跡できなくなるので、「動いていれば commit、動いていなければ throw」にする。
-    private func place(windowID: CGWindowID, frame: CGRect, intoActive: Bool) async throws -> PlacementOutcome {
+    /// - Parameter parkPoint: 非アクティブタブへの登録時の退避先(その窓のディスプレイの隅)。
+    private func place(windowID: CGWindowID, frame: CGRect, intoActive: Bool, parkPoint point: CGPoint) async throws -> PlacementOutcome {
         let driver = self.driver
         if intoActive {
             do {
@@ -1011,7 +1027,6 @@ public final class TabEngine {
                 throw error
             }
         }
-        let point = layout.parkPoint
         do {
             try await executor.run { try driver.setPosition(point, of: windowID) }
             return .parked
@@ -1032,16 +1047,46 @@ public final class TabEngine {
         return abs(current.minX - parkPoint.x) <= 1
     }
 
+    // MARK: - ディスプレイ(段階 D)
+
+    /// 窓が属するディスプレイ。未記録(nil = v1 データ)や切断中は主ディスプレイに fallback する。
+    private func display(for window: ManagedWindow) -> DisplayLayout? {
+        layout.display(id: window.displayID) ?? layout.primaryDisplay
+    }
+
+    /// 窓の退避先(その窓のディスプレイの右下隅)。ディスプレイ間の退避移動は 50〜270ms/窓かかるため、
+    /// 退避は必ず同じ画面の隅にする(docs/02_poc_results.md、docs/04_v2_design.md 段階 D)。
+    private func parkPoint(for window: ManagedWindow) -> CGPoint {
+        display(for: window)?.parkPoint ?? layout.parkPoint
+    }
+
+    private func updateDisplayID(_ id: UUID, _ displayID: DisplayID?) {
+        for ti in state.tabs.indices {
+            if let wi = state.tabs[ti].windows.firstIndex(where: { $0.id == id }) {
+                state.tabs[ti].windows[wi].displayID = displayID
+                return
+            }
+        }
+    }
+
     // MARK: - タイルレイアウト(段階 C)
 
     /// アクティブ化・再適用時の「あるべき frame」。free は clamped(記録 frame)、columns は等幅カラム。
+    /// columns はディスプレイごとにグループ化して、それぞれのコンテンツ領域内で等分する(段階 D)。
     /// columns では未復元(unbound)の窓は列数に入らず、エントリも返らない(呼び手が記録 frame に fallback)。
     private func desiredFrames(for tab: Tab) -> [UUID: CGRect] {
         switch tab.layout {
         case .free:
-            return Dictionary(uniqueKeysWithValues: tab.windows.map { ($0.id, clamped($0.frame)) })
+            return Dictionary(uniqueKeysWithValues: tab.windows.map { ($0.id, clamped($0.frame, for: $0)) })
         case .columns:
-            return Tiler.columnFrames(for: tab.windows, in: layout.contentArea)
+            var frames: [UUID: CGRect] = [:]
+            // Dictionary(grouping:) はグループ内の順序を保つので、列順 = 一覧順が画面ごとに維持される。
+            let groups = Dictionary(grouping: tab.windows) { display(for: $0)?.id ?? "" }
+            for (_, windows) in groups {
+                guard let area = windows.first.flatMap({ display(for: $0)?.contentArea }) else { continue }
+                frames.merge(Tiler.columnFrames(for: windows, in: area)) { current, _ in current }
+            }
+            return frames
         }
     }
 
@@ -1054,7 +1099,7 @@ public final class TabEngine {
             state.tabs[index].layout == .columns
         else { return }
         let tab = state.tabs[index]
-        let desired = Tiler.columnFrames(for: tab.windows, in: layout.contentArea)
+        let desired = desiredFrames(for: tab)
         guard !desired.isEmpty else { return }
         let isActive = tab.id == state.activeTabID
         var ops: [WindowOp] = []
@@ -1133,8 +1178,17 @@ public final class TabEngine {
 
     /// 固定 frame をコンテンツ領域(サイドバーを除いた範囲)に収める。サイズは変えず位置だけ寄せる。
     /// 領域より大きい窓は領域の原点に揃える(はみ出しは許容)。仕様 §3.2「サイドバー領域は配置領域から除外」。
+    /// 主ディスプレイの領域に収める v1 互換版。窓ごとの判定は clamped(_:for:) を使う。
     private func clamped(_ frame: CGRect) -> CGRect {
-        let area = layout.contentArea
+        clamped(frame, in: layout.contentArea)
+    }
+
+    /// 窓が属するディスプレイのコンテンツ領域に収める(段階 D)。ディスプレイ切断中は主ディスプレイへ。
+    private func clamped(_ frame: CGRect, for window: ManagedWindow) -> CGRect {
+        clamped(frame, in: display(for: window)?.contentArea ?? layout.contentArea)
+    }
+
+    private func clamped(_ frame: CGRect, in area: CGRect) -> CGRect {
         guard area.width > 0, area.height > 0 else { return frame }
         var f = frame
         f.origin.x = min(max(f.minX, area.minX), max(area.minX, area.maxX - f.width))

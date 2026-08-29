@@ -23,21 +23,28 @@ public struct ManagedWindow: Codable, Sendable, Hashable, Identifiable {
     /// 固定 frame(AX 座標)。「要求値」ではなく「適用後に到達した frame」を持つ。
     public var frame: CGRect
     public var identity: WindowIdentity
+    /// 所属ディスプレイ(v2 段階 D)。nil = 主ディスプレイ(v1 データもここに落ちる)。
+    /// optional なので合成デコーダが decodeIfPresent になり、キーの無い v1 ファイルもそのまま読める。
+    public var displayID: DisplayID?
     /// 実行時にだけ意味を持つ実ウィンドウへの紐付け。永続化しない(nil = 未復元)。
     public var windowID: CGWindowID?
     public var pid: pid_t?
 
     // windowID / pid は CodingKeys から外すことで JSON に出さない。
     enum CodingKeys: String, CodingKey {
-        case id, frame, identity
+        case id, frame, identity, displayID
     }
 
-    public init(id: UUID = UUID(), frame: CGRect, identity: WindowIdentity, windowID: CGWindowID?, pid: pid_t?) {
+    public init(
+        id: UUID = UUID(), frame: CGRect, identity: WindowIdentity,
+        windowID: CGWindowID?, pid: pid_t?, displayID: DisplayID? = nil
+    ) {
         self.id = id
         self.frame = frame
         self.identity = identity
         self.windowID = windowID
         self.pid = pid
+        self.displayID = displayID
     }
 
     public var isBound: Bool {
