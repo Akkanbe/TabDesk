@@ -11,7 +11,7 @@ public struct DisplayLayout: Sendable, Hashable {
     public let frame: CGRect
     /// 管理対象ウィンドウを配置できる領域(サイドバーのある画面はその分を除いた範囲)。
     public let contentArea: CGRect
-    /// 退避先(この画面の右下隅)。
+    /// この画面の窓に使う安全な退避先。内側の画面では配置外縁の別画面を指すことがある。
     public let parkPoint: CGPoint
 
     public init(id: DisplayID, frame: CGRect, contentArea: CGRect, parkPoint: CGPoint) {
@@ -90,7 +90,7 @@ public struct SystemScreenLayout: ScreenLayout {
     public var displays: [DisplayLayout] {
         let screens = NSScreen.screens
         let frames = screens.map { ScreenGeometry.fullFrameAX(of: $0) }
-        // 退避点は画面配置を考慮して決める(右側に画面がある画面は自画面の隅だと窓が丸見えになる)。
+        // 退避点は画面配置を考慮して決める(配置の右端でない画面は自画面の隅だと窓が見え得る)。
         let parks = ScreenGeometry.parkPoints(forDisplayFrames: frames)
         return screens.enumerated().map { index, screen in
             let visible = ScreenGeometry.visibleFrameAX(of: screen)

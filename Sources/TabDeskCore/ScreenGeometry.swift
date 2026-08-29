@@ -38,19 +38,21 @@ public enum ScreenGeometry {
     /// 「右下隅 −1px」で 1px 線だけが残るのは、その隅が**配置全体の外縁**にある場合だけ。
     /// 右側に別の画面がある画面で自画面の隅に退避すると、隅は合法な座標なので OS はクランプせず、
     /// 窓本体が隣の画面上に丸見えのまま残る(クリックするとフォーカス連動切替まで誘発する)。
-    /// そのため右側に画面がある画面は、配置全体の右下隅(外縁)へフォールバックする。
+    /// そのため右方向へさらに張り出す画面がある場合は、最も右にある**実ディスプレイ**の
+    /// 右下隅(外縁)へフォールバックする。
     /// その窓の切替は画面をまたぐぶん遅くなる(実測 50〜270ms/窓)が、見えないことを優先する。
     public static func parkPoints(forDisplayFrames frames: [CGRect]) -> [CGPoint] {
-        let fallback = CGPoint(
-            x: (frames.map(\.maxX).max() ?? 1) - 1,
-            y: (frames.map(\.maxY).max() ?? 1) - 1)
+        // maxX と maxY を別々の画面から取ると、L 字配置ではどの画面にも属さない空白座標になる。
+        // 右端の実画面を 1 枚選び、その画面内の隅を使う。
+        guard let fallbackFrame = frames.max(by: { lhs, rhs in
+            lhs.maxX == rhs.maxX ? lhs.maxY < rhs.maxY : lhs.maxX < rhs.maxX
+        }) else { return [] }
+        let fallback = CGPoint(x: fallbackFrame.maxX - 1, y: fallbackFrame.maxY - 1)
         return frames.map { frame in
-            // 「右側に画面があるか」だけを見る(縦のずれは判定しない)。斜め配置では過剰に
-            // フォールバックすることがあるが、誤って見える側に倒れるよりよい。
-            let blockedRight = frames.contains { other in
-                other != frame && other.minX >= frame.maxX - 1
-            }
-            return blockedRight ? fallback : CGPoint(x: frame.maxX - 1, y: frame.maxY - 1)
+            // 下側の画面が横に広い縦積みでも、窓は右下方向へ大きく露出し得る。
+            // 配置全体の右端に達していない画面は一律 fallback にして安全側へ倒す。
+            let reachesGlobalRightEdge = frame.maxX == fallbackFrame.maxX
+            return reachesGlobalRightEdge ? CGPoint(x: frame.maxX - 1, y: frame.maxY - 1) : fallback
         }
     }
 

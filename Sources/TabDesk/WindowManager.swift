@@ -33,6 +33,8 @@ final class WindowManager {
     private var lastOnScreenIDs: Set<CGWindowID> = []
     private var reconcileTask: Task<Void, Never>?
     private var layoutReapplyTask: Task<Void, Never>?
+    /// 連続する画面変更通知で、古い reapply Task が新しい通知抑止を解除しないための世代。
+    private var layoutChangeGeneration: UInt64 = 0
     private(set) var isTerminating = false
     private var initialRestoreDone = false
     private var lastExistingIDs: Set<CGWindowID> = []
@@ -113,6 +115,11 @@ final class WindowManager {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(appDidActivate(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        // ネイティブフルスクリーンの開始・解除は Space 切替として届く。on-screen ID は開始前後で
+        // 変化しない場合があるため、未復元エントリがあるときだけ明示的に再照合する。
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(activeSpaceDidChange(_:)),
+            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         // ドラッグ終了(マウスアップ)を全アプリで拾い、デバウンスを待たずに復元する。
         // グローバル監視は Accessibility 権限があれば使える。
         mouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] _ in
@@ -715,8 +722,9 @@ final class WindowManager {
         let livePIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
         let appeared = live.subtracting(lastExistingIDs)
         lastExistingIDs = live
-        // 最小化解除・フルスクリーン解除・別 Space からの復帰は「存在する窓」には現れない
+        // 最小化解除・別 Space からの復帰は「存在する窓」には現れない
         // (existingWindowIDs はそれらを含み続ける)ので、on-screen 集合の変化で検知する。
+        // フルスクリーン解除は集合が変わらない場合があるため activeSpaceDidChange でも補完する。
         // これが無いと、起動時に最小化されていた窓は解除しても未復元のまま残る(登録候補の除外の副作用)。
         let onScreen = WindowEnumerator.onScreenWindowIDs()
         let becameVisible = onScreen.subtracting(lastOnScreenIDs)
@@ -757,12 +765,21 @@ final class WindowManager {
     /// 画面変更・復帰は短時間に連発するので 1 秒でまとめてから再適用する。
     @objc private func layoutMayHaveChanged(_ notification: Notification) {
         guard !isTerminating else { return }
+        layoutChangeGeneration &+= 1
+        let generation = layoutChangeGeneration
+        engine.beginLayoutTransition()
         layoutReapplyTask?.cancel()
         layoutReapplyTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled, let self, self.isTrusted, !self.isTerminating else { return }
+            guard !Task.isCancelled, let self, generation == self.layoutChangeGeneration, !self.isTerminating else { return }
+            guard self.isTrusted else {
+                self.engine.endLayoutTransition()
+                return
+            }
             self.logger.log("layout change (\(notification.name.rawValue)): reapplying")
             await self.engine.reapplyLayout()
+            guard generation == self.layoutChangeGeneration, !self.isTerminating else { return }
+            self.engine.endLayoutTransition()
         }
     }
 
@@ -793,6 +810,19 @@ final class WindowManager {
                 NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
             else { return }
             self.recordFocusedWindow(windowID)
+        }
+    }
+
+    /// Space の切替で、フルスクリーン解除後などに登録可能になった未復元窓を再照合する。
+    @objc private func activeSpaceDidChange(_ notification: Notification) {
+        // 権限取得前に初回復元を消化すると、後から権限を付けても緩め照合を再実行できなくなる。
+        guard isTrusted, !isTerminating, engine.state.allWindows.contains(where: { !$0.isBound }) else { return }
+        strictRestorePending = true
+        if initialRestoreDone {
+            startStrictRestoreIfNeeded()
+        } else {
+            // 初回復元中なら pending を保持し、完了時の defer から厳格照合を追走させる。
+            startInitialRestoreIfNeeded()
         }
     }
 }

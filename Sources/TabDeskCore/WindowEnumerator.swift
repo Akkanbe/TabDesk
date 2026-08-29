@@ -164,12 +164,16 @@ public enum WindowEnumerator {
             }
             // フルスクリーン中は登録対象外(仕様 §3.3)。最小化中も除外する:
             // frame は書けても raise で復帰せず、登録しても切替時に現れない死にエントリになるため。
-            guard !window.isFullscreen else {
+            // eligibility は 1 回のスナップショットで判定し、record にも同じ値を残す。
+            // 二重に AX 読み取りすると、その間の状態遷移で「除外判定と record が矛盾」し得る。
+            let fullscreenRaw = window.fullscreenRaw
+            guard fullscreenRaw != true else {
                 stats.fullscreen += 1
                 stats.exclusionDetails.append("\(appName) [fullscreen]: \(window.title)")
                 continue
             }
-            guard !window.isMinimized else {
+            let minimized = window.isMinimized
+            guard !minimized else {
                 stats.minimized += 1
                 stats.exclusionDetails.append("\(appName) [minimized]: \(window.title)")
                 continue
@@ -182,8 +186,8 @@ public enum WindowEnumerator {
                     bundleID: app.bundleID,
                     title: window.title,
                     frame: try? window.frame(),
-                    isMinimized: window.isMinimized,
-                    fullscreenRaw: window.fullscreenRaw
+                    isMinimized: minimized,
+                    fullscreenRaw: fullscreenRaw
                 )
             )
         }
@@ -239,7 +243,8 @@ public enum WindowEnumerator {
     }
 
     /// CGWindowList 側から見た画面上のウィンドウ ID(_AXUIElementGetWindow の答え合わせ用)。
-    /// 最小化・別 Space・フルスクリーン中の窓は含まないので、`TabEngine.reconcile` には渡さないこと。
+    /// 最小化・別 Space の窓は含まない。アクティブなネイティブフルスクリーン窓は含まれ得るため、
+    /// eligibility や fullscreen 解除検知には使わない。`TabEngine.reconcile` にも渡さないこと。
     public static func onScreenWindowIDs() -> Set<CGWindowID> {
         windowIDs(options: [.optionOnScreenOnly, .excludeDesktopElements])
     }

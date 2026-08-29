@@ -78,6 +78,8 @@ struct TileEngineTests {
         let half = content.width / 2
         #expect(driver.currentFrame(1) == CGRect(x: content.minX, y: content.minY, width: half, height: content.height))
         #expect(driver.currentFrame(2) == CGRect(x: content.minX + half, y: content.minY, width: half, height: content.height))
+        #expect(w2.frame == engine.state.managedWindow(id: w2.id)?.window.frame, "register は retile 後の状態を返す")
+        #expect(w2.frame == driver.currentFrame(2))
 
         try await engine.unregister(w2.id)
         #expect(driver.currentFrame(1) == content, "解除後は残り 1 窓で全面に戻る")
@@ -101,6 +103,30 @@ struct TileEngineTests {
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100, 200])
         #expect(driver.currentFrame(1) == content, "残り 1 窓で全面")
         #expect(engine.state.tab(withID: tab.id)?.windows.count == 1)
+    }
+
+    /// destroyed の猶予中も消えた窓は bound 列に数えず、次の reconcile で残りを組み直す。
+    @Test func vanishedWindowRetilesBeforeGraceExpires() async throws {
+        let (engine, driver) = makeEngine()
+        engine.vanishGracePeriod = .seconds(60)
+        let tab = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: 300, y: 100, width: 500, height: 400))
+        driver.add(2, frame: CGRect(x: 900, y: 200, width: 500, height: 400))
+        try await engine.register(
+            windowID: 1, pid: 100, identity: identity("a"),
+            frame: CGRect(x: 300, y: 100, width: 500, height: 400), into: tab.id)
+        let vanished = try await engine.register(
+            windowID: 2, pid: 200, identity: identity("b"),
+            frame: CGRect(x: 900, y: 200, width: 500, height: 400), into: tab.id)
+        try await engine.setTabLayout(tab.id, .columns)
+
+        driver.kill(2)
+        engine.noteWindowDestroyed(windowID: 2)
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100, 200])
+
+        #expect(driver.currentFrame(1) == content)
+        #expect(engine.state.tab(withID: tab.id)?.windows.count == 2, "猶予中は entry を保持する")
+        #expect(engine.state.managedWindow(id: vanished.id)?.window.isBound == false)
     }
 
     /// 最小サイズ制約の窓は到達 frame を採用して終わり。reconcile を繰り返しても再適用しない(発振回帰)。
@@ -212,5 +238,53 @@ struct TileEngineTests {
         #expect(engine.state.tab(withID: tab.id)?.layout == .free)
         #expect(engine.state.managedWindow(id: w1.id)?.window.frame == content, "列の frame が引き継がれる")
         #expect(driver.currentFrame(1) == content, "free への切替では窓は動かない")
+    }
+
+    /// 個別 frame API から columns の唯一の正を崩せない。
+    @Test func setFrameRejectsColumnsLayout() async throws {
+        let (engine, driver) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: 300, y: 100, width: 500, height: 400))
+        let window = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("a"),
+            frame: CGRect(x: 300, y: 100, width: 500, height: 400), into: tab.id)
+        try await engine.setTabLayout(tab.id, .columns)
+        let tiled = try #require(driver.currentFrame(1))
+        let requested = CGRect(x: 700, y: 300, width: 500, height: 400)
+
+        await #expect(throws: TabEngine.EngineError.self) {
+            try await engine.setFrame(requested, of: window.id)
+        }
+        #expect(driver.currentFrame(1) == tiled)
+        #expect(engine.state.managedWindow(id: window.id)?.window.frame == tiled)
+    }
+
+    /// inactive columns も画面変更時に論理列を更新し、free 化しても旧領域を固定しない。
+    @Test func reapplyUpdatesInactiveColumnsBeforeSwitchingToFree() async throws {
+        let driver = FakeWindowDriver()
+        let layout = MutableScreenLayout(parkPoint: park, contentArea: content)
+        let engine = TabEngine(driver: driver, layout: layout)
+        _ = engine.createTab(name: "A")
+        let inactive = engine.createTab(name: "B")
+        driver.add(1, frame: CGRect(x: 300, y: 100, width: 500, height: 400))
+        driver.add(2, frame: CGRect(x: 900, y: 200, width: 500, height: 400))
+        let w1 = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("b1"),
+            frame: CGRect(x: 300, y: 100, width: 500, height: 400), into: inactive.id)
+        let w2 = try await engine.register(
+            windowID: 2, pid: 200, identity: identity("b2"),
+            frame: CGRect(x: 900, y: 200, width: 500, height: 400), into: inactive.id)
+        try await engine.setTabLayout(inactive.id, .columns)
+
+        let newArea = CGRect(x: 300, y: 30, width: 1140, height: 800)
+        layout.change(parkPoint: CGPoint(x: 1439, y: 899), contentArea: newArea)
+        await engine.reapplyLayout()
+        try await engine.setTabLayout(inactive.id, .free)
+
+        let half = newArea.width / 2
+        #expect(engine.state.managedWindow(id: w1.id)?.window.frame ==
+            CGRect(x: newArea.minX, y: newArea.minY, width: half, height: newArea.height))
+        #expect(engine.state.managedWindow(id: w2.id)?.window.frame ==
+            CGRect(x: newArea.minX + half, y: newArea.minY, width: half, height: newArea.height))
     }
 }
