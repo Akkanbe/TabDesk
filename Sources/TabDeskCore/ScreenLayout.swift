@@ -89,6 +89,9 @@ public struct SystemScreenLayout: ScreenLayout {
 
     public var displays: [DisplayLayout] {
         let screens = NSScreen.screens
+        let frames = screens.map { ScreenGeometry.fullFrameAX(of: $0) }
+        // 退避点は画面配置を考慮して決める(右側に画面がある画面は自画面の隅だと窓が丸見えになる)。
+        let parks = ScreenGeometry.parkPoints(forDisplayFrames: frames)
         return screens.enumerated().map { index, screen in
             let visible = ScreenGeometry.visibleFrameAX(of: screen)
             let content: CGRect
@@ -101,9 +104,9 @@ public struct SystemScreenLayout: ScreenLayout {
             }
             return DisplayLayout(
                 id: ScreenGeometry.displayID(of: screen),
-                frame: ScreenGeometry.fullFrameAX(of: screen),
+                frame: frames[index],
                 contentArea: content,
-                parkPoint: ScreenGeometry.parkPoint(on: screen))
+                parkPoint: parks[index])
         }
     }
 }

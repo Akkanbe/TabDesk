@@ -339,6 +339,11 @@ public final class TabEngine {
                 state.tabs[ti].windows[wi].pid = nil
                 vanished.removeValue(forKey: id)
                 count += 1
+                // unbound は列数に入らないので、columns では bound 数の減少も構造イベント
+                // (removeFromState と同じく同期経路なので予約だけ立て、reconcile が消化する)。
+                if state.tabs[ti].layout == .columns {
+                    pendingRetileTabIDs.insert(state.tabs[ti].id)
+                }
             }
         }
         if count > 0 {
@@ -423,6 +428,9 @@ public final class TabEngine {
             if let livePIDs, !livePIDs.contains(info.pid) {
                 setBinding(id, windowID: nil, pid: nil)
                 vanished.removeValue(forKey: id)
+                if found.tab.layout == .columns {
+                    pendingRetileTabIDs.insert(found.tab.id)  // unbound になった窓は列から外れる
+                }
                 log("vanished: app of \(found.window.identity.appName) quit; kept as unbound")
             } else if now - info.at >= vanishGracePeriod {
                 vanished.removeValue(forKey: id)
@@ -757,10 +765,16 @@ public final class TabEngine {
             guard !isReleasingForShutdown else { return }
             // 同期削除経路(destroyed / vanish)で予約された列の再計算をここで 1 回だけ消化する。
             // 予約を先に空にしてから実行する(失敗しても次の構造イベントまで繰り返さない = 発振させない)。
+            // 再タイルした窓は、ロック外で読んだ frames(再タイル前のスナップショット)との比較から外す
+            // (外さないと動かした直後の窓すべてに無用の復元予約を出してしまう)。
+            var retiledWindowIDs: Set<UUID> = []
             if !pendingRetileTabIDs.isEmpty {
                 let tabIDs = pendingRetileTabIDs
                 pendingRetileTabIDs.removeAll()
                 for tabID in tabIDs {
+                    if let tab = state.tabs.first(where: { $0.id == tabID }) {
+                        retiledWindowIDs.formUnion(tab.windows.map(\.id))
+                    }
                     await retileUnlocked(tabID)
                 }
             }
@@ -774,7 +788,9 @@ public final class TabEngine {
                     if isActive, flagged {
                         // 復元に失敗したまま = 隅に残っているはずなので、復元をやり直す。
                         ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(window.frame, raise: false)))
-                    } else if isActive, let current, !approximatelyEqual(current, window.frame), pendingRestores[window.id] == nil {
+                    } else if isActive, let current, !approximatelyEqual(current, window.frame),
+                        pendingRestores[window.id] == nil, !retiledWindowIDs.contains(window.id)
+                    {
                         // 通知を取りこぼして固定 frame からずれている。ドラッグ中かもしれないので
                         // 即時には動かさず、通常のデバウンス復元(編集モードなら記録)に流す。
                         log("reconcile: \(window.identity.appName) drifted to \(current); scheduling restore")
@@ -1077,7 +1093,10 @@ public final class TabEngine {
     private func desiredFrames(for tab: Tab) -> [UUID: CGRect] {
         switch tab.layout {
         case .free:
-            return Dictionary(uniqueKeysWithValues: tab.windows.map { ($0.id, clamped($0.frame, for: $0)) })
+            // 壊れた state.json で UUID が重複していてもクラッシュさせない(先勝ち)。
+            return Dictionary(
+                tab.windows.map { ($0.id, clamped($0.frame, for: $0)) },
+                uniquingKeysWith: { first, _ in first })
         case .columns:
             var frames: [UUID: CGRect] = [:]
             // Dictionary(grouping:) はグループ内の順序を保つので、列順 = 一覧順が画面ごとに維持される。

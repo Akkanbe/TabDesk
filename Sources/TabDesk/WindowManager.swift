@@ -29,6 +29,8 @@ final class WindowManager {
     private var restoreTask: Task<Void, Never>?
     /// 復元Task中に現れた窓の一度きりの appeared イベントを、Task完了後まで保持する。
     private var strictRestorePending = false
+    /// 前回 tick で画面上に見えていた窓(最小化解除などの「見えるようになった」検知用)。
+    private var lastOnScreenIDs: Set<CGWindowID> = []
     private var reconcileTask: Task<Void, Never>?
     private var layoutReapplyTask: Task<Void, Never>?
     private(set) var isTerminating = false
@@ -130,6 +132,7 @@ final class WindowManager {
             self, selector: #selector(layoutMayHaveChanged(_:)),
             name: Notification.Name("com.apple.screenIsUnlocked"), object: nil)
         lastExistingIDs = WindowEnumerator.existingWindowIDs()
+        lastOnScreenIDs = WindowEnumerator.onScreenWindowIDs()
         if isTrusted {
             startInitialRestoreIfNeeded()
         }
@@ -276,6 +279,15 @@ final class WindowManager {
         }
         // 割り当て先が(自動復元との競合などで)既に紐付いていたら何もしない(bind は上書きを拒否する)。
         guard engine.state.managedWindow(id: managedID)?.window.isBound == false else { return false }
+        // 列挙後にフルスクリーン化/最小化されていることがあるので直前に読み直す(register と同じ)。
+        // false を返せば未復元のまま残り、解除後の自動復元で再試行される。
+        let window = record.window
+        let (fullscreen, minimized) = await executor.run { (window.isFullscreen, window.isMinimized) }
+        guard !isTerminating else { return false }
+        guard !fullscreen, !minimized else {
+            logger.log("bind skipped: \(record.appName) is \(fullscreen ? "fullscreen" : "minimized")")
+            return false
+        }
         do {
             _ = try establishObserver(pid: record.window.pid)
         } catch {
@@ -703,6 +715,12 @@ final class WindowManager {
         let livePIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
         let appeared = live.subtracting(lastExistingIDs)
         lastExistingIDs = live
+        // 最小化解除・フルスクリーン解除・別 Space からの復帰は「存在する窓」には現れない
+        // (existingWindowIDs はそれらを含み続ける)ので、on-screen 集合の変化で検知する。
+        // これが無いと、起動時に最小化されていた窓は解除しても未復元のまま残る(登録候補の除外の副作用)。
+        let onScreen = WindowEnumerator.onScreenWindowIDs()
+        let becameVisible = onScreen.subtracting(lastOnScreenIDs)
+        lastOnScreenIDs = onScreen
         let before = Set(engine.state.allWindows.compactMap(\.windowID))
         reconcileTask = Task { [weak self] in
             guard let self else { return }
@@ -713,8 +731,9 @@ final class WindowManager {
             for gone in before.subtracting(after) {
                 self.forgetWindow(gone)
             }
-            if !appeared.isEmpty, self.engine.state.allWindows.contains(where: { !$0.isBound }) {
+            if !appeared.isEmpty || !becameVisible.isEmpty, self.engine.state.allWindows.contains(where: { !$0.isBound }) {
                 // 復元中でもイベントを記憶し、現在の列挙完了後に必ず一度追走する。
+                // becameVisible は Space 切替でも立つが、未復元エントリがあるときだけなので追走コストは許容。
                 self.strictRestorePending = true
             }
             if !self.initialRestoreDone {

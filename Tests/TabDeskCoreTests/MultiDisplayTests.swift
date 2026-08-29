@@ -125,6 +125,39 @@ struct MultiDisplayTests {
         #expect(driver.currentFrame(3) == secondDisplay.contentArea, "外部側は 1 窓なので外部の全面")
     }
 
+    /// アプリごと終了(unbind)でも columns は次の reconcile で列を組み直す(レビュー指摘)。
+    @Test func appQuitRetilesColumnsOnNextReconcile() async throws {
+        let (engine, driver, _) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: 300, y: 100, width: 500, height: 400))
+        driver.add(2, frame: CGRect(x: 900, y: 200, width: 500, height: 400))
+        try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: CGRect(x: 300, y: 100, width: 500, height: 400), into: tab.id)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: CGRect(x: 900, y: 200, width: 500, height: 400), into: tab.id)
+        try await engine.setTabLayout(tab.id, .columns)
+
+        driver.kill(2)
+        engine.unbindWindows(pid: 200)  // NSWorkspace のアプリ終了通知経路
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+        #expect(driver.currentFrame(1) == mainDisplay.contentArea, "残った bound 1 窓で全面")
+        #expect(engine.state.tab(withID: tab.id)?.windows.count == 2, "未復元エントリは保持される")
+    }
+
+    /// destroyed 通知後に pid ごと消えた(vanish → アプリ終了と確定)場合も列を組み直す(レビュー指摘)。
+    @Test func vanishedThenDeadPIDRetilesColumns() async throws {
+        let (engine, driver, _) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: 300, y: 100, width: 500, height: 400))
+        driver.add(2, frame: CGRect(x: 900, y: 200, width: 500, height: 400))
+        try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: CGRect(x: 300, y: 100, width: 500, height: 400), into: tab.id)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: CGRect(x: 900, y: 200, width: 500, height: 400), into: tab.id)
+        try await engine.setTabLayout(tab.id, .columns)
+
+        driver.kill(2)
+        engine.noteWindowDestroyed(windowID: 2)  // 猶予つきの vanish 保留に入る
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])  // pid 200 が消えた → アプリ終了と確定
+        #expect(driver.currentFrame(1) == mainDisplay.contentArea)
+    }
+
     /// displayID の無い v1 の JSON は nil(= 主ディスプレイ)として読める。
     @Test func decodingV1WindowWithoutDisplayIDDefaultsToNil() throws {
         let json = """
@@ -143,5 +176,43 @@ struct MultiDisplayTests {
         let data = try JSONEncoder().encode(window)
         let decoded = try JSONDecoder().decode(ManagedWindow.self, from: data)
         #expect(decoded.displayID == "second")
+    }
+}
+
+/// 退避点の配置ジオメトリ(レビュー指摘: 右隣に画面がある画面の隅は「内側」なので窓が丸見えになる)。
+struct ParkPointGeometryTests {
+    private let left = CGRect(x: 0, y: 0, width: 1920, height: 1200)
+    private let right = CGRect(x: 1920, y: 0, width: 2560, height: 1440)
+
+    @Test func singleDisplayUsesOwnCorner() {
+        let points = ScreenGeometry.parkPoints(forDisplayFrames: [left])
+        #expect(points == [CGPoint(x: 1919, y: 1199)])
+    }
+
+    /// 右隣がある画面は配置全体の外縁(右下)へ、右端の画面は自画面の隅のまま。
+    @Test func innerDisplayFallsBackToArrangementCorner() {
+        let points = ScreenGeometry.parkPoints(forDisplayFrames: [left, right])
+        #expect(points[0] == CGPoint(x: 4479, y: 1439), "左画面の隅 (1919,1199) は右画面上の合法な座標なので使わない")
+        #expect(points[1] == CGPoint(x: 4479, y: 1439))
+    }
+
+    /// 縦積み(上下)の配置では右側に画面が無いので、どちらも自画面の隅でよい
+    /// (下の画面へ 1px 列がまたがるだけで、窓本体は見えない)。
+    @Test func verticalStackKeepsOwnCorners() {
+        let top = CGRect(x: 0, y: 0, width: 1920, height: 1200)
+        let bottom = CGRect(x: 0, y: 1200, width: 1920, height: 1200)
+        let points = ScreenGeometry.parkPoints(forDisplayFrames: [top, bottom])
+        #expect(points[0] == CGPoint(x: 1919, y: 1199))
+        #expect(points[1] == CGPoint(x: 1919, y: 2399))
+    }
+
+    /// 3 枚横並び: 右端だけ自画面の隅、それ以外はフォールバック。
+    @Test func threeInARowOnlyRightmostKeepsCorner() {
+        let mid = CGRect(x: 1920, y: 0, width: 1920, height: 1200)
+        let rightmost = CGRect(x: 3840, y: 0, width: 1920, height: 1200)
+        let points = ScreenGeometry.parkPoints(forDisplayFrames: [left, mid, rightmost])
+        #expect(points[0] == CGPoint(x: 5759, y: 1199))
+        #expect(points[1] == CGPoint(x: 5759, y: 1199))
+        #expect(points[2] == CGPoint(x: 5759, y: 1199))
     }
 }
