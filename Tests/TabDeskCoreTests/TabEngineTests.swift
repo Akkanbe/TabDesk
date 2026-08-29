@@ -1211,22 +1211,26 @@ struct ParallelEnumerationTests {
 /// 値を差し替えられる layout(ディスプレイ構成の変更を模す)。
 final class MutableScreenLayout: ScreenLayout, @unchecked Sendable {
     private let lock = NSLock()
-    private var _parkPoint: CGPoint
-    private var _contentArea: CGRect
+    private var _displays: [DisplayLayout]
 
     init(parkPoint: CGPoint, contentArea: CGRect) {
-        _parkPoint = parkPoint
-        _contentArea = contentArea
+        _displays = FixedScreenLayout(parkPoint: parkPoint, contentArea: contentArea).displays
     }
 
-    var parkPoint: CGPoint { lock.withLock { _parkPoint } }
-    var contentArea: CGRect { lock.withLock { _contentArea } }
+    init(displays: [DisplayLayout]) {
+        _displays = displays
+    }
+
+    var displays: [DisplayLayout] { lock.withLock { _displays } }
 
     func change(parkPoint: CGPoint, contentArea: CGRect) {
         lock.withLock {
-            _parkPoint = parkPoint
-            _contentArea = contentArea
+            _displays = FixedScreenLayout(parkPoint: parkPoint, contentArea: contentArea).displays
         }
+    }
+
+    func change(displays: [DisplayLayout]) {
+        lock.withLock { _displays = displays }
     }
 }
 

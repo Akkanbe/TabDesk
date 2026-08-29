@@ -12,7 +12,7 @@ final class WindowManager {
     static let reconcileInterval: TimeInterval = 2
 
     let engine: TabEngine
-    let layout = PrimaryScreenLayout(sidebarWidth: WindowManager.sidebarWidth)
+    let layout = SystemScreenLayout(sidebarWidth: WindowManager.sidebarWidth)
     let store: StateStore
     /// Cmd-Tab 等で非アクティブタブの窓にフォーカスが移ったら、そのタブへ自動で切り替える(§3.6)。
     let focusFollows = PersistedToggle(key: "FocusFollowsWindow", defaultValue: true)

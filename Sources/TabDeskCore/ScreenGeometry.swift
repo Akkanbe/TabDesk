@@ -32,6 +32,20 @@ public enum ScreenGeometry {
         return CGPoint(x: full.maxX - 1, y: full.maxY - 1)
     }
 
+    /// 画面の永続識別子。CGDirectDisplayID は再起動で変わりうるので、
+    /// CGDisplayCreateUUIDFromDisplayID の UUID 文字列にする(接続をまたいで同じディスプレイを同定できる)。
+    /// UUID が取れない場合は番号ベースの予備 ID(再起動をまたぐ安定性は劣るがセッション内では機能する)。
+    public static func displayID(of screen: NSScreen) -> DisplayID {
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return "unknown-display"
+        }
+        let directID = CGDirectDisplayID(number.uint32Value)
+        if let uuid = CGDisplayCreateUUIDFromDisplayID(directID)?.takeRetainedValue() {
+            return CFUUIDCreateString(nil, uuid) as String
+        }
+        return "display-\(directID)"
+    }
+
     /// 2 つの frame が許容誤差内で一致するか(スナップバック判定用)。
     public static func approximatelyEqual(_ a: CGRect, _ b: CGRect, tolerance: CGFloat = 1.0) -> Bool {
         abs(a.minX - b.minX) <= tolerance
