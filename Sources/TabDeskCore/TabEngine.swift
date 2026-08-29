@@ -38,6 +38,7 @@ public final class TabEngine {
         case unknownWindow(UUID)
         case windowAlreadyRegistered(windowID: CGWindowID, managedID: UUID)
         case invalidTabOrder
+        case invalidWindowOrder
         /// 退避中の窓を固定 frame に戻せなかった(登録は保持される。相手アプリが応答したら再試行できる)。
         case releaseFailed(managedIDs: Set<UUID>)
         /// エントリは既に別の実ウィンドウに紐付いている(上書きすると前の窓が追跡不能になる)。
@@ -51,6 +52,7 @@ public final class TabEngine {
             case .unknownWindow(let id): return "unknown managed window \(id)"
             case .windowAlreadyRegistered(let wid, let mid): return "window \(wid) already registered as \(mid)"
             case .invalidTabOrder: return "invalid tab order"
+            case .invalidWindowOrder: return "invalid window order"
             case .releaseFailed(let ids): return "could not restore \(ids.count) parked window(s); registration kept"
             case .entryAlreadyBound(let mid, let wid): return "entry \(mid) is already bound to window \(wid)"
             case .shuttingDown: return "TabDesk is shutting down"
@@ -129,6 +131,25 @@ public final class TabEngine {
         }
         let tab = state.tabs.remove(at: from)
         state.tabs.insert(tab, at: to)
+    }
+
+    /// タブ内でウィンドウを 1 つ前/後ろへ並べ替える(columns の列順 = 一覧の並び順)。
+    /// columns のタブなら新しい順序で列を組み直す。範囲外は invalidWindowOrder。
+    public func moveWindow(_ id: UUID, offset: Int) async throws {
+        try await serialized {
+            try rejectIfShuttingDown()
+            guard let found = state.managedWindow(id: id),
+                let ti = state.tabs.firstIndex(where: { $0.id == found.tab.id }),
+                let wi = state.tabs[ti].windows.firstIndex(where: { $0.id == id })
+            else { throw EngineError.unknownWindow(id) }
+            let to = wi + offset
+            guard state.tabs[ti].windows.indices.contains(to) else { throw EngineError.invalidWindowOrder }
+            let window = state.tabs[ti].windows.remove(at: wi)
+            state.tabs[ti].windows.insert(window, at: to)
+            if state.tabs[ti].layout == .columns {
+                await retileUnlocked(state.tabs[ti].id)
+            }
+        }
     }
 
     /// タブのレイアウトを変更する。columns にした場合はその場で列を適用する。

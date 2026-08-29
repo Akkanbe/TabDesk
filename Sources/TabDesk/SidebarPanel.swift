@@ -206,6 +206,7 @@ final class SidebarPanel: NSPanel {
             row.onRenameRequested = { [weak self] in self?.promptRename(tab) }
             row.onDelete = { [weak self] in self?.delete(tab.id) }
             row.onMove = { [weak self] offset in self?.moveTab(tab.id, offset: offset) }
+            row.onSetLayout = { [weak self] layout in self?.setLayout(tab.id, layout) }
             tabsStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: tabsStack.widthAnchor).isActive = true
         }
@@ -219,9 +220,13 @@ final class SidebarPanel: NSPanel {
         windowsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         if let active = state.activeTab {
             windowsHeader.stringValue = "\(active.name) のウィンドウ(\(active.windows.count))"
-            for window in active.windows {
-                let row = WindowRowView(window: window)
+                + (active.layout == .columns ? " — 縦に等分割" : "")
+            for (index, window) in active.windows.enumerated() {
+                let row = WindowRowView(
+                    window: window,
+                    canMoveUp: index > 0, canMoveDown: index < active.windows.count - 1)
                 row.onRemove = { [weak self] in self?.unregister(window.id) }
+                row.onMove = { [weak self] offset in self?.moveWindow(window.id, offset: offset) }
                 row.onAssignRequested = { [weak self, weak row] in
                     guard let self, let row else { return }
                     self.showAssignMenu(for: window, anchor: row)
@@ -403,6 +408,27 @@ final class SidebarPanel: NSPanel {
         }
     }
 
+    private func setLayout(_ tabID: UUID, _ layout: TabLayout) {
+        Task { [manager, logger] in
+            do {
+                try await manager.setTabLayout(tabID, layout)
+            } catch {
+                logger.log("setTabLayout failed: \(error)")
+            }
+        }
+    }
+
+    /// ウィンドウを一覧内で 1 つ上/下へ移動する(columns の列順)。範囲外は Core が弾く。
+    private func moveWindow(_ id: UUID, offset: Int) {
+        Task { [manager, logger] in
+            do {
+                try await manager.moveWindow(id, offset: offset)
+            } catch {
+                logger.log("moveWindow failed: \(error)")
+            }
+        }
+    }
+
     private func delete(_ tabID: UUID) {
         Task { [manager, logger] in
             do {
@@ -454,6 +480,7 @@ final class TabRowView: NSView {
     var onDelete: (() -> Void)?
     /// 並べ替え(-1 = 上へ、+1 = 下へ)。
     var onMove: ((Int) -> Void)?
+    var onSetLayout: ((TabLayout) -> Void)?
 
     private let tab: Tab
     private let canMoveUp: Bool
@@ -514,6 +541,14 @@ final class TabRowView: NSView {
         down.target = self
         down.isEnabled = canMoveDown
         menu.addItem(.separator())
+        // レイアウト切替。現在値にチェックを付ける(仕様 §3.1: タブごとに自由配置/タイルを選択)。
+        let free = menu.addItem(withTitle: "レイアウト: 自由配置", action: #selector(layoutFreeAction), keyEquivalent: "")
+        free.target = self
+        free.state = tab.layout == .free ? .on : .off
+        let columns = menu.addItem(withTitle: "レイアウト: 縦に等分割", action: #selector(layoutColumnsAction), keyEquivalent: "")
+        columns.target = self
+        columns.state = tab.layout == .columns ? .on : .off
+        menu.addItem(.separator())
         menu.addItem(withTitle: "名前を変更", action: #selector(renameAction), keyEquivalent: "").target = self
         menu.addItem(withTitle: "タブを削除", action: #selector(deleteAction), keyEquivalent: "").target = self
         NSMenu.popUpContextMenu(menu, with: event, for: self)
@@ -523,6 +558,8 @@ final class TabRowView: NSView {
     @objc private func deleteAction() { onDelete?() }
     @objc private func moveUpAction() { onMove?(-1) }
     @objc private func moveDownAction() { onMove?(1) }
+    @objc private func layoutFreeAction() { onSetLayout?(.free) }
+    @objc private func layoutColumnsAction() { onSetLayout?(.columns) }
 }
 
 /// 登録ウィンドウ 1 行。未復元(実ウィンドウに紐付いていない)ならグレー表示し、クリックで割り当てメニューを出す。
@@ -530,13 +567,19 @@ final class TabRowView: NSView {
 final class WindowRowView: NSView {
     var onRemove: (() -> Void)?
     var onAssignRequested: (() -> Void)?
+    /// 並べ替え(-1 = 上へ、+1 = 下へ)。columns レイアウトの列順を兼ねる。
+    var onMove: ((Int) -> Void)?
 
     private let isBound: Bool
+    private let canMoveUp: Bool
+    private let canMoveDown: Bool
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    init(window: ManagedWindow) {
+    init(window: ManagedWindow, canMoveUp: Bool, canMoveDown: Bool) {
         isBound = window.isBound
+        self.canMoveUp = canMoveUp
+        self.canMoveDown = canMoveDown
         super.init(frame: .zero)
         let title = window.identity.title.isEmpty ? window.identity.appName : "\(window.identity.appName) — \(window.identity.title)"
         let label = NSTextField(labelWithString: isBound ? title : "\(title)(未復元)")
@@ -572,5 +615,19 @@ final class WindowRowView: NSView {
         }
     }
 
+    override func rightMouseDown(with event: NSEvent) {
+        let menu = NSMenu()
+        menu.autoenablesItems = false  // 端の行では移動項目を無効化する(TabRowView と同じ手動制御)
+        let up = menu.addItem(withTitle: "上へ移動", action: #selector(moveUpAction), keyEquivalent: "")
+        up.target = self
+        up.isEnabled = canMoveUp
+        let down = menu.addItem(withTitle: "下へ移動", action: #selector(moveDownAction), keyEquivalent: "")
+        down.target = self
+        down.isEnabled = canMoveDown
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
     @objc private func removeAction() { onRemove?() }
+    @objc private func moveUpAction() { onMove?(-1) }
+    @objc private func moveDownAction() { onMove?(1) }
 }

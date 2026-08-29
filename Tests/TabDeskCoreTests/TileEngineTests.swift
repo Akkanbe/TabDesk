@@ -181,6 +181,24 @@ struct TileEngineTests {
         #expect(driver.currentFrame(2) == CGRect(x: newArea.minX + half, y: newArea.minY, width: half, height: newArea.height))
     }
 
+    /// 一覧の並べ替えは columns の列順を入れ替え、その場で列を組み直す。範囲外は throw。
+    @Test func moveWindowReordersColumns() async throws {
+        let (engine, driver) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: 300, y: 100, width: 500, height: 400))
+        driver.add(2, frame: CGRect(x: 900, y: 200, width: 500, height: 400))
+        let w1 = try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: CGRect(x: 300, y: 100, width: 500, height: 400), into: tab.id)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: CGRect(x: 900, y: 200, width: 500, height: 400), into: tab.id)
+        try await engine.setTabLayout(tab.id, .columns)
+
+        try await engine.moveWindow(w1.id, offset: 1)
+
+        let half = content.width / 2
+        #expect(driver.currentFrame(2) == CGRect(x: content.minX, y: content.minY, width: half, height: content.height), "先頭になった窓が左列")
+        #expect(driver.currentFrame(1) == CGRect(x: content.minX + half, y: content.minY, width: half, height: content.height))
+        await #expect(throws: TabEngine.EngineError.self) { try await engine.moveWindow(w1.id, offset: 1) }
+    }
+
     /// free に戻すと現在の列 frame がそのまま自由配置の固定 frame になり、以後は自由に編集できる。
     @Test func switchingBackToFreeKeepsCurrentFrames() async throws {
         let (engine, driver) = makeEngine()

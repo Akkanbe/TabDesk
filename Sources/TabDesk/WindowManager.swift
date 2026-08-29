@@ -509,6 +509,12 @@ final class WindowManager {
         try await engine.setTabLayout(tabID, layout)
     }
 
+    /// タブ内のウィンドウを並べ替える(columns の列順)。
+    func moveWindow(_ id: UUID, offset: Int) async throws {
+        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        try await engine.moveWindow(id, offset: offset)
+    }
+
     /// タブを削除する。Core の削除が成功したときだけ、その窓の AX 資源(driver / 要素 / observer)を片付ける。
     /// 復元できない窓があって Core が throw した場合は何も片付けない(登録も資源も保持される)。
     func deleteTab(_ id: UUID) async throws {
