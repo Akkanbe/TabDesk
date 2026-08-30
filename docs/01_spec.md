@@ -210,7 +210,8 @@ macOS 上で他アプリのウィンドウを「タブ」として管理する�
 
 - [x] タイルレイアウト(タブごとに自由配置 / 縦の等幅カラム。docs/04_v2_design.md)
 - [x] マルチディスプレイ対応(docs/04_v2_design.md)
-- [x] `tabdesk://` URL コマンドを既定 OFF の明示設定に変更(docs/04_v2_design.md)
+- [x] `tabdesk://` URL コマンドを既定 OFF の明示設定に変更(Accessibility 権限を持つ本アプリへの
+      代理操作口となるため、配布物が既定で操作口を開けないようにする。docs/04_v2_design.md)
 
 ### v3: 計画(2026-08-29 スコープ決定。詳細設計は着手時に docs/05_v3_design.md へ)
 

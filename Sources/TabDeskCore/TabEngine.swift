@@ -92,6 +92,8 @@ public final class TabEngine {
     /// 窓ごとの復元予約の世代。Task.cancel は IPC 中の Task を止められないので、
     /// 戻ってきた古い Task が「自分はまだ最新か」を世代で確かめてから状態を触る。
     private var restoreGeneration: [UUID: UInt64] = [:]
+    /// テスト用: 復元世代表のエントリ数(登録解除で剪定されることの検証)。
+    var restoreGenerationCountForTesting: Int { restoreGeneration.count }
     /// 画面構成変更から再適用完了まで、OS 由来の moved/resized をユーザー編集として扱わない。
     private var isLayoutTransitioning = false
     private var isBusy = false
@@ -341,6 +343,9 @@ public final class TabEngine {
             for wi in state.tabs[ti].windows.indices where state.tabs[ti].windows[wi].pid == pid {
                 let id = state.tabs[ti].windows[wi].id
                 cancelPendingRestore(id)
+                // 世代表は放っておくと窓の入れ替わりぶんだけ育つ(cancelAllRestores が毎回全走査する)。
+                // isLatest はキー欠損を false と読むので、消しても飛行中の古い Task は無効のまま。
+                restoreGeneration.removeValue(forKey: id)
                 parkedWindowIDs.remove(id)
                 state.tabs[ti].windows[wi].windowID = nil
                 state.tabs[ti].windows[wi].pid = nil
@@ -607,8 +612,9 @@ public final class TabEngine {
     }
 
     /// 最新の画面構成で reapplyLayout が完了したあとに通知受付を戻す。
+    /// begin と違い無条件でクリアする(フラグを下ろす操作を条件付きにすると、将来
+    /// シャットダウンを中断する経路ができたときに reconcile が永久停止する罠になる)。
     public func endLayoutTransition() {
-        guard !isReleasingForShutdown else { return }
         isLayoutTransitioning = false
     }
 
@@ -1026,7 +1032,11 @@ public final class TabEngine {
                     continue
                 }
             }
-            if let actual = result.actual {
+            // apply と同じ許容誤差ゲート: 誤差内の読み戻し値まで採用すると、終了のたびに
+            // サブポイントのずれが記録に蓄積する。
+            if let actual = result.actual, case .restore(let requested, _) = result.op.kind,
+                !approximatelyEqual(actual, requested)
+            {
                 updateFrame(result.op.managedID, actual)
             }
             parkedWindowIDs.remove(result.op.managedID)
@@ -1176,6 +1186,7 @@ public final class TabEngine {
 
     private func removeFromState(_ id: UUID) {
         cancelPendingRestore(id)
+        restoreGeneration.removeValue(forKey: id)  // unbindWindows と同じ剪定(isLatest は欠損 = 無効)
         parkedWindowIDs.remove(id)
         for index in state.tabs.indices {
             let before = state.tabs[index].windows.count

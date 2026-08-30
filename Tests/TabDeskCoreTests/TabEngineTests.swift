@@ -1588,3 +1588,43 @@ struct AdjacentActivationTests {
         #expect(try await empty.activateAdjacent(offset: 1) == nil, "no tabs: no-op")
     }
 }
+
+/// 外部リファクタ精査(v3 段階 0)の修正を固定するテスト。
+@MainActor
+struct AuditFixTests {
+    /// 復元世代表は登録解除で剪定される(放置すると窓の入れ替わりぶん無限に育ち、
+    /// cancelAllRestores が画面変更のたびに全走査する)。
+    @Test func restoreGenerationIsPrunedOnRemoval() async throws {
+        let (engine, driver) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: 300, y: 100, width: 500, height: 400))
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("a"),
+            frame: CGRect(x: 300, y: 100, width: 500, height: 400), into: tab.id)
+        driver.moveExternally(1, to: CGRect(x: 700, y: 300, width: 500, height: 400))
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(120))  // デバウンス消化(世代表にエントリが載る)
+        #expect(engine.restoreGenerationCountForTesting > 0)
+
+        try await engine.unregister(managed.id)
+        #expect(engine.restoreGenerationCountForTesting == 0)
+    }
+
+    /// 終了時の解放(releaseAll)は apply と同じ許容誤差ゲートで到達 frame を採用する。
+    /// ゲートが無いと、サブポイントのずれが終了のたびに記録へ蓄積する。
+    @Test func releaseDoesNotAdoptSubToleranceDrift() async throws {
+        let (engine, driver) = makeEngine()
+        let a = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        driver.add(1, frame: content)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(2, frame: recorded, minSize: CGSize(width: 500.5, height: 0))  // 復元すると幅 500.5 に丸まる
+        let managed = try await engine.register(windowID: 2, pid: 200, identity: identity("b"), frame: recorded, into: b.id)
+        #expect(engine.parkedWindowIDs.contains(managed.id))
+
+        await engine.releaseAllParkedWindows()
+        let after = engine.state.managedWindow(id: managed.id)?.window.frame
+        #expect(after?.width == recorded.width, "許容誤差内(0.5pt)の到達値は採用しない")
+    }
+}

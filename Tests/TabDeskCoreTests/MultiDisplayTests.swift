@@ -84,20 +84,31 @@ struct MultiDisplayTests {
     }
 
     /// 「隅にいる」判定は自分のディスプレイの隅 x と比較する。正しく退避済みの窓を reconcile が動かさない。
+    ///
+    /// 注意: parkPoints で導出した退避点は仕組み上どの画面でも x が同じになる(自画面の隅を使えるのは
+    /// 配置右端に届く画面だけで、その x は fallback と一致する)ため、導出値ではこの規則を検証できない。
+    /// ここでは**画面ごとに隅 x が異なる退避点を手書き**して、エンジンの比較規則そのものを固定する。
     @Test func reconcileDoesNotReparkWindowsAtTheirOwnCorner() async throws {
-        let (engine, driver, _) = makeEngine()
+        let customMain = DisplayLayout(
+            id: "main", frame: fixtureFrames[0],
+            contentArea: mainDisplay.contentArea, parkPoint: CGPoint(x: 1919, y: 1199))
+        let customSecond = DisplayLayout(
+            id: "second", frame: fixtureFrames[1],
+            contentArea: secondDisplay.contentArea, parkPoint: CGPoint(x: 4479, y: 1439))
+        let driver = FakeWindowDriver()
+        let engine = TabEngine(driver: driver, layout: MutableScreenLayout(displays: [customMain, customSecond]))
         let a = engine.createTab(name: "A")
         let b = engine.createTab(name: "B")
         driver.add(1, frame: CGRect(x: 2400, y: 200, width: 800, height: 600))
         try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: CGRect(x: 2400, y: 200, width: 800, height: 600), into: b.id)
         _ = a
-        #expect(driver.currentFrame(1)?.origin == secondDisplay.parkPoint, "非アクティブタブへの登録で外部の隅へ退避")
+        #expect(driver.currentFrame(1)?.origin == customSecond.parkPoint, "非アクティブタブへの登録で外部の隅へ退避")
 
         let before = driver.callCount("setPosition")
         for _ in 0..<3 {
             await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
         }
-        #expect(driver.callCount("setPosition") == before, "主ディスプレイの隅 x と比較していれば毎回再退避してしまう")
+        #expect(driver.callCount("setPosition") == before, "主ディスプレイの隅 x (1919) と比較していれば毎回再退避してしまう")
     }
 
     /// ディスプレイが切断されたら、その窓は主ディスプレイのコンテンツ領域へ収める(段階 D の消失ポリシー)。

@@ -821,10 +821,18 @@ final class WindowManager {
         }
     }
 
+    /// Space 切替起点の再照合の最短間隔。未復元エントリが恒久的に残る場合(登録アプリをもう使っていない等)、
+    /// Space 切替のたびに全アプリへの AX 列挙が 2 回(リトライ込み)走り続けるのを防ぐ。
+    static let spaceRestoreCooldown: Duration = .seconds(15)
+    private var lastSpaceTriggeredRestore: ContinuousClock.Instant?
+
     /// Space の切替で、フルスクリーン解除後などに登録可能になった未復元窓を再照合する。
     @objc private func activeSpaceDidChange(_ notification: Notification) {
         // 権限取得前に初回復元を消化すると、後から権限を付けても緩め照合を再実行できなくなる。
         guard isTrusted, !isTerminating, engine.state.allWindows.contains(where: { !$0.isBound }) else { return }
+        let now = ContinuousClock.now
+        if let last = lastSpaceTriggeredRestore, now - last < Self.spaceRestoreCooldown { return }
+        lastSpaceTriggeredRestore = now
         strictRestorePending = true
         if initialRestoreDone {
             startStrictRestoreIfNeeded()
