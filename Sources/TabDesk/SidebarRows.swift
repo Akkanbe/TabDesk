@@ -24,7 +24,7 @@ final class TabRowView: NSView {
     /// キーでないウィンドウへの最初のクリックも受け取る(既定では「キーにするためのクリック」として消費される)。
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    init(tab: Tab, isActive: Bool, canMoveUp: Bool, canMoveDown: Bool) {
+    init(tab: Tab, isActive: Bool, canMoveUp: Bool, canMoveDown: Bool, thumbnail: NSImage? = nil) {
         self.tab = tab
         self.canMoveUp = canMoveUp
         self.canMoveDown = canMoveDown
@@ -41,9 +41,30 @@ final class TabRowView: NSView {
         count.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         count.textColor = .secondaryLabelColor
 
-        let stack = NSStackView(views: [label, NSView(), count])
-        stack.orientation = .horizontal
-        stack.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
+        let headerRow = NSStackView(views: [label, NSView(), count])
+        headerRow.orientation = .horizontal
+        headerRow.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: thumbnail == nil ? 5 : 0, right: 8)
+
+        let stack: NSStackView
+        if let thumbnail {
+            // サムネイルは名前行の下に敷く(v3 段階 5。右横では 200px 級の行幅に対して小さすぎる)。
+            let imageView = NSImageView(image: thumbnail)
+            imageView.imageScaling = .scaleProportionallyUpOrDown
+            imageView.wantsLayer = true
+            imageView.layer?.cornerRadius = 4
+            imageView.layer?.masksToBounds = true
+            stack = NSStackView(views: [headerRow, imageView])
+            stack.orientation = .vertical
+            stack.spacing = 3
+            stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 6, right: 0)
+            NSLayoutConstraint.activate([
+                headerRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                imageView.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16),
+                imageView.heightAnchor.constraint(equalToConstant: 64),
+            ])
+        } else {
+            stack = headerRow
+        }
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
         NSLayoutConstraint.activate([

@@ -11,6 +11,7 @@ final class SidebarPanel: NSPanel {
     private let logger: FileLogger
 
     private let permissionBanner = NSStackView()
+    private let capturePermissionBanner = NSStackView()
     private let tabsStack = NSStackView()
     private let windowsHeader = NSTextField(labelWithString: "")
     private let windowsStack = NSStackView()
@@ -58,6 +59,11 @@ final class SidebarPanel: NSPanel {
         reposition()
 
         manager.onStateChanged = { [weak self] _ in self?.render() }
+        // サムネイルは state 外のデータなので、撮影完了時は差分キャッシュを捨てて描き直す。
+        manager.thumbnails.onUpdated = { [weak self] _ in
+            self?.lastRendered = nil
+            self?.render()
+        }
         // 改名中に切替先アプリを前面化するとサイドバーがキーを失い、編集が即終了してしまう。
         manager.suppressAppActivation = { [weak self] in self?.isRenaming ?? false }
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -229,6 +235,20 @@ final class SidebarPanel: NSPanel {
         root.addArrangedSubview(permissionBanner)
         bannerLabel.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -20).isActive = true
 
+        // 画面収録権限バナー(タブサムネイル有効時のみ。v3 段階 5)
+        let captureLabel = NSTextField(wrappingLabelWithString:
+            "タブサムネイルには画面収録の権限が必要です(付与後は TabDesk の再起動が必要な場合があります)。")
+        captureLabel.font = NSFont.systemFont(ofSize: 11)
+        let captureButton = NSButton(title: "画面収録設定を開く", target: self, action: #selector(openScreenCaptureSettings))
+        captureButton.bezelStyle = .rounded
+        captureButton.controlSize = .small
+        capturePermissionBanner.orientation = .vertical
+        capturePermissionBanner.alignment = .leading
+        capturePermissionBanner.addArrangedSubview(captureLabel)
+        capturePermissionBanner.addArrangedSubview(captureButton)
+        root.addArrangedSubview(capturePermissionBanner)
+        captureLabel.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -20).isActive = true
+
         // タブ一覧
         tabsStack.orientation = .vertical
         tabsStack.alignment = .leading
@@ -291,7 +311,8 @@ final class SidebarPanel: NSPanel {
         for (index, tab) in state.tabs.enumerated() {
             let row = TabRowView(
                 tab: tab, isActive: tab.id == state.activeTabID,
-                canMoveUp: index > 0, canMoveDown: index < state.tabs.count - 1)
+                canMoveUp: index > 0, canMoveDown: index < state.tabs.count - 1,
+                thumbnail: ThumbnailStore.enabledSetting.value ? manager.thumbnails.images[tab.id] : nil)
             row.onSelect = { [weak self] in self?.activate(tab.id) }
             row.onRenameRequested = { [weak self] in self?.promptRename(tab) }
             row.onDelete = { [weak self] in self?.delete(tab.id) }
@@ -337,6 +358,20 @@ final class SidebarPanel: NSPanel {
 
     private func updatePermissionBanner() {
         permissionBanner.isHidden = manager.isTrusted
+        capturePermissionBanner.isHidden = !(ThumbnailStore.enabledSetting.value && !ThumbnailStore.hasPermission)
+    }
+
+    /// メニューでサムネイル表示を切り替えたあとに呼ぶ(行の作り直しとバナー更新)。
+    func refreshThumbnailPresentation() {
+        lastRendered = nil
+        render()
+        updatePermissionBanner()
+    }
+
+    @objc private func openScreenCaptureSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: - アクション

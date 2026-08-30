@@ -134,6 +134,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let frames = NSMenuItem(title: "背景の枠を表示", action: #selector(toggleFrameWindows(_:)), keyEquivalent: "")
         frames.state = FrameWindowController.enabledSetting.value ? .on : .off
         menu.addItem(frames)
+        let thumbnails = NSMenuItem(title: "タブサムネイルを表示", action: #selector(toggleThumbnails(_:)), keyEquivalent: "")
+        thumbnails.state = ThumbnailStore.enabledSetting.value ? .on : .off
+        menu.addItem(thumbnails)
         let urlCommands = NSMenuItem(title: "URL コマンドを許可(自動化用)", action: #selector(toggleURLCommands(_:)), keyEquivalent: "")
         urlCommands.state = Self.urlCommandsEnabled.value ? .on : .off
         menu.addItem(urlCommands)
@@ -181,6 +184,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Self.urlCommandsEnabled.value.toggle()
         sender.state = Self.urlCommandsEnabled.value ? .on : .off
         logger.log("urlCommandsEnabled=\(Self.urlCommandsEnabled.value)")
+    }
+
+    @objc private func toggleThumbnails(_ sender: NSMenuItem) {
+        ThumbnailStore.enabledSetting.value.toggle()
+        sender.state = ThumbnailStore.enabledSetting.value ? .on : .off
+        // 有効化時にまだ権限が無ければ、この場でシステムのプロンプトを出す(初回のみ表示される)。
+        if ThumbnailStore.enabledSetting.value, !ThumbnailStore.hasPermission {
+            CGRequestScreenCaptureAccess()
+        }
+        sidebar?.refreshThumbnailPresentation()
+        logger.log("tabThumbnailsEnabled=\(ThumbnailStore.enabledSetting.value) permission=\(ThumbnailStore.hasPermission)")
     }
 
     @objc private func toggleFrameWindows(_ sender: NSMenuItem) {

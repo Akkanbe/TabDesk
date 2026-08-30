@@ -106,4 +106,21 @@ ScreenCaptureKit は TabDesk モジュールの 1 ファイルに隔離。
   実運用の感触で既定を再検討する
 - 見た目は角丸 10 + underPageBackgroundColor 50% + separatorColor 1px(実機で微調整前提)
 
-## 段階5 の判断(実装時に追記)
+## 段階5 の判断(2026-08-30 実装): タブサムネイル
+
+- **既定 OFF・メニュー「タブサムネイルを表示」でオプトイン**。画面収録権限のプロンプト
+  (と macOS 仕様の月次再承認ダイアログ)は、機能を有効にしたときだけ出す
+- 撮影は `SCScreenshotManager.captureImage` のワンショット静止画(常時ストリームなし =
+  メニューバーの収録インジケータも出ない)。`SCContentFilter(desktopIndependentWindow:)` は
+  退避中・隠れた窓もそのまま撮れるため、**切替完了後の撮影でタイミング競合が無い**
+- 撮影タイミングはタブ切替時(確定済み)。全切替経路(クリック・ホットキー・フォーカス連動)が
+  通る `performFocusSwitch` にフックし、離れたタブの代表窓
+  (`Tab.representativeWindow` = lastFocused → 先頭 bound)を撮る
+- キャッシュは `ThumbnailStore`(tab.id キー)。行ビューは state 変更のたびに作り直されるため、
+  行にキャッシュは置けない。撮影完了は onUpdated → 差分キャッシュ破棄 → 再描画
+- 失敗(権限剥奪・窓消滅・SCK エラー)はサイレント劣化(古い画像を残す)+初回のみログ
+- UI: タブ行の名前の下に高さ 64px(右横では行幅 200px 級に対して小さすぎる)。OFF 時は従来と同一
+- 権限 UX: アクセシビリティと同型の第 2 バナー(`CGPreflightScreenCaptureAccess` 判定、
+  Privacy_ScreenCapture への deep link)。有効化時に `CGRequestScreenCaptureAccess()`。
+  Info.plist に `NSScreenCaptureUsageDescription` を追加
+- サムネイルはセッション内のみ(永続化しない。次回起動時は切替のたびに埋まっていく)

@@ -18,6 +18,8 @@ final class WindowManager {
     /// contentArea は実効サイドバー幅(折りたたみ・ドラッグ変更込み)に毎回追従する。
     let layout = SystemScreenLayout(sidebarWidth: { sidebarMetricsShared.effectiveWidth })
     var sidebarMetrics: SidebarMetrics { sidebarMetricsShared }
+    /// タブサムネイル(v3 段階 5)。撮影はタブ切替時、キャッシュは tab.id キー。
+    private(set) lazy var thumbnails = ThumbnailStore(logger: logger)
     /// contentArea が変わる操作(幅変更・折りたたみ)の再適用が済んだあとのフック(段階 4 の枠が使う)。
     var onContentAreaChanged: (@MainActor () -> Void)?
     let store: StateStore
@@ -378,12 +380,21 @@ final class WindowManager {
     /// 切替中に届いたフォーカス通知を、最も外側の切替が完了するまで保留する。
     private func performFocusSwitch(_ operation: () async throws -> Void) async throws {
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        let outgoing = engine.state.activeTabID
         focusSwitchDepth += 1
         defer {
             focusSwitchDepth -= 1
             if focusSwitchDepth == 0 { schedulePendingFocusFollow() }
         }
         try await operation()
+        // タブが実際に替わったら、離れたタブの代表窓を撮影する(v3 段階 5。無効時は Store 側で即 return)。
+        // desktopIndependentWindow キャプチャは退避中の窓も撮れるので、切替完了後の撮影でよい。
+        if let outgoing, outgoing != engine.state.activeTabID,
+            let tab = engine.state.tab(withID: outgoing),
+            let window = tab.representativeWindow, let windowID = window.windowID
+        {
+            thumbnails.capture(tabID: outgoing, windowID: windowID)
+        }
     }
 
     /// 非アクティブタブの窓にフォーカスが移ったら、そのタブへ切り替える。
@@ -566,6 +577,7 @@ final class WindowManager {
         for windowID in windowIDs {
             forgetWindow(windowID)
         }
+        thumbnails.remove(tabID: id)
     }
 
     // MARK: - 登録 / 解除

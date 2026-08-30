@@ -86,6 +86,28 @@ struct TileLayoutTests {
         #expect(tab.layout == .free)
     }
 
+    // MARK: - Tab.representativeWindow(サムネイル対象。v3 段階 5)
+
+    @Test func representativeWindowPrefersLastFocusedBoundWindow() {
+        let first = window()
+        let focused = window()
+        let tab = Tab(name: "A", windows: [first, focused], lastFocusedWindowID: focused.id)
+        #expect(tab.representativeWindow?.id == focused.id)
+    }
+
+    @Test func representativeWindowFallsBackToFirstBound() {
+        let unbound = window(bound: false)
+        let bound = window()
+        // lastFocused が未復元(unbound)なら先頭の bound な窓へ。
+        let tab = Tab(name: "A", windows: [unbound, bound], lastFocusedWindowID: unbound.id)
+        #expect(tab.representativeWindow?.id == bound.id)
+    }
+
+    @Test func representativeWindowIsNilWhenAllUnbound() {
+        let tab = Tab(name: "A", windows: [window(bound: false), window(bound: false)])
+        #expect(tab.representativeWindow == nil)
+    }
+
     @Test func layoutRoundTripsThroughCoding() throws {
         let tab = Tab(name: "Tiled", windows: [window()], layout: .columns)
         let data = try JSONEncoder().encode(tab)

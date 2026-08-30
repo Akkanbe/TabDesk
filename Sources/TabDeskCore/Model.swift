@@ -76,6 +76,15 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
         case id, name, windows, lastFocusedWindowID, layout
     }
 
+    /// タブを代表する実ウィンドウ(サムネイル撮影の対象。v3 段階 5)。
+    /// 最後にフォーカスされていた bound な窓 → 無ければ先頭の bound な窓。全滅なら nil。
+    public var representativeWindow: ManagedWindow? {
+        if let id = lastFocusedWindowID, let window = windows.first(where: { $0.id == id }), window.isBound {
+            return window
+        }
+        return windows.first(where: \.isBound)
+    }
+
     /// layout はキーが無い v1 の state.json も、将来の未知の値も `.free` として読む。
     /// version を上げる移行(不一致で .bak 退避+初期化)を避けるための後方互換デコード(docs/04_v2_design.md)。
     /// encode は合成のまま(layout も常に書く)。
