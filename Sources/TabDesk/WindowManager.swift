@@ -59,6 +59,27 @@ final class WindowManager {
         !elements.values.contains(where: { $0.pid == pid }) && !inFlight.values.contains(pid)
     }
 
+    /// 同じ実ウィンドウに対する register / bind の競合を防ぐ予約。
+    private func reserveRegistration(of window: AXWindow) -> Bool {
+        guard inFlight[window.windowID] == nil else { return false }
+        inFlight[window.windowID] = window.pid
+        return true
+    }
+
+    /// 登録処理の終了時に予約を外し、commit されなかった窓の AX 資源だけを片付ける。
+    private func releaseRegistrationReservation(for window: AXWindow) {
+        inFlight.removeValue(forKey: window.windowID)
+        guard engine.state.managedWindow(forWindowID: window.windowID) == nil else { return }
+        driver.forget(window.windowID)
+        dropObserverIfUnused(pid: window.pid)
+    }
+
+    /// Core への commit 後に、通知で使う AX 要素を追跡対象へ加える。
+    private func trackRegisteredWindow(_ window: AXWindow) {
+        elements[window.windowID] = (window.pid, window.element)
+        watchDestroyed(of: window)
+    }
+
     enum RegistrationError: Error, CustomStringConvertible {
         case alreadyInProgress(CGWindowID)
         /// 移動・リサイズ通知(位置固定の要)を購読できないアプリ。登録は行わない(半端な登録を残さない)。
@@ -274,16 +295,9 @@ final class WindowManager {
     func bind(_ record: WindowRecord, to managedID: UUID) async -> Bool {
         guard !isTerminating else { return false }
         let windowID = record.window.windowID
-        guard inFlight[windowID] == nil else { return false }
-        inFlight[windowID] = record.window.pid
-        defer {
-            // observer の不要判定より先に in-flight 印を外す。逆順だと新規 observer が永遠に残る。
-            inFlight.removeValue(forKey: windowID)
-            if engine.state.managedWindow(forWindowID: windowID) == nil {
-                driver.forget(windowID)
-                dropObserverIfUnused(pid: record.window.pid)
-            }
-        }
+        guard reserveRegistration(of: record.window) else { return false }
+        // observer の不要判定より先に in-flight 印を外す。逆順だと新規 observer が永遠に残る。
+        defer { releaseRegistrationReservation(for: record.window) }
         // 割り当て先が(自動復元との競合などで)既に紐付いていたら何もしない(bind は上書きを拒否する)。
         guard engine.state.managedWindow(id: managedID)?.window.isBound == false else { return false }
         // 列挙後にフルスクリーン化/最小化されていることがあるので直前に読み直す(register と同じ)。
@@ -315,8 +329,7 @@ final class WindowManager {
             guard !isTerminating,
                 engine.state.managedWindow(id: managedID)?.window.windowID == windowID
             else { return false }
-            elements[windowID] = (record.window.pid, record.window.element)
-            watchDestroyed(of: record.window)
+            trackRegisteredWindow(record.window)
             return true
         } catch {
             logger.log("bind failed: \(error)")
@@ -343,24 +356,27 @@ final class WindowManager {
 
     /// タブ切替の入口。切替中に届いたフォーカス通知は保留し、完了後に実際のフォーカスと照合する。
     func activate(_ tabID: UUID) async throws {
-        guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
-        focusSwitchDepth += 1
-        defer {
-            focusSwitchDepth -= 1
-            if focusSwitchDepth == 0 { schedulePendingFocusFollow() }
+        try await performFocusSwitch {
+            try await engine.activate(tabID)
         }
-        try await engine.activate(tabID)
     }
 
     /// 隣のタブへ(ホットキー用)。ターゲット解決はエンジンの直列区間内で行うため、連打しても 1 押下 = 1 タブ進む。
     func activateAdjacent(offset: Int) async throws {
+        try await performFocusSwitch {
+            try await engine.activateAdjacent(offset: offset)
+        }
+    }
+
+    /// 切替中に届いたフォーカス通知を、最も外側の切替が完了するまで保留する。
+    private func performFocusSwitch(_ operation: () async throws -> Void) async throws {
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
         focusSwitchDepth += 1
         defer {
             focusSwitchDepth -= 1
             if focusSwitchDepth == 0 { schedulePendingFocusFollow() }
         }
-        try await engine.activateAdjacent(offset: offset)
+        try await operation()
     }
 
     /// 非アクティブタブの窓にフォーカスが移ったら、そのタブへ切り替える。
@@ -570,15 +586,8 @@ final class WindowManager {
                 size: CGSize(width: min(current.width, area.width), height: min(current.height, area.height)))
         }
         let windowID = record.window.windowID
-        guard inFlight[windowID] == nil else { throw RegistrationError.alreadyInProgress(windowID) }
-        inFlight[windowID] = record.window.pid
-        defer {
-            inFlight.removeValue(forKey: windowID)
-            if engine.state.managedWindow(forWindowID: windowID) == nil {
-                driver.forget(windowID)
-                dropObserverIfUnused(pid: record.window.pid)
-            }
-        }
+        guard reserveRegistration(of: record.window) else { throw RegistrationError.alreadyInProgress(windowID) }
+        defer { releaseRegistrationReservation(for: record.window) }
 
         // 必須 observer(moved / resized)は窓に触れる前に確立する。取れないアプリは登録しない。
         _ = try establishObserver(pid: record.window.pid)
@@ -591,8 +600,7 @@ final class WindowManager {
         guard engine.state.managedWindow(id: managed.id)?.window.windowID == windowID else {
             throw TabEngine.EngineError.unknownWindow(managed.id)
         }
-        elements[windowID] = (record.window.pid, record.window.element)
-        watchDestroyed(of: record.window)
+        trackRegisteredWindow(record.window)
     }
 
     func unregister(_ id: UUID) async throws {
@@ -694,8 +702,8 @@ final class WindowManager {
             // 壊れた要素からは ID が取れないので、登録時の要素と比較する。
             guard let entry = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) }) else { return }
             // アプリごと終了した場合は除去せず「未復元」として保持する(再起動後に自動で戻す)。
-            let app = NSRunningApplication(processIdentifier: pid)
-            engine.noteWindowDestroyed(windowID: entry.key, appTerminated: app == nil || app!.isTerminated)
+            let appTerminated = NSRunningApplication(processIdentifier: pid)?.isTerminated ?? true
+            engine.noteWindowDestroyed(windowID: entry.key, appTerminated: appTerminated)
             forgetWindow(entry.key)
         default:
             break

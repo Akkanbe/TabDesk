@@ -241,9 +241,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func cgBounds(_ windowID: CGWindowID) -> CGRect? {
         guard let list = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]],
-            let info = list.first, let dict = info[kCGWindowBounds as String]
+            let info = list.first,
+            let dict = info[kCGWindowBounds as String] as? NSDictionary
         else { return nil }
-        return CGRect(dictionaryRepresentation: dict as! CFDictionary)
+        return CGRect(dictionaryRepresentation: dict as CFDictionary)
     }
 
     // MARK: - URL コマンド

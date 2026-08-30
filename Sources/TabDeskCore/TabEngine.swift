@@ -143,16 +143,15 @@ public final class TabEngine {
     public func moveWindow(_ id: UUID, offset: Int) async throws {
         try await serialized {
             try rejectIfShuttingDown()
-            guard let found = state.managedWindow(id: id),
-                let ti = state.tabs.firstIndex(where: { $0.id == found.tab.id }),
-                let wi = state.tabs[ti].windows.firstIndex(where: { $0.id == id })
-            else { throw EngineError.unknownWindow(id) }
-            let to = wi + offset
-            guard state.tabs[ti].windows.indices.contains(to) else { throw EngineError.invalidWindowOrder }
-            let window = state.tabs[ti].windows.remove(at: wi)
-            state.tabs[ti].windows.insert(window, at: to)
-            if state.tabs[ti].layout == .columns {
-                await retileUnlocked(state.tabs[ti].id)
+            guard let location = windowLocation(of: id) else { throw EngineError.unknownWindow(id) }
+            let destination = location.windowIndex + offset
+            guard state.tabs[location.tabIndex].windows.indices.contains(destination) else {
+                throw EngineError.invalidWindowOrder
+            }
+            let window = state.tabs[location.tabIndex].windows.remove(at: location.windowIndex)
+            state.tabs[location.tabIndex].windows.insert(window, at: destination)
+            if state.tabs[location.tabIndex].layout == .columns {
+                await retileUnlocked(state.tabs[location.tabIndex].id)
             }
         }
     }
@@ -312,26 +311,25 @@ public final class TabEngine {
                 frame = recorded
             }
             // await をまたいだので引き直す(解除されていれば unknownWindow)。
-            guard let again = state.managedWindow(id: id),
-                let ti = state.tabs.firstIndex(where: { $0.id == again.tab.id }),
-                let wi = state.tabs[ti].windows.firstIndex(where: { $0.id == id })
-            else { throw EngineError.unknownWindow(id) }
-            state.tabs[ti].windows[wi].windowID = windowID
-            state.tabs[ti].windows[wi].pid = pid
-            state.tabs[ti].windows[wi].frame = frame
+            guard let location = windowLocation(of: id) else { throw EngineError.unknownWindow(id) }
+            let currentTab = state.tabs[location.tabIndex]
+            let previousIdentity = currentTab.windows[location.windowIndex].identity
+            state.tabs[location.tabIndex].windows[location.windowIndex].windowID = windowID
+            state.tabs[location.tabIndex].windows[location.windowIndex].pid = pid
+            state.tabs[location.tabIndex].windows[location.windowIndex].frame = frame
             if let identity {
-                state.tabs[ti].windows[wi].identity = identity
+                state.tabs[location.tabIndex].windows[location.windowIndex].identity = identity
             } else if let title {
-                state.tabs[ti].windows[wi].identity.title = title
+                state.tabs[location.tabIndex].windows[location.windowIndex].identity.title = title
             }
             if intoActive {
                 parkedWindowIDs.remove(id)
             } else {
                 parkedWindowIDs.insert(id)
             }
-            log("bind: \(again.window.identity.appName) / \(title ?? again.window.identity.title) → \(intoActive ? "\(frame)" : "parked")")
-            if state.tabs[ti].layout == .columns {
-                await retileUnlocked(state.tabs[ti].id)
+            log("bind: \(previousIdentity.appName) / \(title ?? previousIdentity.title) → \(intoActive ? "\(frame)" : "parked")")
+            if state.tabs[location.tabIndex].layout == .columns {
+                await retileUnlocked(state.tabs[location.tabIndex].id)
             }
         }
     }
@@ -449,12 +447,9 @@ public final class TabEngine {
     }
 
     private func setBinding(_ id: UUID, windowID: CGWindowID?, pid: pid_t?) {
-        for ti in state.tabs.indices {
-            if let wi = state.tabs[ti].windows.firstIndex(where: { $0.id == id }) {
-                state.tabs[ti].windows[wi].windowID = windowID
-                state.tabs[ti].windows[wi].pid = pid
-                return
-            }
+        updateManagedWindow(id) { window in
+            window.windowID = windowID
+            window.pid = pid
         }
     }
 
@@ -1112,12 +1107,7 @@ public final class TabEngine {
     }
 
     private func updateDisplayID(_ id: UUID, _ displayID: DisplayID?) {
-        for ti in state.tabs.indices {
-            if let wi = state.tabs[ti].windows.firstIndex(where: { $0.id == id }) {
-                state.tabs[ti].windows[wi].displayID = displayID
-                return
-            }
-        }
+        updateManagedWindow(id) { $0.displayID = displayID }
     }
 
     // MARK: - タイルレイアウト(段階 C)
@@ -1202,12 +1192,30 @@ public final class TabEngine {
     }
 
     private func updateFrame(_ id: UUID, _ frame: CGRect) {
-        for ti in state.tabs.indices {
-            if let wi = state.tabs[ti].windows.firstIndex(where: { $0.id == id }) {
-                state.tabs[ti].windows[wi].frame = frame
-                return
+        updateManagedWindow(id) { $0.frame = frame }
+    }
+
+    /// `WorkspaceState` は値型なので、管理ウィンドウの検索と in-place 更新をここに集約する。
+    /// 同じ二重ループを各更新経路に持たせず、常に最初に見つかったエントリを更新する。
+    private struct WindowLocation {
+        let tabIndex: Int
+        let windowIndex: Int
+    }
+
+    private func windowLocation(of id: UUID) -> WindowLocation? {
+        for tabIndex in state.tabs.indices {
+            if let windowIndex = state.tabs[tabIndex].windows.firstIndex(where: { $0.id == id }) {
+                return WindowLocation(tabIndex: tabIndex, windowIndex: windowIndex)
             }
         }
+        return nil
+    }
+
+    @discardableResult
+    private func updateManagedWindow(_ id: UUID, _ update: (inout ManagedWindow) -> Void) -> Bool {
+        guard let location = windowLocation(of: id) else { return false }
+        update(&state.tabs[location.tabIndex].windows[location.windowIndex])
+        return true
     }
 
     private func cancelPendingRestore(_ id: UUID) {
