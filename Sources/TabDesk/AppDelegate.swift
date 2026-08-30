@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var sidebar: SidebarPanel?
     private var statusItem: NSStatusItem?
     private var loginItemMenuItem: NSMenuItem?
+    private var sidebarCollapseMenuItem: NSMenuItem?
     private var probeWindow: NSWindow?
     private lazy var hotkeys = HotkeyCenter(logger: logger)
 
@@ -100,6 +101,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.manager.engine.editMode.toggle()
                 self.sidebar?.render()
                 self.logger.log("editMode=\(self.manager.engine.editMode) (hotkey)")
+            case .toggleSidebar:
+                self.sidebar?.toggleCollapse()
             }
         }
         hotkeys.reload()
@@ -112,6 +115,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: "TabDesk")
         let menu = NSMenu()
         menu.addItem(withTitle: "サイドバーを表示", action: #selector(showSidebar), keyEquivalent: "")
+        let collapse = NSMenuItem(title: "サイドバーを折りたたむ", action: #selector(toggleSidebarCollapsed(_:)), keyEquivalent: "")
+        collapse.state = manager.sidebarMetrics.isCollapsed ? .on : .off
+        sidebarCollapseMenuItem = collapse
+        menu.addItem(collapse)
         let onTop = NSMenuItem(title: "サイドバーを常に最前面にする", action: #selector(toggleAlwaysOnTop(_:)), keyEquivalent: "")
         onTop.state = alwaysOnTop ? .on : .off
         menu.addItem(onTop)
@@ -141,8 +148,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// System Settings 側でログイン項目が変更されることがあるため、メニューを開くたびに実状態を読み直す。
+    /// 折りたたみもホットキー/サイドバー側で変わるので同様に同期する。
     func menuWillOpen(_ menu: NSMenu) {
         updateLaunchAtLoginMenuItem()
+        sidebarCollapseMenuItem?.state = manager.sidebarMetrics.isCollapsed ? .on : .off
+    }
+
+    @objc private func toggleSidebarCollapsed(_ sender: NSMenuItem) {
+        sidebar?.toggleCollapse()
+        sender.state = manager.sidebarMetrics.isCollapsed ? .on : .off
     }
 
     @objc private func toggleAlwaysOnTop(_ sender: NSMenuItem) {

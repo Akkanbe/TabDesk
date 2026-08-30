@@ -3,16 +3,23 @@ import ApplicationServices
 import AXShim
 import TabDeskCore
 
+/// サイドバー設定の共有実体(中身は UserDefaults)。SystemScreenLayout の幅プロバイダは
+/// MainActor 外(BlockingExecutor 上)からも呼ばれうるため、actor 非隔離のグローバルに置く。
+private let sidebarMetricsShared = SidebarMetrics()
+
 /// エンジンと macOS(AX 通知・NSWorkspace・ポーリング)をつなぐアプリ層のサービス。
 ///
 /// エンジンは AX を知らないので、ここで AXWindow を預け、通知をエンジンのメソッド呼び出しに翻訳する。
 @MainActor
 final class WindowManager {
-    static let sidebarWidth: CGFloat = 240
     static let reconcileInterval: TimeInterval = 2
 
     let engine: TabEngine
-    let layout = SystemScreenLayout(sidebarWidth: WindowManager.sidebarWidth)
+    /// contentArea は実効サイドバー幅(折りたたみ・ドラッグ変更込み)に毎回追従する。
+    let layout = SystemScreenLayout(sidebarWidth: { sidebarMetricsShared.effectiveWidth })
+    var sidebarMetrics: SidebarMetrics { sidebarMetricsShared }
+    /// contentArea が変わる操作(幅変更・折りたたみ)の再適用が済んだあとのフック(段階 4 の枠が使う)。
+    var onContentAreaChanged: (@MainActor () -> Void)?
     let store: StateStore
     /// Cmd-Tab 等で非アクティブタブの窓にフォーカスが移ったら、そのタブへ自動で切り替える(§3.6)。
     let focusFollows = PersistedToggle(key: "FocusFollowsWindow", defaultValue: true)
@@ -767,6 +774,26 @@ final class WindowManager {
             {
                 self.recordFocusedWindow(windowID)
             }
+        }
+    }
+
+    /// サイドバー幅・折りたたみ変更後の即時再適用(v3 段階 3)。
+    /// ユーザー操作起点なので画面変更通知の 1 秒デバウンスは挟まない。generation を進めて、
+    /// 並行してデバウンス中の画面変更 Task がバリアを早期解除しないようにする(layoutMayHaveChanged と同じ規約)。
+    func applySidebarWidthChange() {
+        guard !isTerminating else { return }
+        layoutChangeGeneration &+= 1
+        let generation = layoutChangeGeneration
+        engine.beginLayoutTransition()
+        layoutReapplyTask?.cancel()
+        layoutReapplyTask = Task { [weak self] in
+            guard let self, generation == self.layoutChangeGeneration, !self.isTerminating else { return }
+            if self.isTrusted {
+                await self.engine.reapplyLayout()
+                guard generation == self.layoutChangeGeneration, !self.isTerminating else { return }
+            }
+            self.engine.endLayoutTransition()
+            self.onContentAreaChanged?()  // 権限が無くても枠などの描画は追従させる
         }
     }
 

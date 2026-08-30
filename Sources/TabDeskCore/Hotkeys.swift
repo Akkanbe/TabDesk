@@ -99,6 +99,8 @@ public enum HotkeyAction: Sendable, Hashable {
     case previousTab
     case registerFocusedWindow
     case toggleEditMode
+    /// サイドバーの折りたたみ/展開(v3 段階 3)。
+    case toggleSidebar
 }
 
 /// hotkeys.json の中身。ユーザーが手で編集できるよう、キーは "ctrl+alt+1" 形式の文字列で持つ。
@@ -108,16 +110,18 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
     public var previousTab: String?
     public var registerFocusedWindow: String?
     public var toggleEditMode: String?
+    public var toggleSidebar: String?
 
     public init(
         activateTab: [String], nextTab: String?, previousTab: String?,
-        registerFocusedWindow: String?, toggleEditMode: String?
+        registerFocusedWindow: String?, toggleEditMode: String?, toggleSidebar: String?
     ) {
         self.activateTab = activateTab
         self.nextTab = nextTab
         self.previousTab = previousTab
         self.registerFocusedWindow = registerFocusedWindow
         self.toggleEditMode = toggleEditMode
+        self.toggleSidebar = toggleSidebar
     }
 
     public static let `default` = HotkeyConfig(
@@ -125,7 +129,8 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
         nextTab: "ctrl+tab",
         previousTab: "ctrl+shift+tab",
         registerFocusedWindow: "ctrl+alt+r",
-        toggleEditMode: "ctrl+alt+e")
+        toggleEditMode: "ctrl+alt+e",
+        toggleSidebar: "ctrl+alt+s")
 
     /// 古い hotkeys.json(キーが無い)は既定値で補い、明示的に null が書かれていれば「割り当てなし」と解釈する。
     public init(from decoder: Decoder) throws {
@@ -138,6 +143,8 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
             ? try c.decodeIfPresent(String.self, forKey: .registerFocusedWindow) : d.registerFocusedWindow
         toggleEditMode = c.contains(.toggleEditMode)
             ? try c.decodeIfPresent(String.self, forKey: .toggleEditMode) : d.toggleEditMode
+        toggleSidebar = c.contains(.toggleSidebar)
+            ? try c.decodeIfPresent(String.self, forKey: .toggleSidebar) : d.toggleSidebar
     }
 
     /// 設定を (Hotkey, HotkeyAction) の組に解決する。解釈できない項目はエラー文字列として返し、他は生かす。
@@ -167,6 +174,7 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
         if let spec = previousTab { add(spec, .previousTab, label: "previousTab") }
         if let spec = registerFocusedWindow { add(spec, .registerFocusedWindow, label: "registerFocusedWindow") }
         if let spec = toggleEditMode { add(spec, .toggleEditMode, label: "toggleEditMode") }
+        if let spec = toggleSidebar { add(spec, .toggleSidebar, label: "toggleSidebar") }
         return (bindings, errors)
     }
 

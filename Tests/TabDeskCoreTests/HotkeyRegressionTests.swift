@@ -18,7 +18,8 @@ struct HotkeyRegressionTests {
             activateTab: ["ctrl+alt+1", "control+option+1", "alt+ctrl+1"],
             nextTab: nil, previousTab: nil,
             registerFocusedWindow: nil,
-            toggleEditMode: nil)
+            toggleEditMode: nil,
+            toggleSidebar: nil)
 
         let (bindings, errors) = config.resolve()
 
@@ -33,10 +34,24 @@ struct HotkeyCycleConfigTests {
     @Test func defaultsIncludeTabCycling() {
         let (bindings, errors) = HotkeyConfig.default.resolve()
         #expect(errors.isEmpty)
-        #expect(bindings.count == 13)  // タブ 1..9 + next/prev + 登録 + 編集モード
+        #expect(bindings.count == 14)  // タブ 1..9 + next/prev + 登録 + 編集モード + サイドバー折りたたみ
         #expect(bindings.contains { $0.1 == .nextTab })
         #expect(bindings.contains { $0.1 == .previousTab })
+        #expect(bindings.contains { $0.1 == .toggleSidebar })
         #expect(try! HotkeyParser.parse("ctrl+tab").keyCode == 48)
+    }
+
+    /// 旧 hotkeys.json(toggleSidebar キーなし)は既定値で補われ、明示 null なら無効化できる。
+    @Test func legacyConfigWithoutSidebarKeyGetsDefault() throws {
+        let legacy = """
+        {"activateTab":["ctrl+alt+1"],"registerFocusedWindow":"ctrl+alt+r","toggleEditMode":"ctrl+alt+e"}
+        """
+        let config = try JSONDecoder().decode(HotkeyConfig.self, from: Data(legacy.utf8))
+        #expect(config.toggleSidebar == "ctrl+alt+s")
+
+        let disabled = try JSONDecoder().decode(
+            HotkeyConfig.self, from: Data(#"{"activateTab":[],"toggleSidebar":null}"#.utf8))
+        #expect(disabled.toggleSidebar == nil)
     }
 
     @Test func legacyConfigWithoutCyclingKeysGetsDefaults() throws {
@@ -59,6 +74,6 @@ struct HotkeyCycleConfigTests {
         #expect(config.nextTab == nil, "explicit null means unassigned")
         #expect(config.previousTab == "ctrl+shift+tab")
         let (bindings, _) = config.resolve()
-        #expect(bindings.count == 2)
+        #expect(bindings.count == 3)  // activateTab 1 + previousTab + toggleSidebar(キー無し = 既定)
     }
 }

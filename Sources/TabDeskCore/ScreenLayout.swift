@@ -81,10 +81,18 @@ public struct FixedScreenLayout: ScreenLayout {
 /// 先頭が主ディスプレイなのは NSScreen.screens の仕様と一致)。
 /// sidebarWidth はサイドバーのある主ディスプレイのコンテンツ領域からだけ除く。
 public struct SystemScreenLayout: ScreenLayout {
-    public let sidebarWidth: CGFloat
+    /// サイドバー幅は毎回読む(v3 段階 3: 幅変更・折りたたみに追従)。
+    /// TabEngine は existential(any ScreenLayout)として独立コピーを持つため、
+    /// 値を stored let で持つと変更が伝わらない — closure 越しの共有参照にするのが本質。
+    private let sidebarWidthProvider: @Sendable () -> CGFloat
 
-    public init(sidebarWidth: CGFloat) {
-        self.sidebarWidth = sidebarWidth
+    public init(sidebarWidth: @escaping @Sendable () -> CGFloat) {
+        self.sidebarWidthProvider = sidebarWidth
+    }
+
+    /// 固定幅の互換 init(テスト・PoC 用)。
+    public init(sidebarWidth width: CGFloat) {
+        self.sidebarWidthProvider = { width }
     }
 
     public var displays: [DisplayLayout] {
@@ -92,6 +100,7 @@ public struct SystemScreenLayout: ScreenLayout {
         let frames = screens.map { ScreenGeometry.fullFrameAX(of: $0) }
         // 退避点は画面配置を考慮して決める(配置の右端でない画面は自画面の隅だと窓が見え得る)。
         let parks = ScreenGeometry.parkPoints(forDisplayFrames: frames)
+        let sidebarWidth = sidebarWidthProvider()  // 幅は都度読む(折りたたみ・ドラッグ変更に追従)
         return screens.enumerated().map { index, screen in
             let visible = ScreenGeometry.visibleFrameAX(of: screen)
             let content: CGRect

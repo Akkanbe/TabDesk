@@ -1531,7 +1531,7 @@ struct HotkeyTests {
     @Test func defaultConfigResolvesCompletely() {
         let (bindings, errors) = HotkeyConfig.default.resolve()
         #expect(errors.isEmpty)
-        #expect(bindings.count == 13)  // タブ 1..9 + 順送り/逆送り + 登録 + 編集モード
+        #expect(bindings.count == 14)  // タブ 1..9 + 順送り/逆送り + 登録 + 編集モード + サイドバー折りたたみ
         #expect(bindings.contains { $0.1 == .activateTab(9) })
         #expect(bindings.contains { $0.1 == .registerFocusedWindow })
     }
@@ -1542,7 +1542,7 @@ struct HotkeyTests {
         config.toggleEditMode = "ctrl+alt+1"  // タブ 1 と重複
         let (bindings, errors) = config.resolve()
         #expect(errors.count == 2)
-        #expect(bindings.count == 11)  // 13 - 壊れた 1 - 重複 1
+        #expect(bindings.count == 12)  // 14 - 壊れた 1 - 重複 1
         #expect(!bindings.contains { $0.1 == .activateTab(3) })
     }
 

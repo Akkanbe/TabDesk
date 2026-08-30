@@ -17,6 +17,11 @@ final class SidebarPanel: NSPanel {
     private let addWindowButton = NSButton(title: "＋ ウィンドウを追加", target: nil, action: nil)
     private let editModeCheck = NSButton(checkboxWithTitle: "編集モード(動かした位置を記憶)", target: nil, action: nil)
     private var permissionTimer: Timer?
+    /// 幅を変えられるように保持する(v3 段階 3。生成時の activate だけだと変更できない)。
+    private var widthConstraint: NSLayoutConstraint?
+    private var scrollView: NSScrollView?
+    private var resizeHandle: SidebarResizeHandle?
+    private var expandButton: NSButton?
 
     /// 「常に最前面」設定。既定 true。メニューとパネルはこの値を唯一の真実として同期する。
     static let alwaysOnTopSetting = PersistedToggle(key: "SidebarAlwaysOnTop", defaultValue: true)
@@ -35,7 +40,7 @@ final class SidebarPanel: NSPanel {
         self.logger = logger
         self.alwaysOnTop = Self.alwaysOnTopSetting.value
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: WindowManager.sidebarWidth, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: manager.sidebarMetrics.effectiveWidth, height: 600),
             styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered, defer: false)
         level = alwaysOnTop ? .floating : .normal
@@ -49,6 +54,7 @@ final class SidebarPanel: NSPanel {
         backgroundColor = .clear
         hasShadow = true
         contentView = buildContent()
+        applyCollapsedAppearance()  // 前回終了時の折りたたみ状態を復元
         reposition()
 
         manager.onStateChanged = { [weak self] _ in self?.render() }
@@ -69,7 +75,10 @@ final class SidebarPanel: NSPanel {
     func reposition() {
         guard let screen = ScreenGeometry.primaryScreen else { return }
         let visible = screen.visibleFrame
-        setFrame(NSRect(x: visible.minX, y: visible.minY, width: WindowManager.sidebarWidth, height: visible.height), display: true)
+        setFrame(
+            NSRect(x: visible.minX, y: visible.minY,
+                width: manager.sidebarMetrics.effectiveWidth, height: visible.height),
+            display: true)
     }
 
     @objc private func screenParametersChanged() {
@@ -78,6 +87,47 @@ final class SidebarPanel: NSPanel {
         // 画面構成が変わったら差分キャッシュを捨てて描き直す。
         lastRendered = nil
         render()
+    }
+
+    // MARK: - 幅変更・折りたたみ(v3 段階 3)
+
+    /// ドラッグ中のライブリサイズ(パネルと制約のみ動かす。窓のリフローは commit 時にまとめて)。
+    private func previewResize(to width: CGFloat) {
+        let clamped = min(max(width, SidebarMetrics.minWidth), SidebarMetrics.maxWidth)
+        widthConstraint?.constant = clamped
+        var f = frame
+        f.size.width = clamped
+        setFrame(f, display: true)
+    }
+
+    /// ドラッグ終了: 幅を保存し、コンテンツ領域(窓の配置範囲)を追従させる。
+    private func commitResize() {
+        manager.sidebarMetrics.expandedWidth = frame.width
+        widthConstraint?.constant = manager.sidebarMetrics.effectiveWidth
+        reposition()
+        manager.applySidebarWidthChange()
+        logger.log("sidebarWidth=\(Int(manager.sidebarMetrics.expandedWidth))")
+    }
+
+    /// 折りたたみ切替(ヘッダの「«」/ 細いバーのクリック / ホットキー / メニュー共通の入口)。
+    func toggleCollapse() {
+        manager.sidebarMetrics.isCollapsed.toggle()
+        applyCollapsedAppearance()
+        reposition()
+        manager.applySidebarWidthChange()
+        logger.log("sidebarCollapsed=\(manager.sidebarMetrics.isCollapsed)")
+    }
+
+    @objc private func toggleCollapseAction() { toggleCollapse() }
+
+    /// 折りたたみ状態を見た目へ反映する。render() の state 差分とは独立に扱う
+    /// (state が変わらなくても折りたたみは切り替わるため)。
+    private func applyCollapsedAppearance() {
+        let collapsed = manager.sidebarMetrics.isCollapsed
+        scrollView?.isHidden = collapsed
+        resizeHandle?.isHidden = collapsed
+        expandButton?.isHidden = !collapsed
+        widthConstraint?.constant = manager.sidebarMetrics.effectiveWidth
     }
 
     // MARK: - UI 構築
@@ -99,7 +149,9 @@ final class SidebarPanel: NSPanel {
         // NSClipView は既定で非 flipped(内容が短いと下寄せになる)ので flipped な ClipView を使う。
         // 長いタイトルの行が Auto Layout 経由でパネルごと広げないよう、幅を固定する。
         background.translatesAutoresizingMaskIntoConstraints = false
-        background.widthAnchor.constraint(equalToConstant: WindowManager.sidebarWidth).isActive = true
+        let width = background.widthAnchor.constraint(equalToConstant: manager.sidebarMetrics.effectiveWidth)
+        width.isActive = true
+        widthConstraint = width
 
         let scroll = NSScrollView()
         scroll.contentView = FlippedClipView()
@@ -118,14 +170,48 @@ final class SidebarPanel: NSPanel {
             root.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             root.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
         ])
+        scrollView = scroll
+
+        // 右端のリサイズハンドル(スクロールの上に重ねる。v3 段階 3)。
+        let handle = SidebarResizeHandle()
+        handle.onDrag = { [weak self] width in self?.previewResize(to: width) }
+        handle.onCommit = { [weak self] in self?.commitResize() }
+        handle.translatesAutoresizingMaskIntoConstraints = false
+        background.addSubview(handle)
+        NSLayoutConstraint.activate([
+            handle.topAnchor.constraint(equalTo: background.topAnchor),
+            handle.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            handle.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            handle.widthAnchor.constraint(equalToConstant: 8),
+        ])
+        resizeHandle = handle
+
+        // 折りたたみ中の展開つまみ(細いバー全体がクリック領域)。
+        let expand = NSButton(title: "»", target: self, action: #selector(toggleCollapseAction))
+        expand.bezelStyle = .inline
+        expand.isBordered = false
+        expand.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        expand.toolTip = "サイドバーを展開"
+        expand.translatesAutoresizingMaskIntoConstraints = false
+        background.addSubview(expand)
+        NSLayoutConstraint.activate([
+            expand.topAnchor.constraint(equalTo: background.topAnchor),
+            expand.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            expand.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            expand.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+        ])
+        expandButton = expand
 
         // ヘッダ
         let title = NSTextField(labelWithString: "TabDesk")
         title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        let collapse = NSButton(title: "«", target: self, action: #selector(toggleCollapseAction))
+        collapse.bezelStyle = .inline
+        collapse.toolTip = "サイドバーを折りたたむ"
         let addTab = NSButton(title: "＋", target: self, action: #selector(addTab))
         addTab.bezelStyle = .inline
         addTab.toolTip = "タブを追加"
-        let header = NSStackView(views: [title, NSView(), addTab])
+        let header = NSStackView(views: [title, NSView(), collapse, addTab])
         header.orientation = .horizontal
         root.addArrangedSubview(header)
         header.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -20).isActive = true
@@ -460,6 +546,44 @@ final class SidebarPanel: NSPanel {
 /// 内容を上端から並べるための ClipView(既定は下寄せ)。
 private final class FlippedClipView: NSClipView {
     override var isFlipped: Bool { true }
+}
+
+/// サイドバー右端のリサイズハンドル(v3 段階 3)。
+///
+/// パネルは `.nonactivatingPanel` でキーウィンドウにならないため、カーソル追跡は
+/// `.activeAlways` が必須(`.activeInKeyWindow` では発火しない)。ドラッグ中は onDrag に
+/// 希望幅を流し、マウスを離した時点で onCommit(幅の確定と窓のリフロー)を呼ぶ。
+@MainActor
+private final class SidebarResizeHandle: NSView {
+    var onDrag: ((CGFloat) -> Void)?
+    var onCommit: (() -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds, options: [.cursorUpdate, .activeAlways], owner: self, userInfo: nil))
+        super.updateTrackingAreas()
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.resizeLeftRight.set()
+    }
+
+    // 空実装でイベントを受け取り、以降の mouseDragged / mouseUp がこのビューへ届くようにする
+    // (responder chain へ流すとパネル移動などの既定処理に化けうる)。
+    override func mouseDown(with event: NSEvent) {}
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let window else { return }
+        // 希望幅 = マウスの画面 x − パネル左端(Cocoa 座標だが x はそのまま使える)。
+        onDrag?(NSEvent.mouseLocation.x - window.frame.minX)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        onCommit?()
+    }
 }
 
 /// NSMenuItem.representedObject に載せるための箱(WindowRecord は struct なので)。

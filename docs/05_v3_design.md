@@ -74,7 +74,24 @@ ScreenCaptureKit は TabDesk モジュールの 1 ファイルに隔離。
 - 残存する既知の狭い競合: op の IPC 実行中とちょうど同時に進入した場合、その 1 op 分の採用が
   起こりうる(次の構造イベントまで無害、ウィンドウは最大 2 秒で集合入り)
 
-## 段階3 の判断(実装時に追記)
+## 段階3 の判断(2026-08-30 実装): サイドバー幅ドラッグ+折りたたみ
+
+- `PersistedNumber`(PersistedToggle の数値版)+ `SidebarMetrics`(min 160 / max 400 /
+  折りたたみ 16 / 既定 240)。実体は UserDefaults なのでコピー間・モジュール間で共有される
+- `SystemScreenLayout` の幅を `@Sendable () -> CGFloat` プロバイダに変更。TabEngine は
+  existential として**独立コピー**を持つため、stored let では変更が伝わらない — closure 越しの
+  共有参照が本質(固定幅の互換 init も残した)
+- `WindowManager.applySidebarWidthChange()`: ユーザー操作起点なので 1 秒デバウンスを挟まず
+  begin → reapply → end を即時実行。generation を進めて並行する画面変更 Task の早期解除を防ぐ。
+  完了後に `onContentAreaChanged` フック(段階 4 の枠が使う)。権限が無くてもフックは呼ぶ
+- リサイズハンドル(右端 8px): パネルは `.nonactivatingPanel` でキーにならないため、
+  カーソル追跡は `.activeAlways` が必須。ドラッグ中はパネルだけライブリサイズし、
+  離した時点で幅を確定して窓をリフローする(ドラッグ中に窓を動かすと 100ms 級の AX IPC が連発するため)
+- 折りたたみ: ヘッダ「«」/ 細いバー全面の「»」ボタン / ホットキー(既定 ctrl+alt+s、
+  hotkeys.json 後方互換: キー無し = 既定、明示 null = 無効)/ メニュー項目。
+  表示切替は render() の state 差分と独立のメソッドで行う
+- 既知の非対称: clamp は位置しか動かさないので、狭めた/畳んだとき free の窓は空いた領域へ
+  **広がらない**(columns は追従する)。広げたときは free の窓も押し出される
 
 ## 段階4 の判断(実装時に追記)
 
