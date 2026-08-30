@@ -14,6 +14,10 @@ public protocol WindowDriver: Sendable {
     func setFrame(_ frame: CGRect, of windowID: CGWindowID) throws -> CGRect
     func setPosition(_ point: CGPoint, of windowID: CGWindowID) throws
     func raise(_ windowID: CGWindowID) throws
+    /// ネイティブフルスクリーン中か(v3 段階 2)。ウィンドウが消えていれば throw。
+    /// フルスクリーン中の窓はエンジンが操作対象から外す(setFrame/setPosition が効かず、
+    /// 復元リトライが最終的にフルスクリーン寸法を基準として採用してしまうため)。
+    func isFullscreen(of windowID: CGWindowID) throws -> Bool
 }
 
 public enum WindowDriverError: Error, CustomStringConvertible, Sendable {
@@ -72,5 +76,9 @@ public final class AXWindowDriver: WindowDriver {
 
     public func raise(_ windowID: CGWindowID) throws {
         try window(windowID).raise()
+    }
+
+    public func isFullscreen(of windowID: CGWindowID) throws -> Bool {
+        try window(windowID).isFullscreen  // 属性が読めない場合は false(fail-open。実測記録は docs/04)
     }
 }

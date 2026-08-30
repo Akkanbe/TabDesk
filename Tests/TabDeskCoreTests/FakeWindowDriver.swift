@@ -16,6 +16,8 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         var throwAfterApply = false
         /// 書き込み(setFrame / setPosition / raise)だけ失敗し、読み取りは通る(無応答アプリに近い)。
         var failWrites = false
+        /// ネイティブフルスクリーン中。書き込みは黙って飲み込まれ、frame は変わらない(実機の挙動に最も近い)。
+        var fullscreen = false
     }
 
     private let lock = NSLock()
@@ -46,6 +48,10 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
 
     func setFailWrites(_ id: CGWindowID, _ value: Bool = true) {
         lock.withLock { windows[id]?.failWrites = value }
+    }
+
+    func setFullscreen(_ id: CGWindowID, _ value: Bool = true) {
+        lock.withLock { windows[id]?.fullscreen = value }
     }
 
     struct SimulatedTimeout: Error {}
@@ -97,6 +103,9 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
     @discardableResult
     func setFrame(_ frame: CGRect, of windowID: CGWindowID) throws -> CGRect {
         try withWindow(windowID, "setFrame") { w in
+            // フルスクリーン中は書き込みが黙って飲み込まれる(throw せず frame も変わらない)。
+            // 修正前のエンジンはこれで「3 回試行 → フルスクリーン寸法を採用」に陥っていた。
+            if w.fullscreen { return w.frame }
             // 実アプリの最小サイズ制約を模す。位置は要求どおり、サイズだけクランプされる。
             w.frame = CGRect(
                 origin: frame.origin,
@@ -106,7 +115,14 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
     }
 
     func setPosition(_ point: CGPoint, of windowID: CGWindowID) throws {
-        try withWindow(windowID, "setPosition") { w in w.frame.origin = point }
+        try withWindow(windowID, "setPosition") { w in
+            if w.fullscreen { return }
+            w.frame.origin = point
+        }
+    }
+
+    func isFullscreen(of windowID: CGWindowID) throws -> Bool {
+        try withWindow(windowID, "isFullscreen") { $0.fullscreen }
     }
 
     func raise(_ windowID: CGWindowID) throws {

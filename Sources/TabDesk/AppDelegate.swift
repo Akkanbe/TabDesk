@@ -268,7 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let unbound = s.allWindows.filter { !$0.isBound }
             logger.log("status: trusted=\(manager.isTrusted) tabs=\(s.tabs.map { "\($0.name)(\($0.windows.count))" }) " +
                 "active=\(s.activeTab?.name ?? "-") parked=\(engine.parkedWindowIDs.count) unbound=\(unbound.count) " +
-                "edit=\(engine.editMode) state=\(manager.store.fileURL.path)")
+                "fullscreen=\(engine.fullscreenWindowIDs.count) edit=\(engine.editMode) state=\(manager.store.fileURL.path)")
             for w in unbound {
                 logger.log("  unbound: \(w.identity.appName) | \(w.identity.title) id=\(w.id)")
             }
