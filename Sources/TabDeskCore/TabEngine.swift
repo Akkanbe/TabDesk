@@ -102,6 +102,8 @@ public final class TabEngine {
     private var restoreGeneration: [UUID: UInt64] = [:]
     /// テスト用: 復元世代表のエントリ数(登録解除で剪定されることの検証)。
     var restoreGenerationCountForTesting: Int { restoreGeneration.count }
+    /// テスト用: レイアウト遷移バリアの状態(endLayoutTransition の無条件クリアを固定する)。
+    var isLayoutTransitioningForTesting: Bool { isLayoutTransitioning }
     /// 画面構成変更から再適用完了まで、OS 由来の moved/resized をユーザー編集として扱わない。
     private var isLayoutTransitioning = false
     private var isBusy = false

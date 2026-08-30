@@ -98,7 +98,9 @@ final class SidebarPanel: NSPanel {
     // MARK: - 幅変更・折りたたみ(v3 段階 3)
 
     /// ドラッグ中のライブリサイズ(パネルと制約のみ動かす。窓のリフローは commit 時にまとめて)。
+    /// ドラッグ中にホットキーで折りたたまれた場合は無視する(畳んだ 16px を広げ直さない)。
     private func previewResize(to width: CGFloat) {
+        guard !manager.sidebarMetrics.isCollapsed else { return }
         let clamped = min(max(width, SidebarMetrics.minWidth), SidebarMetrics.maxWidth)
         widthConstraint?.constant = clamped
         var f = frame
@@ -107,7 +109,10 @@ final class SidebarPanel: NSPanel {
     }
 
     /// ドラッグ終了: 幅を保存し、コンテンツ領域(窓の配置範囲)を追従させる。
+    /// ドラッグ中に折りたたまれていたら保存しない(mouseUp は隠れたハンドルにも届くため、
+    /// ここで frame.width=16 を保存すると設定済みの展開幅が minWidth に化ける)。
     private func commitResize() {
+        guard !manager.sidebarMetrics.isCollapsed else { return }
         manager.sidebarMetrics.expandedWidth = frame.width
         widthConstraint?.constant = manager.sidebarMetrics.effectiveWidth
         reposition()

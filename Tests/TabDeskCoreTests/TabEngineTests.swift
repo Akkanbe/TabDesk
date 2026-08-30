@@ -1610,6 +1610,18 @@ struct AuditFixTests {
         #expect(engine.restoreGenerationCountForTesting == 0)
     }
 
+    /// endLayoutTransition はシャットダウン中でも無条件でフラグを下ろす(段階 0 の修正の固定)。
+    /// begin と対称のガードを将来うっかり再導入すると、シャットダウンを中断する経路ができたときに
+    /// reconcile / スナップバックが永久停止する — このテストがその回帰を検知する。
+    @Test func endLayoutTransitionClearsFlagEvenDuringShutdown() {
+        let (engine, _) = makeEngine()
+        engine.beginLayoutTransition()  // beginShutdown より先(begin はシャットダウン中を拒否するため)
+        #expect(engine.isLayoutTransitioningForTesting)
+        engine.beginShutdown()
+        engine.endLayoutTransition()
+        #expect(!engine.isLayoutTransitioningForTesting, "クリアは無条件であること")
+    }
+
     /// 終了時の解放(releaseAll)は apply と同じ許容誤差ゲートで到達 frame を採用する。
     /// ゲートが無いと、サブポイントのずれが終了のたびに記録へ蓄積する。
     @Test func releaseDoesNotAdoptSubToleranceDrift() async throws {
