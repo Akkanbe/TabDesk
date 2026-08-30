@@ -111,19 +111,25 @@ final class WindowRowView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    init(window: ManagedWindow, canMoveUp: Bool, canMoveDown: Bool) {
+    init(window: ManagedWindow, canMoveUp: Bool, canMoveDown: Bool, isDisplayDisconnected: Bool = false) {
         isBound = window.isBound
         self.canMoveUp = canMoveUp
         self.canMoveDown = canMoveDown
         super.init(frame: .zero)
         let title = SidebarText.windowTitle(appName: window.identity.appName, title: window.identity.title)
-        let label = NSTextField(labelWithString: isBound ? title : "\(title)(未復元)")
+        // 切断退避(v3 段階 D3): 記録位置を凍結して管理を止めていることをユーザーに伝える。
+        let suffix = !isBound ? "(未復元)" : (isDisplayDisconnected ? "(別ディスプレイ待機)" : "")
+        let label = NSTextField(labelWithString: title + suffix)
         label.font = NSFont.systemFont(ofSize: 11)
         label.lineBreakMode = .byTruncatingTail
         // 幅が足りなければ末尾省略で縮む(サイドバーを押し広げない)。
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        label.textColor = isBound ? .labelColor : .secondaryLabelColor
-        label.toolTip = isBound ? title : "\(title)\nクリックして、いま開いているウィンドウを割り当てます"
+        label.textColor = (isBound && !isDisplayDisconnected) ? .labelColor : .secondaryLabelColor
+        label.toolTip = !isBound
+            ? "\(title)\nクリックして、いま開いているウィンドウを割り当てます"
+            : (isDisplayDisconnected
+                ? "\(title)\nディスプレイ切断中のため、再接続まで位置を管理しません(位置を変えたい場合は解除して登録し直してください)"
+                : title)
         let remove = NSButton(title: "×", target: self, action: #selector(removeAction))
         remove.bezelStyle = .inline
         remove.isBordered = false

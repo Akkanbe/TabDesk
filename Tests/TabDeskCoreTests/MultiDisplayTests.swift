@@ -111,8 +111,27 @@ struct MultiDisplayTests {
         #expect(driver.callCount("setPosition") == before, "主ディスプレイの隅 x (1919) と比較していれば毎回再退避してしまう")
     }
 
-    /// ディスプレイが切断されたら、その窓は主ディスプレイのコンテンツ領域へ収める(段階 D の消失ポリシー)。
-    @Test func disconnectedDisplayFallsBackToPrimary() async throws {
+    /// ディスプレイが切断されても、記録 frame・所属・実窓は凍結される(v3 段階 D3 = 切断退避)。
+    @Test func disconnectedDisplayPreservesRecordedFrame() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let frame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: frame)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: frame, into: tab.id)
+        let writesBefore = driver.callCount("setFrame") + driver.callCount("setPosition")
+
+        layout.change(displays: [soloMainDisplay])
+        await engine.reapplyLayout()
+
+        let window = try #require(engine.state.managedWindow(id: managed.id)?.window)
+        #expect(window.frame == frame, "記録 frame は凍結")
+        #expect(window.displayID == "second", "所属も凍結")
+        #expect(driver.currentFrame(1) == frame, "実窓に op を発行しない")
+        #expect(driver.callCount("setFrame") + driver.callCount("setPosition") == writesBefore)
+    }
+
+    /// 再接続すると、次の reapplyLayout の通常経路が記録 frame へ復元する(電源サイクル往復の回帰)。
+    @Test func reconnectRestoresOriginalFrame() async throws {
         let (engine, driver, layout) = makeEngine()
         let tab = engine.createTab(name: "A")
         let frame = CGRect(x: 2400, y: 200, width: 800, height: 600)
@@ -121,13 +140,34 @@ struct MultiDisplayTests {
 
         layout.change(displays: [soloMainDisplay])
         await engine.reapplyLayout()
+        // macOS が切断時に窓を主画面へ動かした状況を模す(偽ドライバは OS クランプを持たないため)。
+        driver.moveExternally(1, to: CGRect(x: 400, y: 100, width: 800, height: 600))
 
-        let current = try #require(driver.currentFrame(1))
-        #expect(mainDisplay.contentArea.contains(current), "主ディスプレイの領域内へ移る")
+        layout.change(displays: [mainDisplay, secondDisplay])
+        await engine.reapplyLayout()
+
+        #expect(driver.currentFrame(1) == frame, "再接続後は元の外部座標へ戻る")
+        #expect(engine.state.allWindows.first?.frame == frame)
     }
 
-    /// 非アクティブ窓も画面切断時に論理 frame を主画面へ更新し、解除で旧外部座標へ戻さない。
-    @Test func disconnectedInactiveWindowIsReleasedInsidePrimary() async throws {
+    /// 未復元(unbound)エントリの保存 frame も切断で書き換えない(精査 High の unbound 経路)。
+    @Test func disconnectedUnboundEntryKeepsFrame() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let frame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: frame)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: frame, into: tab.id)
+        engine.unbindWindows(pid: 100)
+
+        layout.change(displays: [soloMainDisplay])
+        await engine.reapplyLayout()
+
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == frame)
+        #expect(engine.state.managedWindow(id: managed.id)?.window.displayID == "second")
+    }
+
+    /// 切断中の解除は実窓を動かさず(macOS が置いた場所のまま)、登録だけ手放す。
+    @Test func unregisterDisconnectedWindowLeavesItInPlace() async throws {
         let (engine, driver, layout) = makeEngine()
         _ = engine.createTab(name: "A")
         let inactive = engine.createTab(name: "B")
@@ -137,16 +177,21 @@ struct MultiDisplayTests {
             windowID: 1, pid: 100, identity: identity("ext"), frame: externalFrame, into: inactive.id)
 
         layout.change(displays: [soloMainDisplay])
-        await engine.reapplyLayout()
+        // macOS の切断時クランプを模す(実窓はどこかの生きている画面に置かれる)。
+        let osPlaced = CGRect(x: 500, y: 200, width: 800, height: 600)
+        driver.moveExternally(1, to: osPlaced)
+        let writesBefore = driver.callCount("setFrame") + driver.callCount("setPosition")
 
-        let recorded = try #require(engine.state.managedWindow(id: managed.id)?.window.frame)
-        #expect(mainDisplay.contentArea.contains(recorded), "inactive の保存 frame も現在の画面へ寄せる")
         try await engine.unregister(managed.id)
-        let released = try #require(driver.currentFrame(1))
-        #expect(mainDisplay.contentArea.contains(released), "解除時に切断済み画面の座標へ戻さない")
+
+        #expect(engine.state.allWindows.isEmpty, "登録は解除される")
+        #expect(driver.currentFrame(1) == osPlaced, "実窓は OS が置いた場所のまま")
+        #expect(driver.callCount("setFrame") + driver.callCount("setPosition") == writesBefore, "書き込み op なし")
+        #expect(engine.parkedWindowIDs.isEmpty)
     }
 
-    /// editMode 中でも、画面切断に伴う OS/reapply の移動で永続 displayID を主画面へ変えない。
+    /// editMode 中でも、画面切断に伴う OS の移動(遅延通知含む)で凍結した frame と所属を上書きしない。
+    /// OS 移動とユーザードラッグは通知から区別できないため、切断中は編集モードでも一切記録しない(D3)。
     @Test func layoutTransitionDoesNotRecordOSMoveAsDisplayEdit() async throws {
         let (engine, driver, layout) = makeEngine()
         let tab = engine.createTab(name: "A")
@@ -163,13 +208,13 @@ struct MultiDisplayTests {
         engine.windowFrameDidChange(windowID: 1)
         await engine.reapplyLayout()
         engine.endLayoutTransition()
-        // reapply 自身の遅延 moved 通知も、current == recorded なら編集として扱わない。
+        // barrier 解除後に届く遅延 moved 通知も、切断中は編集として扱わない。
         engine.windowFrameDidChange(windowID: 1)
         try await Task.sleep(for: .milliseconds(100))
 
         let current = try #require(engine.state.managedWindow(id: managed.id)?.window)
         #expect(current.displayID == "second", "再接続時に元ディスプレイを識別できるよう所属を保持する")
-        #expect(mainDisplay.contentArea.contains(current.frame))
+        #expect(current.frame == externalFrame, "凍結した記録 frame は遅延通知でも上書きされない")
     }
 
     /// 通常のユーザードラッグでは、従来どおり移動先ディスプレイへ所属を更新する。
@@ -192,8 +237,8 @@ struct MultiDisplayTests {
         #expect(current.frame == externalFrame)
     }
 
-    /// 画面変更通知のデバウンス前に解除しても、release 自身が現在の画面構成へ収める。
-    @Test func unregisterClampsBeforeDelayedLayoutReapply() async throws {
+    /// 終了時の全解放も切断中の窓には触らず、記録 frame を次回起動の復元材料として残す。
+    @Test func shutdownReleaseKeepsDisconnectedFrames() async throws {
         let (engine, driver, layout) = makeEngine()
         _ = engine.createTab(name: "A")
         let inactive = engine.createTab(name: "B")
@@ -201,12 +246,143 @@ struct MultiDisplayTests {
         driver.add(1, frame: externalFrame)
         let managed = try await engine.register(
             windowID: 1, pid: 100, identity: identity("ext"), frame: externalFrame, into: inactive.id)
+        #expect(engine.parkedWindowIDs.contains(managed.id))
 
         layout.change(displays: [soloMainDisplay])
-        try await engine.unregister(managed.id)
+        let osPlaced = CGRect(x: 500, y: 200, width: 800, height: 600)
+        driver.moveExternally(1, to: osPlaced)
+        await engine.releaseAllParkedWindows()
 
-        let released = try #require(driver.currentFrame(1))
-        #expect(mainDisplay.contentArea.contains(released))
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == externalFrame, "保存値は凍結のまま")
+        #expect(driver.currentFrame(1) == osPlaced, "実窓は動かさない")
+        #expect(engine.parkedWindowIDs.isEmpty, "退避フラグは畳んで手放す")
+    }
+
+    /// reconcile は切断中の窓に補正 op を出さない(park 再試行・ずれ検知・フラグ修復すべて対象外)。
+    @Test func reconcileEmitsNoOpsForDisconnectedWindows() async throws {
+        let (engine, driver, layout) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let inactive = engine.createTab(name: "B")
+        let frame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: frame)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: frame, into: inactive.id)
+
+        layout.change(displays: [soloMainDisplay])
+        driver.moveExternally(1, to: CGRect(x: 500, y: 200, width: 800, height: 600))  // 隅から外れた状態
+        let before = driver.callCount("setFrame") + driver.callCount("setPosition")
+        for _ in 0..<3 {
+            await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+        }
+        #expect(driver.callCount("setFrame") + driver.callCount("setPosition") == before)
+    }
+
+    /// タブ切替は切断中の窓を復元も退避もせず、同じタブの生きている窓だけを扱う。
+    @Test func activateSkipsDisconnectedWindows() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let a = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        let extFrame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        let mainFrame = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: extFrame)
+        driver.add(2, frame: mainFrame)
+        driver.add(3, frame: mainFrame)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: extFrame, into: a.id)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("m"), frame: mainFrame, into: a.id)
+        try await engine.register(windowID: 3, pid: 300, identity: identity("b"), frame: mainFrame, into: b.id)
+
+        layout.change(displays: [soloMainDisplay])
+        let osPlaced = CGRect(x: 500, y: 200, width: 800, height: 600)
+        driver.moveExternally(1, to: osPlaced)
+
+        try await engine.activate(b.id)
+        #expect(driver.currentFrame(1) == osPlaced, "切断中の窓は退避しない")
+        #expect(driver.currentFrame(2)?.origin == soloMainDisplay.parkPoint, "生きている窓は退避する")
+
+        try await engine.activate(a.id)
+        #expect(driver.currentFrame(1) == osPlaced, "切断中の窓は復元もしない")
+        #expect(driver.currentFrame(2) == mainFrame, "生きている窓は復元する")
+    }
+
+    /// スナップバックは切断中の窓を無視する(採用によるframe破壊も起きない)。
+    @Test func snapbackIgnoresDisconnectedWindow() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let frame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: frame)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: frame, into: tab.id)
+
+        layout.change(displays: [soloMainDisplay])
+        driver.moveExternally(1, to: CGRect(x: 700, y: 300, width: 800, height: 600))
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(150))
+
+        #expect(driver.currentFrame(1) == CGRect(x: 700, y: 300, width: 800, height: 600), "戻さない")
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == frame, "記録も変えない")
+    }
+
+    /// 編集モードでも切断中の窓のドラッグは記録しない(凍結は凍結)。
+    @Test func editModeDragDoesNotRecordDisconnectedWindow() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let frame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: frame)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: frame, into: tab.id)
+        engine.editMode = true
+
+        layout.change(displays: [soloMainDisplay])
+        driver.moveExternally(1, to: CGRect(x: 300, y: 100, width: 800, height: 600))
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(150))
+
+        let window = try #require(engine.state.managedWindow(id: managed.id)?.window)
+        #expect(window.frame == frame)
+        #expect(window.displayID == "second")
+    }
+
+    /// columns の列計算から切断中の窓は除外され、主画面へタイルされない。
+    @Test func columnsExcludeDisconnectedWindows() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let m1 = CGRect(x: 300, y: 100, width: 500, height: 400)
+        let m2 = CGRect(x: 900, y: 200, width: 500, height: 400)
+        let ext = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: m1)
+        driver.add(2, frame: m2)
+        driver.add(3, frame: ext)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("m1"), frame: m1, into: tab.id)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("m2"), frame: m2, into: tab.id)
+        let extManaged = try await engine.register(windowID: 3, pid: 300, identity: identity("ext"), frame: ext, into: tab.id)
+        try await engine.setTabLayout(tab.id, .columns)
+
+        layout.change(displays: [soloMainDisplay])
+        await engine.reapplyLayout()
+
+        let area = soloMainDisplay.contentArea
+        let half = area.width / 2
+        #expect(driver.currentFrame(1) == CGRect(x: area.minX, y: area.minY, width: half, height: area.height), "主画面は 2 窓で等分")
+        #expect(driver.currentFrame(2) == CGRect(x: area.minX + half, y: area.minY, width: half, height: area.height))
+        #expect(engine.state.managedWindow(id: extManaged.id)?.window.frame == secondDisplay.contentArea, "切断中の窓は列に入らず記録も凍結")
+    }
+
+    /// 切断中エントリへの bind は配置(place)を省略し、記録 frame を保ったまま紐付けだけ行う。
+    @Test func bindToDisconnectedEntrySkipsPlacement() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let frame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: frame)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: frame, into: tab.id)
+        engine.unbindWindows(pid: 100)
+        layout.change(displays: [soloMainDisplay])
+
+        driver.add(9, frame: CGRect(x: 500, y: 200, width: 800, height: 600))  // 再起動後の同じ窓(別 ID)
+        let writesBefore = driver.callCount("setFrame") + driver.callCount("setPosition")
+        try await engine.bind(managed.id, windowID: 9, pid: 100)
+
+        let window = try #require(engine.state.managedWindow(id: managed.id)?.window)
+        #expect(window.isBound)
+        #expect(window.frame == frame, "記録 frame は凍結のまま")
+        #expect(driver.callCount("setFrame") + driver.callCount("setPosition") == writesBefore, "place の IPC なし")
+        #expect(!engine.parkedWindowIDs.contains(managed.id), "非アクティブ扱いでも退避フラグは立てない")
     }
 
     /// columns はディスプレイごとに独立して等分する(画面をまたいだ 1 本の列にはしない)。

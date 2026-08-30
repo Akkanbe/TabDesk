@@ -296,21 +296,28 @@ public final class TabEngine {
             // resolveVanished が entry を削除しないよう、この時点で古い消滅保留を取り消す。
             vanished.removeValue(forKey: id)
             let intoActive = found.tab.id == state.activeTabID
-            // 保存時と画面構成が違っていても、最初の復元から現在のコンテンツ領域内へ収める
-            // (窓のディスプレイが切断中なら主ディスプレイへ)。退避先も窓のディスプレイの隅。
-            let recorded = clamped(found.window.frame, for: found.window)
-            let outcome = try await place(
-                windowID: windowID, frame: recorded, intoActive: intoActive,
-                parkPoint: parkPoint(for: found.window))
             let frame: CGRect
-            switch outcome {
-            case .placed(let actual):
-                frame = actual
-            case .unreached:
-                // 復元では保存済みレイアウトこそ守るべき値。実窓は後の reconcile / スナップバックが寄せる。
-                frame = recorded
-            case .parked:
-                frame = recorded
+            if isDisplayDisconnected(found.window) {
+                // 切断退避中は配置(place)を丸ごと省略する: 記録 frame を凍結し、実窓は今の場所のまま
+                // 紐付けだけ行う(段階 D3)。再接続後の reapplyLayout が記録 frame へ復元する。
+                frame = found.window.frame
+                log("bind (display disconnected): kept frame, window left as-is")
+            } else {
+                // 保存時と画面構成が違っていても、最初の復元から現在のコンテンツ領域内へ収める。
+                // 退避先も窓のディスプレイの隅。
+                let recorded = clamped(found.window.frame, for: found.window)
+                let outcome = try await place(
+                    windowID: windowID, frame: recorded, intoActive: intoActive,
+                    parkPoint: parkPoint(for: found.window))
+                switch outcome {
+                case .placed(let actual):
+                    frame = actual
+                case .unreached:
+                    // 復元では保存済みレイアウトこそ守るべき値。実窓は後の reconcile / スナップバックが寄せる。
+                    frame = recorded
+                case .parked:
+                    frame = recorded
+                }
             }
             // await をまたいだので引き直す(解除されていれば unknownWindow)。
             guard let location = windowLocation(of: id) else { throw EngineError.unknownWindow(id) }
@@ -324,7 +331,8 @@ public final class TabEngine {
             } else if let title {
                 state.tabs[location.tabIndex].windows[location.windowIndex].identity.title = title
             }
-            if intoActive {
+            if intoActive || isDisplayDisconnected(currentTab.windows[location.windowIndex]) {
+                // 切断退避中は park していない(op を出していない)ので、非アクティブでもフラグは立てない。
                 parkedWindowIDs.remove(id)
             } else {
                 parkedWindowIDs.insert(id)
@@ -477,10 +485,11 @@ public final class TabEngine {
             guard found.tab.layout == .free else {
                 throw EngineError.frameManagedByLayout(tabID: found.tab.id)
             }
-            let frame = clamped(frame, for: found.window)
+            // 切断退避中は要求値をそのまま記録して IPC しない(clamp すると主の座標に化ける)。
+            let frame = isDisplayDisconnected(found.window) ? frame : clamped(frame, for: found.window)
             cancelPendingRestore(id)
             guard let windowID = found.window.windowID, !parkedWindowIDs.contains(id),
-                found.tab.id == state.activeTabID
+                found.tab.id == state.activeTabID, !isDisplayDisconnected(found.window)
             else {
                 updateFrame(id, frame)
                 return frame
@@ -534,6 +543,7 @@ public final class TabEngine {
         for tab in state.tabs {
             for window in tab.windows {
                 guard let windowID = window.windowID, let pid = window.pid else { continue }  // 未復元は対象外
+                guard !isDisplayDisconnected(window) else { continue }  // 切断退避(frame 凍結・op なし)
                 if tab.id == tabID {
                     // 既にアクティブなタブの窓には触らない。ドラッグ中の一時 frame を読み戻して
                     // 「到達 frame」として採用してしまうのを避けるため(ずれはスナップバックが直す)。
@@ -585,8 +595,11 @@ public final class TabEngine {
                 let isActive = tab.id == state.activeTabID
                 let desired = desiredFrames(for: tab)
                 for window in tab.windows {
-                    // 非アクティブ窓も論理 frame を現在の画面構成へ更新する。更新しないと、画面切断後に
-                    // そのタブを表示せず解除・削除・終了した際、旧画面の座標へ復元してしまう。
+                    // 切断退避中は論理 frame を凍結し op も出さない(段階 D3)。ここで clamp すると
+                    // 主ディスプレイの座標で保存され、再接続後に元の位置へ戻れなくなる(精査 High)。
+                    guard !isDisplayDisconnected(window) else { continue }
+                    // 接続中の窓は、非アクティブでも論理 frame を現在の画面構成へ更新する。更新しないと、
+                    // 画面リサイズ後にそのタブを表示せず解除・削除・終了した際、旧座標へ復元してしまう。
                     let target = desired[window.id] ?? clamped(window.frame, for: window)
                     if target != window.frame { updateFrame(window.id, target) }
                     guard let windowID = window.windowID, let pid = window.pid else { continue }
@@ -630,6 +643,10 @@ public final class TabEngine {
         let managed = found.window
         // 退避操作そのものが通知を発火させる。退避中の通知は編集モードでも記録しない。
         guard !parkedWindowIDs.contains(managed.id), found.tab.id == state.activeTabID else { return }
+        // 切断退避中はスナップバックも記録もしない(段階 D3)。編集モードの例外は設けない:
+        // OS による移動(切断時の退避)とユーザーのドラッグは通知からは区別できず、遅延して届いた
+        // OS 移動の通知 1 発で凍結 frame が上書きされてしまう。位置を変えたい場合は解除→再登録。
+        guard !isDisplayDisconnected(managed) else { return }
         // 通常モードは静止後に復元、編集モードは静止後に記録(どちらもデバウンス。ドラッグ中は触らない)。
         scheduleRestore(managed.id, attempt: 1)
     }
@@ -695,6 +712,9 @@ public final class TabEngine {
             let recorded = found.window.frame
             // 自分の reapply 等で既に記録値へ到達した通知は、編集モードでも所属変更として扱わない。
             if approximatelyEqual(current, recorded) { return }
+            // 切断退避中は復元も記録もしない(段階 D3、windowFrameDidChange と同じ理由。
+            // 予約後に切断された場合もここで止まる)。
+            guard !isDisplayDisconnected(found.window) else { return }
             // 編集モードで記録するのは free のタブだけ。columns では列が唯一の正なので、
             // ドラッグは編集モードでも常にスナップバックさせる(記録すると列と記録がずれたまま残る)。
             if editMode, found.tab.layout == .free {
@@ -812,6 +832,8 @@ public final class TabEngine {
                 let isActive = tab.id == state.activeTabID
                 for window in tab.windows {
                     guard let windowID = window.windowID, let pid = window.pid else { continue }
+                    // 切断退避中は補正しない(park 再試行・ずれ検知・フラグ修復すべて対象外。段階 D3)。
+                    guard !isDisplayDisconnected(window) else { continue }
                     let flagged = parkedWindowIDs.contains(window.id)
                     let current = frames[window.id]
                     if isActive, flagged {
@@ -986,8 +1008,12 @@ public final class TabEngine {
                 cancelPendingRestore(result.op.managedID)
             case .restore(let requested, _):
                 parkedWindowIDs.remove(result.op.managedID)
-                if let actual = result.actual, !approximatelyEqual(actual, requested) {
+                if let actual = result.actual, !approximatelyEqual(actual, requested),
+                    let found = state.managedWindow(id: result.op.managedID),
+                    !isDisplayDisconnected(found.window)
+                {
                     // 自分の操作なのでユーザー操作との競合はない。相手アプリの制約として到達 frame を採用する。
+                    // op の IPC 中にディスプレイが切断された場合だけは採用しない(凍結の保険。段階 D3)。
                     updateFrame(result.op.managedID, actual)
                     log("adopting \(actual) for \(result.op.managedID) (requested \(requested))")
                 }
@@ -1006,6 +1032,12 @@ public final class TabEngine {
         var ops: [WindowOp] = []
         for window in windows {
             cancelPendingRestore(window.id)
+            // 切断退避中は frame を凍結して op も出さず、退避フラグだけ畳んで手放す(段階 D3)。
+            // 実窓は macOS が置いた場所のまま。次回起動・再接続時の復元材料として記録座標を残す。
+            if isDisplayDisconnected(window) {
+                parkedWindowIDs.remove(window.id)
+                continue
+            }
             // 画面変更通知の 1 秒デバウンスより先に解除・終了されても、切断済み画面へ戻さない。
             let target = desired[window.id] ?? clamped(window.frame, for: window)
             if target != window.frame { updateFrame(window.id, target) }
@@ -1106,8 +1138,26 @@ public final class TabEngine {
     // MARK: - ディスプレイ(段階 D)
 
     /// 窓が属するディスプレイ。未記録(nil = v1 データ)や切断中は主ディスプレイに fallback する。
+    /// 注意: 呼び手は先に isDisplayDisconnected を確認すること。ここでの主 fallback が正当なのは
+    /// nil(= 主の意味)の場合だけで、切断中の窓に使うと「主の領域へ clamp」してしまう。
     private func display(for window: ManagedWindow) -> DisplayLayout? {
         layout.display(id: window.displayID) ?? layout.primaryDisplay
+    }
+
+    /// 窓のディスプレイが「記録されているのに現在接続されていない」か(v3 段階 D3 = 切断退避)。
+    /// nil(v1 データ = 主ディスプレイの意味)は切断扱いにしない。
+    ///
+    /// 切断中の窓は記録 frame / displayID を**凍結**し、**op を一切発行しない**(park / restore /
+    /// retile / snapback すべて)。op を出すと macOS が生きている画面へ clamp した結果を
+    /// 採用経路(apply / releaseAll / performRestore)が記録へ書き戻してしまうため、
+    /// clamp の抑止だけでは足りない。実窓は macOS が置いた場所に放置し、bind・生存管理・focus 追跡は
+    /// 続ける。再接続後は displays が毎回再計算されるため、次の reapplyLayout の通常経路が
+    /// 記録 frame へ復元する(ディスプレイ集合の差分検知は不要)。
+    /// 編集モードでも例外は設けない(OS 移動とユーザードラッグを通知から区別できないため)。
+    /// 切断中の窓を別の場所で管理し直したい場合は、解除して登録し直す。
+    private func isDisplayDisconnected(_ window: ManagedWindow) -> Bool {
+        guard let id = window.displayID else { return false }
+        return layout.display(id: id) == nil
     }
 
     /// 窓の所属ディスプレイ用に計算済みの安全な退避先。通常は同じ画面の右下隅だが、
@@ -1126,16 +1176,19 @@ public final class TabEngine {
     /// columns はディスプレイごとにグループ化して、それぞれのコンテンツ領域内で等分する(段階 D)。
     /// columns では未復元(unbound)の窓は列数に入らず、エントリも返らない(呼び手が記録 frame に fallback)。
     private func desiredFrames(for tab: Tab) -> [UUID: CGRect] {
+        // 切断退避中の窓は対象外(frame 凍結、columns では列数にも入れない)。エントリを返さないだけでなく、
+        // 呼び手側も fallback の clamp を踏まないよう isDisplayDisconnected でスキップすること。
+        let windows = tab.windows.filter { !isDisplayDisconnected($0) }
         switch tab.layout {
         case .free:
             // 壊れた state.json で UUID が重複していてもクラッシュさせない(先勝ち)。
             return Dictionary(
-                tab.windows.map { ($0.id, clamped($0.frame, for: $0)) },
+                windows.map { ($0.id, clamped($0.frame, for: $0)) },
                 uniquingKeysWith: { first, _ in first })
         case .columns:
             var frames: [UUID: CGRect] = [:]
             // Dictionary(grouping:) はグループ内の順序を保つので、列順 = 一覧順が画面ごとに維持される。
-            let groups = Dictionary(grouping: tab.windows) { display(for: $0)?.id ?? "" }
+            let groups = Dictionary(grouping: windows) { display(for: $0)?.id ?? "" }
             for (_, windows) in groups {
                 guard let area = windows.first.flatMap({ display(for: $0)?.contentArea }) else { continue }
                 frames.merge(Tiler.columnFrames(for: windows, in: area)) { current, _ in current }

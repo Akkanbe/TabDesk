@@ -74,6 +74,10 @@ final class SidebarPanel: NSPanel {
 
     @objc private func screenParametersChanged() {
         reposition()
+        // 「(別ディスプレイ待機)」表示は state 外(接続中ディスプレイ集合)に依存するので、
+        // 画面構成が変わったら差分キャッシュを捨てて描き直す。
+        lastRendered = nil
+        render()
     }
 
     // MARK: - UI 構築
@@ -221,10 +225,13 @@ final class SidebarPanel: NSPanel {
         if let active = state.activeTab {
             windowsHeader.stringValue = "\(active.name) のウィンドウ(\(active.windows.count))"
                 + (active.layout == .columns ? " — 縦に等分割" : "")
+            // 切断退避(displayID があるのに接続中の画面に無い)を行の表示に反映する。
+            let connected = Set(manager.layout.displays.map(\.id))
             for (index, window) in active.windows.enumerated() {
                 let row = WindowRowView(
                     window: window,
-                    canMoveUp: index > 0, canMoveDown: index < active.windows.count - 1)
+                    canMoveUp: index > 0, canMoveDown: index < active.windows.count - 1,
+                    isDisplayDisconnected: window.displayID.map { !connected.contains($0) } ?? false)
                 row.onRemove = { [weak self] in self?.unregister(window.id) }
                 row.onMove = { [weak self] offset in self?.moveWindow(window.id, offset: offset) }
                 row.onAssignRequested = { [weak self, weak row] in
