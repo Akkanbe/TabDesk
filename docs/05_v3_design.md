@@ -122,5 +122,6 @@ ScreenCaptureKit は TabDesk モジュールの 1 ファイルに隔離。
 - UI: タブ行の名前の下に高さ 64px(右横では行幅 200px 級に対して小さすぎる)。OFF 時は従来と同一
 - 権限 UX: アクセシビリティと同型の第 2 バナー(`CGPreflightScreenCaptureAccess` 判定、
   Privacy_ScreenCapture への deep link)。有効化時に `CGRequestScreenCaptureAccess()`。
-  Info.plist に `NSScreenCaptureUsageDescription` を追加
+  Info.plist の purpose-string は**追加しない**: macOS の画面収録 TCC に対応する purpose-string
+  キーは存在せず(NSScreenCaptureUsageDescription を tccd は読まない)、ダイアログ文言はシステム固定
 - サムネイルはセッション内のみ(永続化しない。次回起動時は切替のたびに埋まっていく)

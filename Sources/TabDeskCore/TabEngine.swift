@@ -28,6 +28,8 @@ public final class TabEngine {
 
     public struct SwitchReport: Sendable {
         public let tabID: UUID
+        /// 切替前にアクティブだったタブ(直列区間内で確定した値。サムネイル撮影の対象決定に使う)。
+        public let previousActiveTabID: UUID?
         public let operationCount: Int
         public let durationMs: Double
         public let failures: [OperationFailure]
@@ -499,8 +501,10 @@ public final class TabEngine {
             // 切断退避中は要求値をそのまま記録して IPC しない(clamp すると主の座標に化ける)。
             let frame = isDisplayDisconnected(found.window) ? frame : clamped(frame, for: found.window)
             cancelPendingRestore(id)
+            // フルスクリーン中も記録のみ(段階 2 の他経路と同じ: 論理配置は更新し、IPC は出さない。
+            // 出すと書き込みが飲み込まれ、読み戻したフルスクリーン寸法を記録してしまう)。
             guard let windowID = found.window.windowID, !parkedWindowIDs.contains(id),
-                found.tab.id == state.activeTabID, !isDisplayDisconnected(found.window)
+                found.tab.id == state.activeTabID, !opsSuppressed(for: found.window)
             else {
                 updateFrame(id, frame)
                 return frame
@@ -547,6 +551,7 @@ public final class TabEngine {
     @discardableResult
     private func activateUnlocked(_ tabID: UUID) async throws -> SwitchReport {
         let target = try tab(tabID)
+        let previousActive = state.activeTabID
         let alreadyActive = tabID == state.activeTabID
         let desired = desiredFrames(for: target)
         var parks: [WindowOp] = []
@@ -590,7 +595,9 @@ public final class TabEngine {
         }
         log("activate \(target.name): \(ops.count) ops in \(String(format: "%.1f", elapsed)) ms" +
             (failures.isEmpty ? "" : "; failures: \(failures.map(\.message))"))
-        return SwitchReport(tabID: tabID, operationCount: ops.count, durationMs: elapsed, failures: failures)
+        return SwitchReport(
+            tabID: tabID, previousActiveTabID: previousActive,
+            operationCount: ops.count, durationMs: elapsed, failures: failures)
     }
 
     // MARK: - レイアウトの再適用
@@ -721,7 +728,8 @@ public final class TabEngine {
         // フルスクリーンも同じバッチで読む: 進入の resize 通知は次の reconcile より先に届くため、
         // ここで検出しないと「3 回試行 → フルスクリーン寸法を採用」の破壊が起きる(段階 2)。
         guard let probed = try? await executor.run({
-            (frame: try driver.frame(of: windowID), fullscreen: (try? driver.isFullscreen(of: windowID)) ?? false)
+            (frame: try driver.frame(of: windowID),
+                fullscreen: (try? driver.isFullscreen(of: windowID)) ?? nil)  // nil = 判定不能
         }) else { return }
         let current = probed.frame
         guard isLatest(id, generation) else { return }  // IPC 中に新しい通知や setFrame が入った
@@ -732,12 +740,14 @@ public final class TabEngine {
                 let found = state.managedWindow(id: id), !parkedWindowIDs.contains(id),
                 found.tab.id == state.activeTabID
             else { return }
-            if probed.fullscreen {
+            if probed.fullscreen == true {
                 if fullscreenWindowIDs.insert(id).inserted {
                     log("fullscreen: \(found.window.identity.appName) entered; suspending ops")
                 }
                 return  // 復元しない・採用しない(解除は reconcile が検出して自動復帰)
             }
+            // 判定不能(nil)でメンバー中なら手を出さない(誤復元 → フルスクリーン寸法採用の破壊を防ぐ)。
+            if probed.fullscreen == nil, fullscreenWindowIDs.contains(id) { return }
             let recorded = found.window.frame
             // 自分の reapply 等で既に記録値へ到達した通知は、編集モードでも所属変更として扱わない。
             if approximatelyEqual(current, recorded) { return }
@@ -848,10 +858,17 @@ public final class TabEngine {
             // フルスクリーン集合を一括読み取りの結果で更新する(op ループより先に。段階 2)。
             // 読めなかった窓は前回の判定を維持する(判断材料が無いのに解除すると op を出してしまう)。
             for (id, obs) in observed {
-                if obs.isFullscreen, fullscreenWindowIDs.insert(id).inserted {
-                    log("fullscreen: \(id) entered; suspending ops")
-                } else if !obs.isFullscreen, fullscreenWindowIDs.remove(id) != nil {
-                    log("fullscreen: \(id) exited; resuming management")
+                switch obs.isFullscreen {
+                case true?:
+                    if fullscreenWindowIDs.insert(id).inserted {
+                        log("fullscreen: \(id) entered; suspending ops")
+                    }
+                case false?:
+                    if fullscreenWindowIDs.remove(id) != nil {
+                        log("fullscreen: \(id) exited; resuming management")
+                    }
+                case nil:
+                    break  // 判定不能: 前回のメンバーシップを維持(誤って外すと復元リトライが破壊する)
                 }
             }
             var retiledWindowIDs: Set<UUID> = []
@@ -907,7 +924,8 @@ public final class TabEngine {
 
     struct ObservedWindowState: Sendable {
         let frame: CGRect
-        let isFullscreen: Bool
+        /// nil = 判定不能(前回のフルスクリーン判定を維持する)。
+        let isFullscreen: Bool?
     }
 
     /// 紐付いている全窓の現在 frame とフルスクリーン状態を読む。読み取りは pid ごとに並列(ロックの外で呼ぶこと)。
@@ -925,7 +943,8 @@ public final class TabEngine {
                     await executor.run {
                         windows.compactMap { window -> (UUID, ObservedWindowState)? in
                             guard let wid = window.windowID, let current = try? driver.frame(of: wid) else { return nil }
-                            let fullscreen = (try? driver.isFullscreen(of: wid)) ?? false  // 読めなければ fail-open
+                            // nil(読めない)は nil のまま運ぶ(false に潰さない — 呼び手が前回判定を維持する)。
+                            let fullscreen = (try? driver.isFullscreen(of: wid)) ?? nil
                             return (window.id, ObservedWindowState(frame: current, isFullscreen: fullscreen))
                         }
                     }

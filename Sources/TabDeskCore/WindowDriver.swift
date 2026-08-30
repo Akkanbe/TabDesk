@@ -15,9 +15,10 @@ public protocol WindowDriver: Sendable {
     func setPosition(_ point: CGPoint, of windowID: CGWindowID) throws
     func raise(_ windowID: CGWindowID) throws
     /// ネイティブフルスクリーン中か(v3 段階 2)。ウィンドウが消えていれば throw。
-    /// フルスクリーン中の窓はエンジンが操作対象から外す(setFrame/setPosition が効かず、
-    /// 復元リトライが最終的にフルスクリーン寸法を基準として採用してしまうため)。
-    func isFullscreen(of windowID: CGWindowID) throws -> Bool
+    /// **nil = 判定不能**(属性が読めない・タイムアウト)。呼び手は nil を「前回の判定を維持」と
+    /// 扱うこと — false に潰すと、忙しいアプリの一時的な読み取り失敗でフルスクリーン集合から
+    /// 誤って外れ、復元リトライがフルスクリーン寸法を採用する破壊が再発する(v3 レビュー指摘)。
+    func isFullscreen(of windowID: CGWindowID) throws -> Bool?
 }
 
 public enum WindowDriverError: Error, CustomStringConvertible, Sendable {
@@ -78,7 +79,7 @@ public final class AXWindowDriver: WindowDriver {
         try window(windowID).raise()
     }
 
-    public func isFullscreen(of windowID: CGWindowID) throws -> Bool {
-        try window(windowID).isFullscreen  // 属性が読めない場合は false(fail-open。実測記録は docs/04)
+    public func isFullscreen(of windowID: CGWindowID) throws -> Bool? {
+        try window(windowID).fullscreenRaw  // nil = 属性が読めない(呼び手が前回判定を維持する)
     }
 }

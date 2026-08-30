@@ -147,6 +147,56 @@ struct FullscreenTests {
         #expect(driver.currentFrame(1) == fullscreenRect)
     }
 
+    /// AXFullScreen の読み取り失敗(nil)はメンバーシップを維持し、復元も採用もしない(レビュー指摘)。
+    /// false に潰すと、忙しいアプリの一時的なタイムアウト 1 回で集合から外れ、直後の即時復元が
+    /// 飲み込まれてフルスクリーン寸法を記録に採用してしまう。
+    @Test func unreadableFullscreenProbeKeepsMembershipAndFrames() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let b = engine.createTab(name: "B")
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: recorded)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("b"), frame: recorded, into: b.id)
+        #expect(engine.parkedWindowIDs.contains(managed.id), "非アクティブ登録で退避フラグが立つ")
+
+        driver.setFullscreen(1)
+        driver.moveExternally(1, to: fullscreenRect)
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        // タブを表示(fullscreen 窓は復元 op を出さないので退避フラグは残る = 危険な組み合わせ)。
+        try await engine.activate(b.id)
+        #expect(engine.parkedWindowIDs.contains(managed.id))
+
+        driver.setFullscreenReadFails(1)
+        let writesBefore = driver.callCount("setFrame") + driver.callCount("setPosition")
+        for _ in 0..<3 {
+            await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+        }
+        #expect(engine.fullscreenWindowIDs.contains(managed.id), "読めない間は前回判定を維持")
+        #expect(driver.callCount("setFrame") + driver.callCount("setPosition") == writesBefore, "op を出さない")
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == recorded, "記録 frame を破壊しない")
+    }
+
+    /// setFrame はフルスクリーン中、記録のみ更新して IPC を出さない(レビュー指摘: ゲート漏れの回帰)。
+    @Test func setFrameRecordsOnlyWhileFullscreen() async throws {
+        let (engine, driver) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        driver.add(1, frame: CGRect(x: 300, y: 100, width: 500, height: 400))
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: CGRect(x: 300, y: 100, width: 500, height: 400), into: tab.id)
+        driver.setFullscreen(1)
+        driver.moveExternally(1, to: fullscreenRect)
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+
+        let requested = CGRect(x: 400, y: 200, width: 600, height: 500)
+        let writesBefore = driver.callCount("setFrame")
+        let result = try await engine.setFrame(requested, of: managed.id)
+        #expect(result == requested, "clamp 済み要求値が記録される")
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == requested)
+        #expect(driver.callCount("setFrame") == writesBefore, "IPC は出さない(飲み込まれた読み戻し値を記録しない)")
+        #expect(driver.currentFrame(1) == fullscreenRect)
+    }
+
     /// reconcile はフルスクリーンの出入りに追従して集合を更新する。
     @Test func reconcileRefreshesFullscreenMembership() async throws {
         let (engine, driver) = makeEngine()

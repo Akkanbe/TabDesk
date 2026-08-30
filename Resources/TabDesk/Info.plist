@@ -24,8 +24,6 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>NSScreenCaptureUsageDescription</key>
-	<string>タブ切替時にウィンドウのサムネイルを撮影するために使用します。</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>CFBundleURLTypes</key>

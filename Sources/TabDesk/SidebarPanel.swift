@@ -597,6 +597,8 @@ private final class FlippedClipView: NSClipView {
 private final class SidebarResizeHandle: NSView {
     var onDrag: ((CGFloat) -> Void)?
     var onCommit: (() -> Void)?
+    /// 掴んだ点と右端の相対位置。保持しないとドラッグ開始時に最大 8px(ハンドル幅ぶん)跳ねる。
+    private var grabOffset: CGFloat = 0
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -611,14 +613,16 @@ private final class SidebarResizeHandle: NSView {
         NSCursor.resizeLeftRight.set()
     }
 
-    // 空実装でイベントを受け取り、以降の mouseDragged / mouseUp がこのビューへ届くようにする
+    // イベントを受け取り、以降の mouseDragged / mouseUp がこのビューへ届くようにする
     // (responder chain へ流すとパネル移動などの既定処理に化けうる)。
-    override func mouseDown(with event: NSEvent) {}
+    override func mouseDown(with event: NSEvent) {
+        grabOffset = (window?.frame.maxX ?? 0) - NSEvent.mouseLocation.x
+    }
 
     override func mouseDragged(with event: NSEvent) {
         guard let window else { return }
-        // 希望幅 = マウスの画面 x − パネル左端(Cocoa 座標だが x はそのまま使える)。
-        onDrag?(NSEvent.mouseLocation.x - window.frame.minX)
+        // 希望幅 = (マウスの画面 x + 掴みオフセット) − パネル左端(Cocoa 座標だが x はそのまま使える)。
+        onDrag?(NSEvent.mouseLocation.x + grabOffset - window.frame.minX)
     }
 
     override func mouseUp(with event: NSEvent) {

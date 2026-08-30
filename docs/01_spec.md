@@ -265,7 +265,8 @@ v2 の保留分:
 - [x] アプリ名: **TabDesk**(GitHub: https://github.com/Akkanbe/TabDesk、bundle ID: `io.github.akkanbe.tabdesk`)
 - [x] ホットキーのデフォルト割当: Ctrl+Option+1〜9(タブ切替)、Ctrl+Tab / Ctrl+Shift+Tab(順送り/逆送り。
       2026-08-26 追加。グローバル捕捉のため他アプリの Ctrl+Tab と競合する点は README に明記)、
-      Ctrl+Option+R(フォーカス窓を登録)、Ctrl+Option+E(編集モード)。
+      Ctrl+Option+R(フォーカス窓を登録)、Ctrl+Option+E(編集モード)、
+      Ctrl+Option+S(サイドバー折りたたみ。2026-08-30 追加)。
       `~/Library/Application Support/TabDesk/hotkeys.json` で変更可(キーが無い項目は既定値、null は割り当てなし)
 - [x] サイドバーの幅・自動非表示オプションの要否 → **要**と決定(2026-08-29)。幅変更と全体の
       折りたたみを v3 で実装する(§5 v3)。「常に最前面」の ON/OFF はメニューバーから切替可能(既定 ON)

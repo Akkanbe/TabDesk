@@ -378,18 +378,19 @@ final class WindowManager {
     }
 
     /// 切替中に届いたフォーカス通知を、最も外側の切替が完了するまで保留する。
-    private func performFocusSwitch(_ operation: () async throws -> Void) async throws {
+    private func performFocusSwitch(_ operation: () async throws -> TabEngine.SwitchReport?) async throws {
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
-        let outgoing = engine.state.activeTabID
         focusSwitchDepth += 1
         defer {
             focusSwitchDepth -= 1
             if focusSwitchDepth == 0 { schedulePendingFocusFollow() }
         }
-        try await operation()
+        let report = try await operation()
         // タブが実際に替わったら、離れたタブの代表窓を撮影する(v3 段階 5。無効時は Store 側で即 return)。
+        // 「離れたタブ」は直列区間内で確定した report の値を使う(切替連打時、入口で読んだ
+        // activeTabID は待ち行列の間に古くなり、間のタブの撮影が抜けるため)。
         // desktopIndependentWindow キャプチャは退避中の窓も撮れるので、切替完了後の撮影でよい。
-        if let outgoing, outgoing != engine.state.activeTabID,
+        if let report, let outgoing = report.previousActiveTabID, outgoing != report.tabID,
             let tab = engine.state.tab(withID: outgoing),
             let window = tab.representativeWindow, let windowID = window.windowID
         {
@@ -805,8 +806,10 @@ final class WindowManager {
                 guard generation == self.layoutChangeGeneration, !self.isTerminating else { return }
             }
             self.engine.endLayoutTransition()
-            self.onContentAreaChanged?()  // 権限が無くても枠などの描画は追従させる
         }
+        // 枠などの描画は同期で即追従させる(rebuild は live な幅プロバイダを読む冪等処理なので
+        // reapply の完了を待つ必要が無く、直後の画面変更通知に Task が世代負けしても取り残されない)。
+        onContentAreaChanged?()
     }
 
     /// 画面変更・復帰は短時間に連発するので 1 秒でまとめてから再適用する。
@@ -864,13 +867,19 @@ final class WindowManager {
     /// Space 切替のたびに全アプリへの AX 列挙が 2 回(リトライ込み)走り続けるのを防ぐ。
     static let spaceRestoreCooldown: Duration = .seconds(15)
     private var lastSpaceTriggeredRestore: ContinuousClock.Instant?
+    private var spaceRestoreRetryTask: Task<Void, Never>?
 
     /// Space の切替で、フルスクリーン解除後などに登録可能になった未復元窓を再照合する。
     @objc private func activeSpaceDidChange(_ notification: Notification) {
         // 権限取得前に初回復元を消化すると、後から権限を付けても緩め照合を再実行できなくなる。
         guard isTrusted, !isTerminating, engine.state.allWindows.contains(where: { !$0.isBound }) else { return }
         let now = ContinuousClock.now
-        if let last = lastSpaceTriggeredRestore, now - last < Self.spaceRestoreCooldown { return }
+        if let last = lastSpaceTriggeredRestore, now - last < Self.spaceRestoreCooldown {
+            // イベントを「落とす」と、クールダウン中のフルスクリーン解除がいつまでも再照合されない
+            // (解除後は on-screen 集合も変わらず becameVisible も発火しない)。期限に 1 回だけ追走する。
+            scheduleSpaceRestoreRetry(after: Self.spaceRestoreCooldown - (now - last))
+            return
+        }
         lastSpaceTriggeredRestore = now
         strictRestorePending = true
         if initialRestoreDone {
@@ -878,6 +887,19 @@ final class WindowManager {
         } else {
             // 初回復元中なら pending を保持し、完了時の defer から厳格照合を追走させる。
             startInitialRestoreIfNeeded()
+        }
+    }
+
+    /// クールダウン中に落とした Space イベントの一発追走。期限が来たら通常の入口を通し直す
+    /// (未復元が解消済みなら入口の guard で自然に何もしない)。多重予約はしない。
+    private func scheduleSpaceRestoreRetry(after delay: Duration) {
+        guard spaceRestoreRetryTask == nil else { return }
+        spaceRestoreRetryTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self else { return }
+            self.spaceRestoreRetryTask = nil
+            guard !Task.isCancelled, !self.isTerminating else { return }
+            self.activeSpaceDidChange(Notification(name: NSWorkspace.activeSpaceDidChangeNotification))
         }
     }
 }
