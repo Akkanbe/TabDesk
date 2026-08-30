@@ -93,6 +93,17 @@ ScreenCaptureKit は TabDesk モジュールの 1 ファイルに隔離。
 - 既知の非対称: clamp は位置しか動かさないので、狭めた/畳んだとき free の窓は空いた領域へ
   **広がらない**(columns は追従する)。広げたときは free の窓も押し出される
 
-## 段階4 の判断(実装時に追記)
+## 段階4 の判断(2026-08-30 実装): 背景「枠」ウィンドウ
+
+- `FrameWindowController` がディスプレイごとに 1 枚、contentArea を覆う borderless ウィンドウを敷く
+  (`[DisplayID: NSWindow]` — v4 のディスプレイごとサイドバーの下敷きを兼ねる構造)
+- レベルは `.normal - 1`(全アプリの窓の背後、デスクトップの手前)。**`ignoresMouseEvents = true` は必須**
+  (無いと窓の隙間のクリックを枠が奪う)。canJoinAllSpaces + stationary + fullScreenAuxiliary
+- 座標は `ScreenGeometry.axRect(fromCocoa:)` の自己逆変換で AX → Cocoa(手書きの反転はしない)
+- 再構築の契機: 画面構成変更通知+段階 3 の `onContentAreaChanged`(幅変更・折りたたみ)
+- **既定 OFF**: 明示登録制では未登録の窓が枠の上に浮くため「容れ物」の錯視が弱く、
+  アップデートで突然見た目が変わるのも避ける。メニュー「背景の枠を表示」でワンクリック ON。
+  実運用の感触で既定を再検討する
+- 見た目は角丸 10 + underPageBackgroundColor 50% + separatorColor 1px(実機で微調整前提)
 
 ## 段階5 の判断(実装時に追記)

@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var loginItemMenuItem: NSMenuItem?
     private var sidebarCollapseMenuItem: NSMenuItem?
+    private var frameWindows: FrameWindowController?
     private var probeWindow: NSWindow?
     private lazy var hotkeys = HotkeyCenter(logger: logger)
 
@@ -22,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // メニューの「常に最前面」表示はサイドバーの実状態から作るので、サイドバーを先に用意する。
         let panel = SidebarPanel(manager: manager, logger: logger)
         sidebar = panel
+        frameWindows = FrameWindowController(manager: manager)
         installStatusItem(alwaysOnTop: panel.alwaysOnTop)
         panel.orderFrontRegardless()
         logger.log("sidebar shown at \(panel.frame)")
@@ -129,6 +131,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItemMenuItem = login
         updateLaunchAtLoginMenuItem()
         menu.addItem(login)
+        let frames = NSMenuItem(title: "背景の枠を表示", action: #selector(toggleFrameWindows(_:)), keyEquivalent: "")
+        frames.state = FrameWindowController.enabledSetting.value ? .on : .off
+        menu.addItem(frames)
         let urlCommands = NSMenuItem(title: "URL コマンドを許可(自動化用)", action: #selector(toggleURLCommands(_:)), keyEquivalent: "")
         urlCommands.state = Self.urlCommandsEnabled.value ? .on : .off
         menu.addItem(urlCommands)
@@ -176,6 +181,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Self.urlCommandsEnabled.value.toggle()
         sender.state = Self.urlCommandsEnabled.value ? .on : .off
         logger.log("urlCommandsEnabled=\(Self.urlCommandsEnabled.value)")
+    }
+
+    @objc private func toggleFrameWindows(_ sender: NSMenuItem) {
+        FrameWindowController.enabledSetting.value.toggle()
+        sender.state = FrameWindowController.enabledSetting.value ? .on : .off
+        frameWindows?.rebuild()
+        logger.log("frameWindowsEnabled=\(FrameWindowController.enabledSetting.value)")
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
