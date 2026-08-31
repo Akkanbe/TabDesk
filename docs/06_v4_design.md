@@ -49,8 +49,24 @@
 - 段階4: 選択ディスプレイ解決+ホットキー
 - 段階5: SidebarController(画面ごとサイドバー)+メトリクス+URL
 
-**過渡状態(段階2〜4)**: サイドバーは 1 本のままで、主ディスプレイ以外のアクティブ表示が
-正確でない。旧 activeTabID ミラーにより主画面は v3 同等に動く。段階5 で解消。
+## 段階4〜5 の記録(2026-08-31 実装)
+
+- 段階4: `SelectedDisplayResolver`(純関数)— TabDesk 前面(改名中)/前面 pid 一致なら
+  フォーカスキャッシュの画面、それ以外はマウスの画面 → 主。**非同期 AX は使わない**。
+  キャッシュはフォーカス通知で無料更新。前面化ルール(切替画面 == 選択画面のときだけ)適用。
+  Ctrl+Option+R はフォーカス窓の画面のアクティブタブへ(無ければ自動作成)
+- 段階5: `SidebarController` が `[DisplayID: SidebarPanel]` を所有(冪等 rebuild・パネル再利用・
+  切断で破棄)。単一スロットのコールバック(onStateChanged / thumbnails.onUpdated /
+  suppressAppActivation = 全パネル OR)と権限タイマー・画面変更 observer は controller が 1 つ持つ。
+  `onContentAreaChanged` は observer 配列に多重化(枠とサイドバーが購読)。
+  パネルは自画面のタブ+自画面のアクティブだけを描画し、「＋」は自画面にタブを作る。
+  タブの「上へ/下へ」は同一画面内の隣と入れ替え(グローバル index に写像)。
+  `SystemScreenLayout` は全画面から画面別実効幅を減算(プロバイダは `(DisplayID) -> CGFloat`)。
+  折りたたみキーは `SidebarCollapsed.<displayID>`(旧キーからシード)。
+  メニューの折りたたみ・ホットキー Ctrl+Option+S は選択中の画面のパネルに作用。
+  URL: `tab?name[&display=<index>]`、status は `actives=[name@display]` を出力
+
+(過渡状態の注記は解消済みのため削除)
 
 ## 段階1〜3 の記録(2026-08-31 実装)
 

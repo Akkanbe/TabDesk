@@ -84,15 +84,17 @@ public struct SystemScreenLayout: ScreenLayout {
     /// サイドバー幅は毎回読む(v3 段階 3: 幅変更・折りたたみに追従)。
     /// TabEngine は existential(any ScreenLayout)として独立コピーを持つため、
     /// 値を stored let で持つと変更が伝わらない — closure 越しの共有参照にするのが本質。
-    private let sidebarWidthProvider: @Sendable () -> CGFloat
+    /// v4 段階 5: 各画面にサイドバーが載るため、プロバイダは DisplayID を受け取る
+    /// (幅は共有・折りたたみは画面ごと、を呼び手が解決する)。
+    private let sidebarWidthProvider: @Sendable (DisplayID) -> CGFloat
 
-    public init(sidebarWidth: @escaping @Sendable () -> CGFloat) {
+    public init(sidebarWidth: @escaping @Sendable (DisplayID) -> CGFloat) {
         self.sidebarWidthProvider = sidebarWidth
     }
 
     /// 固定幅の互換 init(テスト・PoC 用)。
     public init(sidebarWidth width: CGFloat) {
-        self.sidebarWidthProvider = { width }
+        self.sidebarWidthProvider = { _ in width }
     }
 
     public var displays: [DisplayLayout] {
@@ -100,19 +102,17 @@ public struct SystemScreenLayout: ScreenLayout {
         let frames = screens.map { ScreenGeometry.fullFrameAX(of: $0) }
         // 退避点は画面配置を考慮して決める(配置の右端でない画面は自画面の隅だと窓が見え得る)。
         let parks = ScreenGeometry.parkPoints(forDisplayFrames: frames)
-        let sidebarWidth = sidebarWidthProvider()  // 幅は都度読む(折りたたみ・ドラッグ変更に追従)
         return screens.enumerated().map { index, screen in
+            // v4: すべての画面にサイドバーが載るので、各画面のコンテンツ領域から
+            // その画面の実効幅(共有幅 or 折りたたみ 16px)を除く。id を先に確定して幅を引く。
+            let id = ScreenGeometry.displayID(of: screen)
+            let sidebarWidth = sidebarWidthProvider(id)
             let visible = ScreenGeometry.visibleFrameAX(of: screen)
-            let content: CGRect
-            if index == 0 {
-                content = CGRect(
-                    x: visible.minX + sidebarWidth, y: visible.minY,
-                    width: visible.width - sidebarWidth, height: visible.height)
-            } else {
-                content = visible
-            }
+            let content = CGRect(
+                x: visible.minX + sidebarWidth, y: visible.minY,
+                width: visible.width - sidebarWidth, height: visible.height)
             return DisplayLayout(
-                id: ScreenGeometry.displayID(of: screen),
+                id: id,
                 frame: frames[index],
                 contentArea: content,
                 parkPoint: parks[index])

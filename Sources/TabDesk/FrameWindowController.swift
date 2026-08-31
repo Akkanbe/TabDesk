@@ -22,7 +22,7 @@ final class FrameWindowController: NSObject {
             self, selector: #selector(screenParametersChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
         // サイドバーの幅変更・折りたたみで contentArea が変わったら追従する(段階 3 のフック)。
-        manager.onContentAreaChanged = { [weak self] in self?.rebuild() }
+        manager.addContentAreaObserver { [weak self] in self?.rebuild() }
         rebuild()
     }
 

@@ -6,7 +6,7 @@ import TabDeskCore
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let logger = FileLogger(directoryName: "TabDesk", fileName: "tabdesk.log")
     private lazy var manager = WindowManager(logger: logger)
-    private var sidebar: SidebarPanel?
+    private var sidebars: SidebarController?
     private var statusItem: NSStatusItem?
     private var loginItemMenuItem: NSMenuItem?
     private var sidebarCollapseMenuItem: NSMenuItem?
@@ -20,13 +20,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         logger.log("TabDesk started. log: \(logger.fileURL.path) trusted=\(manager.isTrusted)")
-        // メニューの「常に最前面」表示はサイドバーの実状態から作るので、サイドバーを先に用意する。
-        let panel = SidebarPanel(manager: manager, logger: logger)
-        sidebar = panel
+        // v4: 各ディスプレイに 1 本のサイドバー。生成・破棄は SidebarController が持つ。
+        let controller = SidebarController(manager: manager, logger: logger)
+        sidebars = controller
         frameWindows = FrameWindowController(manager: manager)
-        installStatusItem(alwaysOnTop: panel.alwaysOnTop)
-        panel.orderFrontRegardless()
-        logger.log("sidebar shown at \(panel.frame)")
+        installStatusItem(alwaysOnTop: controller.alwaysOnTop)
+        controller.orderFrontAll()
         installHotkeys()
         if !manager.isTrusted {
             manager.requestPermission()
@@ -104,10 +103,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 Task { [manager = self.manager] in await manager.registerFocusedWindow() }
             case .toggleEditMode:
                 self.manager.engine.editMode.toggle()
-                self.sidebar?.render()
+                self.sidebars?.render()
                 self.logger.log("editMode=\(self.manager.engine.editMode) (hotkey)")
             case .toggleSidebar:
-                self.sidebar?.toggleCollapse()
+                // v4: 折りたたみは「選択中のディスプレイ」のパネルに作用する。
+                guard let displayID = self.manager.selectedDisplayID() else { return }
+                self.sidebars?.panel(for: displayID)?.toggleCollapse()
             }
         }
         hotkeys.reload()
@@ -121,7 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "サイドバーを表示", action: #selector(showSidebar), keyEquivalent: "")
         let collapse = NSMenuItem(title: "サイドバーを折りたたむ", action: #selector(toggleSidebarCollapsed(_:)), keyEquivalent: "")
-        collapse.state = manager.sidebarMetrics.isCollapsed ? .on : .off
+        collapse.state = menuCollapseState()
         sidebarCollapseMenuItem = collapse
         menu.addItem(collapse)
         let onTop = NSMenuItem(title: "サイドバーを常に最前面にする", action: #selector(toggleAlwaysOnTop(_:)), keyEquivalent: "")
@@ -162,19 +163,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 折りたたみもホットキー/サイドバー側で変わるので同様に同期する。
     func menuWillOpen(_ menu: NSMenu) {
         updateLaunchAtLoginMenuItem()
-        sidebarCollapseMenuItem?.state = manager.sidebarMetrics.isCollapsed ? .on : .off
+        sidebarCollapseMenuItem?.state = menuCollapseState()
     }
 
     @objc private func toggleSidebarCollapsed(_ sender: NSMenuItem) {
-        sidebar?.toggleCollapse()
-        sender.state = manager.sidebarMetrics.isCollapsed ? .on : .off
+        guard let displayID = manager.selectedDisplayID() else { return }
+        sidebars?.panel(for: displayID)?.toggleCollapse()
+        sender.state = menuCollapseState()
+    }
+
+    /// メニューのチェック状態は「選択中のディスプレイ」の折りたたみを映す(v4: 画面ごと)。
+    private func menuCollapseState() -> NSControl.StateValue {
+        guard let displayID = manager.selectedDisplayID() else { return .off }
+        return manager.sidebarMetrics(for: displayID).isCollapsed ? .on : .off
     }
 
     @objc private func toggleAlwaysOnTop(_ sender: NSMenuItem) {
-        guard let sidebar else { return }
-        sidebar.alwaysOnTop.toggle()
-        sender.state = sidebar.alwaysOnTop ? .on : .off
-        logger.log("alwaysOnTop=\(sidebar.alwaysOnTop)")
+        guard let sidebars else { return }
+        sidebars.alwaysOnTop.toggle()
+        sender.state = sidebars.alwaysOnTop ? .on : .off
+        logger.log("alwaysOnTop=\(sidebars.alwaysOnTop)")
     }
 
     @objc private func toggleFocusFollows(_ sender: NSMenuItem) {
@@ -201,7 +209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if enabled, !ThumbnailStore.hasPermission {
             CGRequestScreenCaptureAccess()
         }
-        sidebar?.refreshThumbnailPresentation()
+        sidebars?.refreshThumbnailPresentation()
         logger.log("tabThumbnailsEnabled=\(enabled) permission=\(ThumbnailStore.hasPermission)")
     }
 
@@ -273,8 +281,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showSidebar() {
-        sidebar?.reposition()
-        sidebar?.orderFrontRegardless()
+        sidebars?.rebuild()
+        sidebars?.orderFrontAll()
     }
 
     @objc private func openAccessibilitySettings() {
@@ -314,8 +322,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "status":
             let s = engine.state
             let unbound = s.allWindows.filter { !$0.isBound }
+            // v4: アクティブは画面ごと。"name@display" 形式で列挙する。
+            let actives = s.activeTabIDs
+                .map { key, id in "\(s.tab(withID: id)?.name ?? "?")@\(key)" }
+                .sorted()
             logger.log("status: trusted=\(manager.isTrusted) tabs=\(s.tabs.map { "\($0.name)(\($0.windows.count))" }) " +
-                "active=\(s.activeTab?.name ?? "-") parked=\(engine.parkedWindowIDs.count) unbound=\(unbound.count) " +
+                "actives=\(actives) parked=\(engine.parkedWindowIDs.count) unbound=\(unbound.count) " +
                 "fullscreen=\(engine.fullscreenWindowIDs.count) edit=\(engine.editMode) state=\(manager.store.fileURL.path)")
             for w in unbound {
                 logger.log("  unbound: \(w.identity.appName) | \(w.identity.title) id=\(w.id)")
@@ -330,7 +342,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         case "tab":
-            engine.createTab(name: q["name"] ?? "タブ\(engine.state.tabs.count + 1)")
+            // v4: display=<layout.displays の index> で作成先を指定できる。省略時は選択中の画面。
+            let displayID: DisplayID?
+            if let indexText = q["display"], let index = Int(indexText),
+                manager.layout.displays.indices.contains(index)
+            {
+                displayID = manager.layout.displays[index].id
+            } else {
+                displayID = manager.selectedDisplayID()
+            }
+            engine.createTab(name: q["name"] ?? "タブ\(engine.state.tabs.count + 1)", on: displayID)
         case "add":
             guard let wid = CGWindowID(q["wid"] ?? ""), let target = tab(named: q["tab"]) else {
                 logger.log("url: add needs wid=<available window id> [&tab=name]")
@@ -361,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         case "edit":
             engine.editMode = (q["on"] ?? "1") != "0"
-            sidebar?.render()
+            sidebars?.render()
             logger.log("editMode=\(engine.editMode)")
         case "restore":
             Task { [manager] in await manager.restoreUnboundWindows(strictness: (q["strict"] ?? "0") == "1" ? .strict : .lenient) }
@@ -398,8 +419,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 logger.log("screen '\(screen.localizedName)': frame=\(screen.frame) visible=\(screen.visibleFrame) " +
                     "scale=\(screen.backingScaleFactor) id=\(ScreenGeometry.displayID(of: screen))")
             }
-            if let sidebar {
-                logger.log("sidebar: cocoa=\(sidebar.frame) cg=\(cgBounds(CGWindowID(sidebar.windowNumber)).map { "\($0)" } ?? "?")")
+            for display in manager.layout.displays {
+                if let panel = sidebars?.panel(for: display.id) {
+                    logger.log("sidebar[\(display.id)]: cocoa=\(panel.frame) " +
+                        "cg=\(cgBounds(CGWindowID(panel.windowNumber)).map { "\($0)" } ?? "?")")
+                }
             }
             for display in manager.layout.displays {
                 logger.log("display \(display.id): frame(AX)=\(display.frame) content=\(display.contentArea) park=\(display.parkPoint)")

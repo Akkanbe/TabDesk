@@ -3,9 +3,6 @@ import ApplicationServices
 import AXShim
 import TabDeskCore
 
-/// サイドバー設定の共有実体(中身は UserDefaults)。SystemScreenLayout の幅プロバイダは
-/// MainActor 外(BlockingExecutor 上)からも呼ばれうるため、actor 非隔離のグローバルに置く。
-private let sidebarMetricsShared = SidebarMetrics()
 
 /// エンジンと macOS(AX 通知・NSWorkspace・ポーリング)をつなぐアプリ層のサービス。
 ///
@@ -15,13 +12,20 @@ final class WindowManager {
     static let reconcileInterval: TimeInterval = 2
 
     let engine: TabEngine
-    /// contentArea は実効サイドバー幅(折りたたみ・ドラッグ変更込み)に毎回追従する。
-    let layout = SystemScreenLayout(sidebarWidth: { sidebarMetricsShared.effectiveWidth })
-    var sidebarMetrics: SidebarMetrics { sidebarMetricsShared }
+    /// v4: 各画面のコンテンツ領域は「共有幅 or その画面の折りたたみ 16px」を都度読む。
+    /// SidebarMetrics の実体は UserDefaults(スレッドセーフ・register は冪等)なので、
+    /// MainActor 外のプロバイダ呼び出しでも毎回生成してよい。
+    let layout = SystemScreenLayout(sidebarWidth: { SidebarMetrics(displayID: $0).effectiveWidth })
+    func sidebarMetrics(for displayID: DisplayID) -> SidebarMetrics {
+        SidebarMetrics(displayID: displayID)
+    }
     /// タブサムネイル(v3 段階 5)。撮影はタブ切替時、キャッシュは tab.id キー。
     private(set) lazy var thumbnails = ThumbnailStore(logger: logger)
-    /// contentArea が変わる操作(幅変更・折りたたみ)の再適用が済んだあとのフック(段階 4 の枠が使う)。
-    var onContentAreaChanged: (@MainActor () -> Void)?
+    /// contentArea が変わる操作(幅変更・折りたたみ)の再適用後の通知先(枠と各サイドバーが購読する)。
+    private var contentAreaObservers: [@MainActor () -> Void] = []
+    func addContentAreaObserver(_ observer: @escaping @MainActor () -> Void) {
+        contentAreaObservers.append(observer)
+    }
     let store: StateStore
     /// Cmd-Tab 等で非アクティブタブの窓にフォーカスが移ったら、そのタブへ自動で切り替える(§3.6)。
     let focusFollows = PersistedToggle(key: "FocusFollowsWindow", defaultValue: true)
@@ -874,7 +878,7 @@ final class WindowManager {
         }
         // 枠などの描画は同期で即追従させる(rebuild は live な幅プロバイダを読む冪等処理なので
         // reapply の完了を待つ必要が無く、直後の画面変更通知に Task が世代負けしても取り残されない)。
-        onContentAreaChanged?()
+        for observer in contentAreaObservers { observer() }
     }
 
     /// 画面変更・復帰は短時間に連発するので 1 秒でまとめてから再適用する。

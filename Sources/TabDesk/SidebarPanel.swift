@@ -9,6 +9,10 @@ import TabDeskCore
 final class SidebarPanel: NSPanel {
     private let manager: WindowManager
     private let logger: FileLogger
+    /// このパネルが載るディスプレイ(v4: 各画面に 1 本)。
+    let displayID: DisplayID
+    /// 幅は全画面共有・折りたたみはこの画面専用(v4 段階 5)。
+    private let metrics: SidebarMetrics
 
     private let permissionBanner = NSStackView()
     private let capturePermissionBanner = NSStackView()
@@ -17,7 +21,6 @@ final class SidebarPanel: NSPanel {
     private let windowsStack = NSStackView()
     private let addWindowButton = NSButton(title: "＋ ウィンドウを追加", target: nil, action: nil)
     private let editModeCheck = NSButton(checkboxWithTitle: "編集モード(動かした位置を記憶)", target: nil, action: nil)
-    private var permissionTimer: Timer?
     /// 幅を変えられるように保持する(v3 段階 3。生成時の activate だけだと変更できない)。
     private var widthConstraint: NSLayoutConstraint?
     private var scrollView: NSScrollView?
@@ -36,12 +39,16 @@ final class SidebarPanel: NSPanel {
         }
     }
 
-    init(manager: WindowManager, logger: FileLogger) {
+    /// v4: パネルの生成・破棄・コールバック配線は SidebarController が所有する。
+    /// パネルは「1 画面ぶんの表示と操作」だけを持つ(タイマーや observer は持たない)。
+    init(manager: WindowManager, logger: FileLogger, displayID: DisplayID) {
         self.manager = manager
         self.logger = logger
+        self.displayID = displayID
+        self.metrics = manager.sidebarMetrics(for: displayID)
         self.alwaysOnTop = Self.alwaysOnTopSetting.value
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: manager.sidebarMetrics.effectiveWidth, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: metrics.effectiveWidth, height: 600),
             styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered, defer: false)
         level = alwaysOnTop ? .floating : .normal
@@ -57,21 +64,6 @@ final class SidebarPanel: NSPanel {
         contentView = buildContent()
         applyCollapsedAppearance()  // 前回終了時の折りたたみ状態を復元
         reposition()
-
-        manager.onStateChanged = { [weak self] _ in self?.render() }
-        // サムネイルは state 外のデータなので、撮影完了時は差分キャッシュを捨てて描き直す。
-        manager.thumbnails.onUpdated = { [weak self] _ in
-            self?.lastRendered = nil
-            self?.render()
-        }
-        // 改名中に切替先アプリを前面化するとサイドバーがキーを失い、編集が即終了してしまう。
-        manager.suppressAppActivation = { [weak self] in self?.isRenaming ?? false }
-        permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.updatePermissionBanner() }
-        }
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(screenParametersChanged),
-            name: NSApplication.didChangeScreenParametersNotification, object: nil)
         render()
         updatePermissionBanner()
     }
@@ -79,20 +71,24 @@ final class SidebarPanel: NSPanel {
     // MARK: - 配置
 
     func reposition() {
-        guard let screen = ScreenGeometry.primaryScreen else { return }
+        guard let screen = ScreenGeometry.screen(for: displayID) else { return }
         let visible = screen.visibleFrame
         setFrame(
             NSRect(x: visible.minX, y: visible.minY,
-                width: manager.sidebarMetrics.effectiveWidth, height: visible.height),
+                width: metrics.effectiveWidth, height: visible.height),
             display: true)
     }
 
-    @objc private func screenParametersChanged() {
+    /// 画面構成・contentArea の変化を controller から受ける(差分キャッシュも捨てる)。
+    func refreshAfterLayoutChange() {
         reposition()
-        // 「(別ディスプレイ待機)」表示は state 外(接続中ディスプレイ集合)に依存するので、
-        // 画面構成が変わったら差分キャッシュを捨てて描き直す。
         lastRendered = nil
         render()
+    }
+
+    /// 権限バナーの更新(controller の 1 秒タイマーから呼ばれる)。
+    func refreshPermissionBanners() {
+        updatePermissionBanner()
     }
 
     // MARK: - 幅変更・折りたたみ(v3 段階 3)
@@ -100,7 +96,7 @@ final class SidebarPanel: NSPanel {
     /// ドラッグ中のライブリサイズ(パネルと制約のみ動かす。窓のリフローは commit 時にまとめて)。
     /// ドラッグ中にホットキーで折りたたまれた場合は無視する(畳んだ 16px を広げ直さない)。
     private func previewResize(to width: CGFloat) {
-        guard !manager.sidebarMetrics.isCollapsed else { return }
+        guard !metrics.isCollapsed else { return }
         let clamped = min(max(width, SidebarMetrics.minWidth), SidebarMetrics.maxWidth)
         widthConstraint?.constant = clamped
         var f = frame
@@ -112,21 +108,21 @@ final class SidebarPanel: NSPanel {
     /// ドラッグ中に折りたたまれていたら保存しない(mouseUp は隠れたハンドルにも届くため、
     /// ここで frame.width=16 を保存すると設定済みの展開幅が minWidth に化ける)。
     private func commitResize() {
-        guard !manager.sidebarMetrics.isCollapsed else { return }
-        manager.sidebarMetrics.expandedWidth = frame.width
-        widthConstraint?.constant = manager.sidebarMetrics.effectiveWidth
+        guard !metrics.isCollapsed else { return }
+        metrics.expandedWidth = frame.width
+        widthConstraint?.constant = metrics.effectiveWidth
         reposition()
         manager.applySidebarWidthChange()
-        logger.log("sidebarWidth=\(Int(manager.sidebarMetrics.expandedWidth))")
+        logger.log("sidebarWidth=\(Int(metrics.expandedWidth))")
     }
 
     /// 折りたたみ切替(ヘッダの「«」/ 細いバーのクリック / ホットキー / メニュー共通の入口)。
     func toggleCollapse() {
-        manager.sidebarMetrics.isCollapsed.toggle()
+        metrics.isCollapsed.toggle()
         applyCollapsedAppearance()
         reposition()
         manager.applySidebarWidthChange()
-        logger.log("sidebarCollapsed=\(manager.sidebarMetrics.isCollapsed)")
+        logger.log("sidebarCollapsed=\(metrics.isCollapsed)")
     }
 
     @objc private func toggleCollapseAction() { toggleCollapse() }
@@ -134,11 +130,11 @@ final class SidebarPanel: NSPanel {
     /// 折りたたみ状態を見た目へ反映する。render() の state 差分とは独立に扱う
     /// (state が変わらなくても折りたたみは切り替わるため)。
     private func applyCollapsedAppearance() {
-        let collapsed = manager.sidebarMetrics.isCollapsed
+        let collapsed = metrics.isCollapsed
         scrollView?.isHidden = collapsed
         resizeHandle?.isHidden = collapsed
         expandButton?.isHidden = !collapsed
-        widthConstraint?.constant = manager.sidebarMetrics.effectiveWidth
+        widthConstraint?.constant = metrics.effectiveWidth
     }
 
     // MARK: - UI 構築
@@ -160,7 +156,7 @@ final class SidebarPanel: NSPanel {
         // NSClipView は既定で非 flipped(内容が短いと下寄せになる)ので flipped な ClipView を使う。
         // 長いタイトルの行が Auto Layout 経由でパネルごと広げないよう、幅を固定する。
         background.translatesAutoresizingMaskIntoConstraints = false
-        let width = background.widthAnchor.constraint(equalToConstant: manager.sidebarMetrics.effectiveWidth)
+        let width = background.widthAnchor.constraint(equalToConstant: metrics.effectiveWidth)
         width.isActive = true
         widthConstraint = width
 
@@ -310,15 +306,18 @@ final class SidebarPanel: NSPanel {
         let state = manager.engine.state
         // エンジンの state は同じ値でも didSet が発火する。見た目が変わらないなら行を作り直さない
         // (ダブルクリックの 2 回目が作り直し直後の行に届き、レイアウト前で編集欄が出ない事故を防ぐ)。
+        // v4: activeTabIDs は state に含まれるので、この差分キーで画面別アクティブの変化も拾える。
         if let last = lastRendered, last.state == state, last.editMode == manager.engine.editMode {
             return
         }
         lastRendered = (state, manager.engine.editMode)
+        // v4: 自分の画面のタブだけを描く。
+        let tabs = state.tabs(on: displayID, primaryID: manager.layout.primaryDisplay?.id)
         tabsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        for (index, tab) in state.tabs.enumerated() {
+        for (index, tab) in tabs.enumerated() {
             let row = TabRowView(
-                tab: tab, isActive: tab.id == state.activeTabID,
-                canMoveUp: index > 0, canMoveDown: index < state.tabs.count - 1,
+                tab: tab, isActive: tab.id == state.activeTabIDs[displayID],
+                canMoveUp: index > 0, canMoveDown: index < tabs.count - 1,
                 thumbnail: ThumbnailStore.enabledSetting.value ? manager.thumbnails.images[tab.id] : nil)
             row.onSelect = { [weak self] in self?.activate(tab.id) }
             row.onRenameRequested = { [weak self] in self?.promptRename(tab) }
@@ -328,7 +327,7 @@ final class SidebarPanel: NSPanel {
             tabsStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: tabsStack.widthAnchor).isActive = true
         }
-        if state.tabs.isEmpty {
+        if tabs.isEmpty {
             let hint = NSTextField(labelWithString: "「＋」でタブを作成")
             hint.textColor = .secondaryLabelColor
             hint.font = NSFont.systemFont(ofSize: 11)
@@ -336,7 +335,7 @@ final class SidebarPanel: NSPanel {
         }
 
         windowsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        if let active = state.activeTab {
+        if let active = state.activeTab(on: displayID) {
             windowsHeader.stringValue = "\(active.name) のウィンドウ(\(active.windows.count))"
                 + (active.layout == .columns ? " — 縦に等分割" : "")
             // 切断退避(displayID があるのに接続中の画面に無い)を行の表示に反映する。
@@ -388,8 +387,9 @@ final class SidebarPanel: NSPanel {
     }
 
     @objc private func addTab() {
-        let count = manager.engine.state.tabs.count + 1
-        manager.engine.createTab(name: "タブ\(count)")
+        // v4: このパネルの画面にタブを作る(連番も画面ごと)。
+        let count = manager.engine.state.tabs(on: displayID, primaryID: manager.layout.primaryDisplay?.id).count + 1
+        manager.engine.createTab(name: "タブ\(count)", on: displayID)
     }
 
     @objc private func toggleEditMode() {
@@ -408,7 +408,7 @@ final class SidebarPanel: NSPanel {
             let (candidates, unavailable) = await self.manager.availableWindowsAndIssues()
             guard let sender else { return }
             sender.title = originalTitle
-            sender.isEnabled = self.manager.engine.state.activeTabID != nil
+            sender.isEnabled = self.manager.engine.activeTabID(on: self.displayID) != nil
             self.presentAddWindowMenu(candidates, unavailableApps: unavailable, anchor: sender)
         }
     }
@@ -439,7 +439,7 @@ final class SidebarPanel: NSPanel {
 
     @objc private func addWindow(_ sender: NSMenuItem) {
         guard let box = sender.representedObject as? WindowRecordBox,
-            let tabID = manager.engine.state.activeTabID
+            let tabID = manager.engine.activeTabID(on: displayID)  // v4: 自画面のアクティブタブへ
         else { return }
         Task { [manager, logger] in
             do {
@@ -535,9 +535,17 @@ final class SidebarPanel: NSPanel {
     /// タブを 1 つ上/下へ移動する。index は render 時の値ではなくクリック時点で引き直す
     /// (メニュー表示中に state が変わりうるため。範囲外は Core が invalidTabOrder で弾く)。
     private func moveTab(_ tabID: UUID, offset: Int) {
-        guard let index = manager.engine.state.tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        // v4: 「上へ/下へ」は同じ画面の隣のタブとの入れ替え。グローバル配列上では隣接しない
+        // ことがあるので、画面内リストで隣を探してからグローバル index に写して入れ替える。
+        let state = manager.engine.state
+        let tabs = state.tabs(on: displayID, primaryID: manager.layout.primaryDisplay?.id)
+        guard let localIndex = tabs.firstIndex(where: { $0.id == tabID }),
+            tabs.indices.contains(localIndex + offset),
+            let from = state.tabs.firstIndex(where: { $0.id == tabID }),
+            let to = state.tabs.firstIndex(where: { $0.id == tabs[localIndex + offset].id })
+        else { return }
         do {
-            try manager.engine.moveTab(fromIndex: index, toIndex: index + offset)
+            try manager.engine.moveTab(fromIndex: from, toIndex: to)
         } catch {
             logger.log("moveTab failed: \(error)")
         }

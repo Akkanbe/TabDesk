@@ -70,6 +70,11 @@ public enum ScreenGeometry {
         return "display-\(directID)"
     }
 
+    /// DisplayID から NSScreen への逆引き(v4: 画面ごとのサイドバーの配置に使う)。
+    public static func screen(for displayID: DisplayID) -> NSScreen? {
+        NSScreen.screens.first { self.displayID(of: $0) == displayID }
+    }
+
     /// 2 つの frame が許容誤差内で一致するか(スナップバック判定用)。
     public static func approximatelyEqual(_ a: CGRect, _ b: CGRect, tolerance: CGFloat = 1.0) -> Bool {
         abs(a.minX - b.minX) <= tolerance

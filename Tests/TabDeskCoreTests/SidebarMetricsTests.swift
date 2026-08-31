@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import Testing
@@ -103,5 +104,71 @@ struct SidebarWidthReflowTests {
 
     private func id(_ name: String) -> WindowIdentity {
         WindowIdentity(bundleID: "test.\(name)", appName: name, title: name, registeredSize: CGSize(width: 500, height: 400))
+    }
+}
+
+/// v4 段階 5: 幅は共有・折りたたみは画面ごと。
+struct PerDisplaySidebarMetricsTests {
+    private func makeSuite() -> (UserDefaults, String) {
+        let suite = "tabdesk-test-\(UUID().uuidString)"
+        return (UserDefaults(suiteName: suite)!, suite)
+    }
+
+    @Test func widthIsSharedAcrossDisplays() {
+        let (defaults, suite) = makeSuite()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let main = SidebarMetrics(displayID: "main", defaults: defaults)
+        let second = SidebarMetrics(displayID: "second", defaults: defaults)
+        main.expandedWidth = 320
+        #expect(second.expandedWidth == 320, "幅は全画面共有")
+    }
+
+    @Test func collapseIsPerDisplay() {
+        let (defaults, suite) = makeSuite()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let main = SidebarMetrics(displayID: "main", defaults: defaults)
+        let second = SidebarMetrics(displayID: "second", defaults: defaults)
+        main.isCollapsed = true
+        #expect(main.effectiveWidth == SidebarMetrics.collapsedWidth)
+        #expect(second.isCollapsed == false, "折りたたみは画面ごとに独立")
+        #expect(second.effectiveWidth == SidebarMetrics.defaultWidth)
+    }
+
+    /// v3 のグローバル折りたたみキーが、画面別キーの既定値としてシードされる。
+    @Test func legacyCollapsedValueSeedsPerDisplayDefault() {
+        let (defaults, suite) = makeSuite()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SidebarMetrics(defaults: defaults).isCollapsed = true  // v3 の保存値
+        let migrated = SidebarMetrics(displayID: "main", defaults: defaults)
+        #expect(migrated.isCollapsed == true, "旧キーの値を引き継ぐ")
+        migrated.isCollapsed = false
+        #expect(SidebarMetrics(displayID: "main", defaults: defaults).isCollapsed == false)
+    }
+}
+
+/// v4 段階 5: SystemScreenLayout は各画面のコンテンツ領域から画面別の実効幅を除く。
+@MainActor
+struct SystemScreenLayoutProviderTests {
+    @Test func subtractsPerDisplayWidthFromEveryDisplay() {
+        guard !NSScreen.screens.isEmpty else { return }  // ヘッドレス環境では判定不能
+        let layout = SystemScreenLayout(sidebarWidth: { id in id.hasSuffix("...never...") ? 0 : 100 })
+        for display in layout.displays {
+            guard let screen = ScreenGeometry.screen(for: display.id) else { continue }
+            let visible = ScreenGeometry.visibleFrameAX(of: screen)
+            #expect(display.contentArea.minX == visible.minX + 100, "全画面で幅が引かれる")
+            #expect(display.contentArea.width == visible.width - 100)
+        }
+    }
+
+    @Test func providerReceivesEachDisplayID() {
+        guard !NSScreen.screens.isEmpty else { return }
+        nonisolated(unsafe) var seen: Set<DisplayID> = []
+        let lock = NSLock()
+        let layout = SystemScreenLayout(sidebarWidth: { id in
+            lock.withLock { _ = seen.insert(id) }
+            return 0
+        })
+        let ids = Set(layout.displays.map(\.id))
+        #expect(lock.withLock { seen } == ids, "画面ごとに自分の ID で幅を問い合わせる")
     }
 }
