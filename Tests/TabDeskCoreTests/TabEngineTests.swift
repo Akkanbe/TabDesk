@@ -1640,3 +1640,32 @@ struct AuditFixTests {
         #expect(after?.width == recorded.width, "許容誤差内(0.5pt)の到達値は採用しない")
     }
 }
+
+/// v4 段階 0: 終了時解放のタブ横断 pid 並列化の検証。
+@MainActor
+struct ShutdownReleaseBatchTests {
+    /// 別タブ・別 pid の退避窓が、終了時に 1 回の解放バッチとして pid 並列で復元される。
+    /// (旧実装はタブごとに逐次呼び出しだったため、遅いアプリの待ちがタブ数ぶん直列に積み上がった)
+    @Test func shutdownReleasesAcrossTabsInOneBatch() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "Active")
+        let b = engine.createTab(name: "B")
+        let c = engine.createTab(name: "C")
+        let frameB = CGRect(x: 300, y: 100, width: 500, height: 400)
+        let frameC = CGRect(x: 900, y: 200, width: 500, height: 400)
+        driver.add(1, frame: frameB)
+        driver.add(2, frame: frameC)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("b"), frame: frameB, into: b.id)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("c"), frame: frameC, into: c.id)
+        // 解放の setFrame だけ遅くして、並列実行なら実行時間が重なるようにする。
+        driver.setDelay(1, 0.08)
+        driver.setDelay(2, 0.08)
+
+        await engine.releaseAllParkedWindows()
+
+        #expect(driver.currentFrame(1) == frameB)
+        #expect(driver.currentFrame(2) == frameC)
+        #expect(driver.maxConcurrent >= 2, "タブをまたいだ pid 並列で解放される")
+        #expect(engine.parkedWindowIDs.isEmpty)
+    }
+}

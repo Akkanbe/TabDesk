@@ -662,3 +662,29 @@ struct ParkPointGeometryTests {
         #expect(points[2] == CGPoint(x: 5759, y: 1199))
     }
 }
+
+/// v4 段階 0: setFrame の IPC 後チェック順の統一(切断の凍結を fullscreen より先に確認する)。
+@MainActor
+struct SetFrameMidIPCOrderTests {
+    /// IPC 中に「fullscreen 進入(書き込みが飲み込まれる)」と「ディスプレイ切断」が同時に起きた場合、
+    /// 切断の凍結が勝つ(修正前は fullscreen 分岐が先で、凍結すべき記録へ要求値を書いていた)。
+    @Test func setFrameFreezesWhenDisplayDisconnectsMidIPC() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let frame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: frame)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: frame, into: tab.id)
+        // reconcile 前に fullscreen へ進入(集合は未更新なので setFrame のガードは素通りする)。
+        driver.setFullscreen(1)
+        driver.setDelay(1, 0.15)
+
+        async let result = engine.setFrame(CGRect(x: 2500, y: 250, width: 800, height: 600), of: managed.id)
+        try await Task.sleep(for: .milliseconds(50))  // setFrame の IPC 中に…
+        layout.change(displays: [soloMainDisplay])    // …ディスプレイが切断される
+        let returned = try await result
+
+        #expect(returned == frame, "凍結された従来値が返る")
+        let recorded = engine.state.managedWindow(id: managed.id)?.window.frame
+        #expect(recorded == frame, "要求値もフルスクリーン寸法も記録しない(凍結が最優先)")
+    }
+}

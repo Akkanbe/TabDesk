@@ -66,6 +66,11 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         lock.withLock { windows[id]?.minSize = size }
     }
 
+    /// 登録後に擬似 IPC 遅延を変える(登録は速く済ませ、特定の操作だけ遅くしたいテスト用)。
+    func setDelay(_ id: CGWindowID, _ value: TimeInterval) {
+        lock.withLock { windows[id]?.delay = value }
+    }
+
     /// ユーザー操作やアプリ自身の移動を模す(エンジンを経由しない frame 変更)。
     func moveExternally(_ id: CGWindowID, to frame: CGRect) {
         lock.withLock { windows[id]?.frame = frame }

@@ -192,7 +192,7 @@ public final class TabEngine {
         try await serialized {
             try rejectIfShuttingDown()
             let tab = try self.tab(id)
-            let unreleased = await releaseAll(tab.windows, from: tab)
+            let unreleased = await releaseAll(tab.windows)
             // 1 枚でも戻せなければタブごと残す(隅に取り残した窓を追跡不能にしない)。
             // 戻せた窓は非アクティブタブの未退避窓として reconcile が再び退避する。
             guard unreleased.isEmpty else { throw EngineError.releaseFailed(managedIDs: unreleased) }
@@ -287,7 +287,7 @@ public final class TabEngine {
         try await serialized {
             try rejectIfShuttingDown()
             guard let found = state.managedWindow(id: id) else { throw EngineError.unknownWindow(id) }
-            let unreleased = await releaseAll([found.window], from: found.tab)
+            let unreleased = await releaseAll([found.window])
             // 固定 frame に戻せたことを確認できるまで登録は手放さない(隅に取り残さない)。
             guard unreleased.isEmpty else { throw EngineError.releaseFailed(managedIDs: unreleased) }
             removeFromState(id)
@@ -437,10 +437,9 @@ public final class TabEngine {
         // ロック取得前に立てる: ロック待ち中の reconcile にも、これから始まる reconcile にも効かせる。
         beginShutdown()
         await serialized {
-            var unreleased = Set<UUID>()
-            for tab in state.tabs {
-                unreleased.formUnion(await releaseAll(tab.windows, from: tab))
-            }
+            // タブ横断で 1 回にまとめる: runRelease の pid グループ化がタブをまたいで効き、
+            // タブ数が増えても(v4)遅いアプリ 1 つの待ちが直列に積み上がらない。
+            let unreleased = await releaseAll(state.allWindows)
             if !unreleased.isEmpty {
                 log("shutdown: \(unreleased.count) window(s) could not be restored and may remain parked")
             }
@@ -562,8 +561,12 @@ public final class TabEngine {
             guard let rebound = state.managedWindow(id: id), rebound.window.windowID == windowID else {
                 throw EngineError.unknownWindow(id)
             }
-            // 呼出し直前には通常窓でも、IPC 中に fullscreen / ディスプレイ切断へ遷移しうる。
-            // fullscreen ならユーザーの論理要求だけを残し、切断なら従来値を凍結する。
+            // 呼出し直前には通常窓でも、IPC 中にディスプレイ切断 / fullscreen へ遷移しうる。
+            // 他の全経路と同じ順で「切断の凍結」を先に確認する(切断なら従来値を凍結し、
+            // fullscreen ならユーザーの論理要求だけを残す)。
+            if isDisplayDisconnected(rebound.window) {
+                return rebound.window.frame
+            }
             if !approximatelyEqual(actual, frame),
                 await refreshFullscreenMembership(managedID: id, windowID: windowID) == true
             {
@@ -1250,12 +1253,15 @@ public final class TabEngine {
                     currentBinding.window.windowID == windowID
                 else { continue }
                 if isDisplayDisconnected(currentBinding.window) {
+                    // 失敗を握りつぶすのではなく「切断のため反映しない」ことを痕跡として残す(診断性)。
+                    log("apply: op failed but display disconnected; leaving \(result.op.managedID) frozen: \(error)")
                     parkedWindowIDs.remove(result.op.managedID)
                     continue
                 }
                 if await refreshFullscreenMembership(
                     managedID: result.op.managedID, windowID: windowID) == true
                 {
+                    log("apply: op failed but window is fullscreen; suspending \(result.op.managedID): \(error)")
                     parkedWindowIDs.remove(result.op.managedID)
                     continue
                 }
@@ -1263,6 +1269,7 @@ public final class TabEngine {
                     rebound.window.windowID == windowID
                 else { continue }
                 if isDisplayDisconnected(rebound.window) {
+                    log("apply: op failed but display disconnected; leaving \(result.op.managedID) frozen: \(error)")
                     parkedWindowIDs.remove(result.op.managedID)
                     continue
                 }
@@ -1326,10 +1333,19 @@ public final class TabEngine {
     /// 退避フラグだけに頼らず、非アクティブタブの窓は実位置にかかわらず戻す(退避が「失敗扱いだが適用済み」でも拾う)。
     ///
     /// 戻り値は復元を確認できなかった窓(退避フラグは維持する)。呼び出し側はこれが空のときだけ登録を手放す。
-    private func releaseAll(_ windows: [ManagedWindow], from tab: Tab) async -> Set<UUID> {
-        let currentTab = state.tab(withID: tab.id) ?? tab
-        let isActive = currentTab.id == state.activeTabID
-        let desired = desiredFrames(for: currentTab)
+    /// 窓集合を固定 frame へ戻す(解除・タブ削除・終了時)。窓ごとに所属タブの文脈を引き直すので、
+    /// **タブをまたいだ一括呼び出しが可能**(v4 段階 0: 終了時はタブ横断で 1 回にまとめ、
+    /// runRelease の pid 並列がタブ数に依存せず効くようにする — タブが増える v4 で 3 秒期限を守る)。
+    private func releaseAll(_ windows: [ManagedWindow]) async -> Set<UUID> {
+        // desiredFrames はタブ単位の計算なので、同一タブ分はキャッシュする(旧実装と同じ回数)。
+        var desiredByTab: [UUID: (frames: [UUID: CGRect], isActive: Bool)] = [:]
+        func tabContext(_ tabID: UUID) -> (frames: [UUID: CGRect], isActive: Bool)? {
+            if let cached = desiredByTab[tabID] { return cached }
+            guard let tab = state.tab(withID: tabID) else { return nil }
+            let context = (desiredFrames(for: tab), tab.id == state.activeTabID)
+            desiredByTab[tabID] = context
+            return context
+        }
         var candidates: [(window: ManagedWindow, target: CGRect)] = []
         for snapshot in windows {
             cancelPendingRestore(snapshot.id)
@@ -1341,11 +1357,12 @@ public final class TabEngine {
                 parkedWindowIDs.remove(window.id)
                 continue
             }
+            guard let context = tabContext(found.tab.id) else { continue }
             // 画面変更通知の 1 秒デバウンスより先に解除・終了されても、切断済み画面へ戻さない。
-            let target = desired[window.id] ?? clamped(window.frame, for: window)
+            let target = context.frames[window.id] ?? clamped(window.frame, for: window)
             let frameChanged = target != window.frame
             if frameChanged { updateFrame(window.id, target) }
-            guard window.isBound, !isActive || parkedWindowIDs.contains(window.id) || frameChanged else { continue }
+            guard window.isBound, !context.isActive || parkedWindowIDs.contains(window.id) || frameChanged else { continue }
             candidates.append((window, target))
         }
 
