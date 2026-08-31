@@ -688,3 +688,112 @@ struct SetFrameMidIPCOrderTests {
         #expect(recorded == frame, "要求値もフルスクリーン寸法も記録しない(凍結が最優先)")
     }
 }
+
+/// v4 段階 2: ディスプレイ別アクティベーションの検証。
+@MainActor
+struct PerDisplayActivationTests {
+    /// A 画面のタブ切替は B 画面の窓に一切触れない(op も出さない)。
+    @Test func switchOnDisplayADoesNotTouchDisplayB() async throws {
+        let (engine, driver, _) = makeEngine()
+        let a1 = engine.createTab(name: "A1", on: "main")
+        let a2 = engine.createTab(name: "A2", on: "main")
+        let b1 = engine.createTab(name: "B1", on: "second")
+        let mainFrame = CGRect(x: 300, y: 100, width: 500, height: 400)
+        let extFrame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: mainFrame)
+        driver.add(2, frame: mainFrame)
+        driver.add(3, frame: extFrame)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("a1"), frame: mainFrame, into: a1.id)
+        try await engine.register(windowID: 2, pid: 200, identity: identity("a2"), frame: mainFrame, into: a2.id)
+        try await engine.register(windowID: 3, pid: 300, identity: identity("b1"), frame: extFrame, into: b1.id)
+        #expect(driver.currentFrame(3) == extFrame, "B1 は second のアクティブなので表示されたまま")
+
+        let before3 = driver.callLog().filter { $0.hasSuffix(":3") }.count
+        try await engine.activate(a2.id)
+
+        #expect(driver.currentFrame(1)?.origin == mainDisplay.parkPoint, "main 側は退避")
+        #expect(driver.currentFrame(2) == mainFrame, "main 側は復元")
+        #expect(driver.currentFrame(3) == extFrame, "second 側は不変")
+        #expect(driver.callLog().filter { $0.hasSuffix(":3") }.count == before3, "second の窓へ op なし")
+    }
+
+    /// 画面ごとのアクティブは独立して保持・永続化される。
+    @Test func independentActivesPersistInState() async throws {
+        let (engine, driver, _) = makeEngine()
+        let a1 = engine.createTab(name: "A1", on: "main")
+        let a2 = engine.createTab(name: "A2", on: "main")
+        let b1 = engine.createTab(name: "B1", on: "second")
+        let b2 = engine.createTab(name: "B2", on: "second")
+        _ = driver
+        #expect(engine.activeTabID(on: "main") == a1.id, "first-tab-wins は画面ごと")
+        #expect(engine.activeTabID(on: "second") == b1.id)
+
+        try await engine.activate(a2.id)
+        try await engine.activate(b2.id)
+        #expect(engine.activeTabID(on: "main") == a2.id)
+        #expect(engine.activeTabID(on: "second") == b2.id)
+        #expect(engine.state.activeTabIDs == ["main": a2.id, "second": b2.id])
+        _ = (a1, b1)
+    }
+
+    /// 順送りは選択画面のタブだけを巡回する。
+    @Test func adjacentCyclesOnlyWithinTheDisplay() async throws {
+        let (engine, _, _) = makeEngine()
+        let a1 = engine.createTab(name: "A1", on: "main")
+        let a2 = engine.createTab(name: "A2", on: "main")
+        let b1 = engine.createTab(name: "B1", on: "second")
+
+        try await engine.activateAdjacent(offset: 1, on: "main")
+        #expect(engine.activeTabID(on: "main") == a2.id)
+        try await engine.activateAdjacent(offset: 1, on: "main")
+        #expect(engine.activeTabID(on: "main") == a1.id, "main の 2 枚で循環(B1 を跨がない)")
+        #expect(engine.activeTabID(on: "second") == b1.id, "second は不変")
+
+        #expect(try await engine.activateAdjacent(offset: 1, on: "gone") == nil, "切断画面は no-op")
+    }
+
+    /// 切断中の画面のタブは activate できない(タブごと凍結)。
+    @Test func activatingFrozenTabThrows() async throws {
+        let (engine, driver, layout) = makeEngine()
+        _ = engine.createTab(name: "A", on: "main")
+        let b = engine.createTab(name: "B", on: "second")
+        let extFrame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: extFrame)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("ext"), frame: extFrame, into: b.id)
+
+        layout.change(displays: [soloMainDisplay])
+        await #expect(throws: TabEngine.EngineError.self) { try await engine.activate(b.id) }
+        #expect(driver.currentFrame(1) == extFrame, "凍結タブの窓は動かない")
+        #expect(try await engine.activateAdjacent(offset: 1, on: "second") == nil)
+    }
+
+    /// アクティブタブの削除は同じ画面の次タブへ引き継ぎ、他画面には影響しない。
+    @Test func deleteActivePicksSameDisplaySuccessor() async throws {
+        let (engine, _, _) = makeEngine()
+        let a1 = engine.createTab(name: "A1", on: "main")
+        let a2 = engine.createTab(name: "A2", on: "main")
+        let b1 = engine.createTab(name: "B1", on: "second")
+
+        try await engine.deleteTab(a1.id)
+        #expect(engine.activeTabID(on: "main") == a2.id, "同じ画面の後継")
+        #expect(engine.activeTabID(on: "second") == b1.id, "他画面は不変")
+
+        try await engine.deleteTab(a2.id)
+        #expect(engine.activeTabID(on: "main") == nil, "最後のタブを消したら nil(画面をまたいで飛ばない)")
+        #expect(engine.activeTabID(on: "second") == b1.id)
+    }
+
+    /// 旧 activeTabID は主ディスプレイのアクティブのミラーであり続ける。
+    @Test func legacyMirrorTracksPrimaryActive() async throws {
+        let (engine, _, _) = makeEngine()
+        let a1 = engine.createTab(name: "A1", on: "main")
+        let a2 = engine.createTab(name: "A2", on: "main")
+        let b1 = engine.createTab(name: "B1", on: "second")
+        #expect(engine.state.activeTabID == a1.id)
+
+        try await engine.activate(b1.id)
+        #expect(engine.state.activeTabID == a1.id, "他画面の切替でミラーは動かない")
+        try await engine.activate(a2.id)
+        #expect(engine.state.activeTabID == a2.id)
+    }
+}

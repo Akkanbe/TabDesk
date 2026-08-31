@@ -146,7 +146,8 @@ final class WindowManager {
             self?.scheduleSave()
             self?.onStateChanged?(state)
         }
-        engine.activateApplication = { [weak self] pid in
+        engine.activateApplication = { [weak self] pid, _ in
+            // TODO(v4 段階 4): 切替した画面 == 選択中の画面のときだけ前面化する(displayID を使う)。
             if self?.suppressAppActivation?() == true { return }
             NSRunningApplication(processIdentifier: pid)?.activate()
         }
@@ -386,9 +387,11 @@ final class WindowManager {
     }
 
     /// 隣のタブへ(ホットキー用)。ターゲット解決はエンジンの直列区間内で行うため、連打しても 1 押下 = 1 タブ進む。
+    /// TODO(v4 段階 4): 選択中のディスプレイを解決して渡す(それまでは主ディスプレイ固定)。
     func activateAdjacent(offset: Int) async throws {
+        guard let displayID = layout.primaryDisplay?.id else { return }
         try await performFocusSwitch {
-            try await engine.activateAdjacent(offset: offset)
+            try await engine.activateAdjacent(offset: offset, on: displayID)
         }
     }
 

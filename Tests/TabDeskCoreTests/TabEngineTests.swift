@@ -153,7 +153,7 @@ struct SwitchingTests {
         #expect(driver.currentFrame(2)?.origin == park)
 
         var focusedPID: pid_t?
-        engine.activateApplication = { focusedPID = $0 }
+        engine.activateApplication = { pid, _ in focusedPID = pid }
         let report = try await engine.activate(b.id)
         #expect(report.operationCount == 2)
         #expect(report.failures.isEmpty)
@@ -1293,7 +1293,7 @@ struct FocusTargetTests {
         try await engine.activate(a.id)
 
         var activated: [pid_t] = []
-        engine.activateApplication = { activated.append($0) }
+        engine.activateApplication = { pid, _ in activated.append(pid) }
         let activation = Task { try await engine.activate(b.id) }
         try await Task.sleep(for: .milliseconds(20))
         engine.noteWindowDestroyed(windowID: 2)  // 切替の IPC 中に最終フォーカス窓が閉じられた
@@ -1568,8 +1568,8 @@ struct AdjacentActivationTests {
         try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
 
         // 1 回目の切替が進行中に 2 回目の押下が来る(連打)
-        async let first: TabEngine.SwitchReport? = engine.activateAdjacent(offset: 1)
-        async let second: TabEngine.SwitchReport? = engine.activateAdjacent(offset: 1)
+        async let first: TabEngine.SwitchReport? = engine.activateAdjacent(offset: 1, on: "fixed")
+        async let second: TabEngine.SwitchReport? = engine.activateAdjacent(offset: 1, on: "fixed")
         _ = try await (first, second)
         #expect(engine.state.activeTabID == c.id, "two presses must land two tabs ahead, not collapse onto B")
         _ = b
@@ -1579,13 +1579,13 @@ struct AdjacentActivationTests {
         let (engine, _) = makeEngine()
         let a = engine.createTab(name: "A")
         let b = engine.createTab(name: "B")
-        try await engine.activateAdjacent(offset: -1)  // A から前へ → 末尾 B
+        try await engine.activateAdjacent(offset: -1, on: "fixed")  // A から前へ → 末尾 B
         #expect(engine.state.activeTabID == b.id)
-        try await engine.activateAdjacent(offset: 1)  // B から次へ → 先頭 A
+        try await engine.activateAdjacent(offset: 1, on: "fixed")  // B から次へ → 先頭 A
         #expect(engine.state.activeTabID == a.id)
 
         let (empty, _) = makeEngine()
-        #expect(try await empty.activateAdjacent(offset: 1) == nil, "no tabs: no-op")
+        #expect(try await empty.activateAdjacent(offset: 1, on: "fixed") == nil, "no tabs: no-op")
     }
 }
 

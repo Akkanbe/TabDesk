@@ -30,6 +30,8 @@ public final class TabEngine {
         public let tabID: UUID
         /// 切替前にアクティブだったタブ(直列区間内で確定した値。サムネイル撮影の対象決定に使う)。
         public let previousActiveTabID: UUID?
+        /// 切替が作用したディスプレイ(v4。nil は接続ディスプレイなしの縮退時のみ)。
+        public let displayID: DisplayID?
         public let operationCount: Int
         public let durationMs: Double
         public let failures: [OperationFailure]
@@ -49,6 +51,8 @@ public final class TabEngine {
         case entryAlreadyBound(managedID: UUID, boundWindowID: CGWindowID)
         /// 終了時の全窓解放が始まっている。これ以降に実窓を動かす操作は受け付けない。
         case shuttingDown
+        /// タブの所属ディスプレイが切断中(v4: タブごと凍結。再接続まで切替できない)。
+        case tabDisplayDisconnected(UUID)
 
         public var description: String {
             switch self {
@@ -61,6 +65,7 @@ public final class TabEngine {
             case .releaseFailed(let ids): return "could not restore \(ids.count) parked window(s); registration kept"
             case .entryAlreadyBound(let mid, let wid): return "entry \(mid) is already bound to window \(wid)"
             case .shuttingDown: return "TabDesk is shutting down"
+            case .tabDisplayDisconnected(let id): return "tab \(id) is on a disconnected display"
             }
         }
     }
@@ -76,7 +81,9 @@ public final class TabEngine {
 
     public var onStateChanged: (@MainActor (WorkspaceState) -> Void)?
     /// 切替後にフォーカスを移すためのフック(AppKit への依存をエンジンに持ち込まないため)。
-    public var activateApplication: (@MainActor (pid_t) -> Void)?
+    /// 切替後の前面化フック。第 2 引数は切替が作用したディスプレイ(v4: 呼び手が
+    /// 「選択中の画面の切替のときだけ前面化する」判断に使う)。
+    public var activateApplication: (@MainActor (pid_t, DisplayID?) -> Void)?
     public var log: @Sendable (String) -> Void = { _ in }
 
     /// 終了処理(`releaseAllParkedWindows`)が始まったら true。以降の reconcile は戻した窓を再び隅へ送らない。
@@ -132,13 +139,49 @@ public final class TabEngine {
     // MARK: - タブ CRUD
 
     @discardableResult
-    public func createTab(name: String) -> Tab {
-        let tab = Tab(name: name)
+    public func createTab(name: String, on displayID: DisplayID? = nil) -> Tab {
+        let tab = Tab(name: name, displayID: displayID)
         state.tabs.append(tab)
-        if state.activeTabID == nil {
-            state.activeTabID = tab.id
+        // その画面の最初のタブがアクティブになる(v4: first-tab-wins は画面ごと)。
+        if let key = resolvedDisplayID(of: tab), state.activeTabIDs[key] == nil {
+            setActiveTab(tab.id, on: key)
         }
         return tab
+    }
+
+    // MARK: - ディスプレイ別アクティブ(v4)
+
+    /// タブの実効ディスプレイ ID(nil タブ = そのときの主ディスプレイ)。
+    /// 戻り値 nil は接続ディスプレイが 1 枚も無い縮退時のみ。
+    private func resolvedDisplayID(of tab: Tab) -> DisplayID? {
+        tab.displayID ?? layout.primaryDisplay?.id
+    }
+
+    /// このタブがその画面のアクティブか。v4 のアクティブ判定はすべてここを通す。
+    private func isActiveTab(_ tab: Tab) -> Bool {
+        guard let key = resolvedDisplayID(of: tab) else { return tab.id == state.activeTabID }
+        return state.activeTabIDs[key] == tab.id
+    }
+
+    /// タブの所属ディスプレイが切断中か(nil タブ = 主の意味なので切断にならない)。
+    private func isTabDisplayDisconnected(_ tab: Tab) -> Bool {
+        guard let id = tab.displayID else { return false }
+        return layout.display(id: id) == nil
+    }
+
+    public func activeTabID(on displayID: DisplayID) -> UUID? {
+        state.activeTabIDs[displayID]
+    }
+
+    /// アクティブの更新。旧 activeTabID は主ディスプレイのミラーとして併記する(ダウングレード耐性)。
+    /// didSet(保存・UI 通知)を 1 回にまとめるため、まとめて代入する。
+    private func setActiveTab(_ id: UUID?, on displayID: DisplayID) {
+        var next = state
+        next.activeTabIDs[displayID] = id
+        if displayID == layout.primaryDisplay?.id {
+            next.activeTabID = id
+        }
+        if next != state { state = next }
     }
 
     public func renameTab(_ id: UUID, to name: String) throws {
@@ -205,9 +248,13 @@ public final class TabEngine {
             pendingRetileTabIDs.remove(id)
             // await をまたいだので index は引き直す(同期の moveTab が割り込みうる)。
             state.tabs.remove(at: try tabIndex(id))
-            if state.activeTabID == id {
-                state.activeTabID = nil
-                if let next = state.tabs.first {
+            // v4: アクティブの後継は**同じ画面**のタブから選ぶ(画面をまたいでジャンプしない)。
+            // 同じ画面にタブが残らなければその画面のアクティブは nil(サイドバーは作成ヒントを出す)。
+            if let key = resolvedDisplayID(of: tab), state.activeTabIDs[key] == id {
+                setActiveTab(nil, on: key)
+                if let next = state.tabs.first(where: {
+                    resolvedDisplayID(of: $0) == key && !isTabDisplayDisconnected($0)
+                }) {
                     try await activateUnlocked(next.id)
                 }
             }
@@ -240,7 +287,7 @@ public final class TabEngine {
             let frame = clamped(frame, in: display?.contentArea ?? layout.contentArea)
             var managed = ManagedWindow(
                 frame: frame, identity: identity, windowID: windowID, pid: pid, displayID: display?.id)
-            let intoActive = tabID == state.activeTabID
+            let intoActive = isActiveTab(try tab(tabID))
 
             let outcome = try await place(
                 windowID: windowID, frame: frame, intoActive: intoActive,
@@ -327,7 +374,7 @@ public final class TabEngine {
             // 消滅判定の猶予中に新しい窓への紐付けを開始した場合、place の IPC 待ち中に
             // resolveVanished が entry を削除しないよう、この時点で古い消滅保留を取り消す。
             vanished.removeValue(forKey: id)
-            let intoActive = found.tab.id == state.activeTabID
+            let intoActive = isActiveTab(found.tab)
             let requestedFrame: CGRect
             let frame: CGRect
             let fullscreenAfterPlacement: Bool?
@@ -553,7 +600,7 @@ public final class TabEngine {
             // フルスクリーン中も記録のみ(段階 2 の他経路と同じ: 論理配置は更新し、IPC は出さない。
             // 出すと書き込みが飲み込まれ、読み戻したフルスクリーン寸法を記録してしまう)。
             guard let windowID = found.window.windowID, !parkedWindowIDs.contains(id),
-                found.tab.id == state.activeTabID, !opsSuppressed(for: found.window)
+                isActiveTab(found.tab), !opsSuppressed(for: found.window)
             else {
                 updateFrame(id, frame)
                 return frame
@@ -598,35 +645,45 @@ public final class TabEngine {
         }
     }
 
-    /// 隣のタブへ切り替える(offset +1 = 次、-1 = 前。端で循環)。
-    /// 相対ターゲットの解決を直列区間の**中**で行う。連打時、切替が確定する前の古い activeTabID から
+    /// 指定ディスプレイ内で隣のタブへ切り替える(offset +1 = 次、-1 = 前。端で循環)。
+    /// 相対ターゲットの解決を直列区間の**中**で行う。連打時、切替が確定する前の古いアクティブから
     /// 同じタブを選んでしまい「1 押下 = 1 タブ」にならない問題を防ぐ(押した回数ぶん確実に進む)。
+    /// v4: 巡回はそのディスプレイのタブに限る。タブが無い/画面が切断中なら no-op(nil)。
     @discardableResult
-    public func activateAdjacent(offset: Int) async throws -> SwitchReport? {
+    public func activateAdjacent(offset: Int, on displayID: DisplayID) async throws -> SwitchReport? {
         try await serialized {
             try rejectIfShuttingDown()
-            let count = state.tabs.count
-            guard count > 0 else { return nil }
+            guard layout.display(id: displayID) != nil else { return nil }
+            let tabsOnDisplay = state.tabs.filter {
+                resolvedDisplayID(of: $0) == displayID && !isTabDisplayDisconnected($0)
+            }
+            guard !tabsOnDisplay.isEmpty else { return nil }
             let index: Int
-            if let current = state.tabs.firstIndex(where: { $0.id == state.activeTabID }) {
-                index = ((current + offset) % count + count) % count
+            if let current = state.activeTabIDs[displayID],
+                let i = tabsOnDisplay.firstIndex(where: { $0.id == current })
+            {
+                index = ((i + offset) % tabsOnDisplay.count + tabsOnDisplay.count) % tabsOnDisplay.count
             } else {
                 // アクティブタブが無い/消えている場合は方向によらず先頭へ。
                 index = 0
             }
-            return try await activateUnlocked(state.tabs[index].id)
+            return try await activateUnlocked(tabsOnDisplay[index].id)
         }
     }
 
     @discardableResult
     private func activateUnlocked(_ tabID: UUID) async throws -> SwitchReport {
         let target = try tab(tabID)
-        let previousActive = state.activeTabID
-        let alreadyActive = tabID == state.activeTabID
+        // v4: 切断中の画面のタブは凍結(切替不可)。窓レベルの D3 凍結と対になるタブレベルのガード。
+        guard !isTabDisplayDisconnected(target) else { throw EngineError.tabDisplayDisconnected(tabID) }
+        let displayKey = resolvedDisplayID(of: target)
+        let previousActive = displayKey.flatMap { state.activeTabIDs[$0] }
+        let alreadyActive = previousActive == tabID
         let desired = desiredFrames(for: target)
         var parks: [WindowOp] = []
         var restores: [WindowOp] = []
-        for tab in state.tabs {
+        // v4: 切替はそのディスプレイのタブだけに作用する(他画面の窓には一切触れない)。
+        for tab in state.tabs where resolvedDisplayID(of: tab) == displayKey {
             for window in tab.windows {
                 guard let windowID = window.windowID, let pid = window.pid else { continue }  // 未復元は対象外
                 guard !isDisplayDisconnected(window) else { continue }  // 切断退避(frame 凍結・op なし)
@@ -657,16 +714,20 @@ public final class TabEngine {
         let results = await run(ops)
         let elapsed = stopwatch.elapsedMs
         let failures = await apply(results)
-        state.activeTabID = tabID
+        if let displayKey {
+            setActiveTab(tabID, on: displayKey)
+        } else {
+            state.activeTabID = tabID  // 接続ディスプレイなしの縮退時のみ(旧挙動)
+        }
 
         // IPC 中に最終フォーカス窓が閉じられていることがあるので、切替開始時の snapshot ではなく今の状態から選ぶ。
         if !alreadyActive, let refreshed = state.tab(withID: tabID), let pid = focusTargetPID(in: refreshed) {
-            activateApplication?(pid)
+            activateApplication?(pid, displayKey)
         }
         log("activate \(target.name): \(ops.count) ops in \(String(format: "%.1f", elapsed)) ms" +
             (failures.isEmpty ? "" : "; failures: \(failures.map(\.message))"))
         return SwitchReport(
-            tabID: tabID, previousActiveTabID: previousActive,
+            tabID: tabID, previousActiveTabID: previousActive, displayID: displayKey,
             operationCount: ops.count, durationMs: elapsed, failures: failures)
     }
 
@@ -682,7 +743,7 @@ public final class TabEngine {
             // 窓のディスプレイが切断されていれば主ディスプレイへ clamp される(段階 D の消失ポリシー)。
             var ops: [WindowOp] = []
             for tab in state.tabs {
-                let isActive = tab.id == state.activeTabID
+                let isActive = isActiveTab(tab)
                 let desired = desiredFrames(for: tab)
                 for window in tab.windows {
                     // 切断退避中は論理 frame を凍結し op も出さない(段階 D3)。ここで clamp すると
@@ -734,7 +795,7 @@ public final class TabEngine {
         guard let found = state.managedWindow(forWindowID: windowID) else { return }
         let managed = found.window
         // 退避操作そのものが通知を発火させる。退避中の通知は編集モードでも記録しない。
-        guard !parkedWindowIDs.contains(managed.id), found.tab.id == state.activeTabID else { return }
+        guard !parkedWindowIDs.contains(managed.id), isActiveTab(found.tab) else { return }
         // 切断退避中はスナップバックも記録もしない(段階 D3)。編集モードの例外は設けない:
         // OS による移動(切断時の退避)とユーザーのドラッグは通知からは区別できず、遅延して届いた
         // OS 移動の通知 1 発で凍結 frame が上書きされてしまう。位置を変えたい場合は解除→再登録。
@@ -791,7 +852,7 @@ public final class TabEngine {
             pendingRestores[id] = nil
         }
         guard let found = state.managedWindow(id: id), let windowID = found.window.windowID,
-            !parkedWindowIDs.contains(id), found.tab.id == state.activeTabID
+            !parkedWindowIDs.contains(id), isActiveTab(found.tab)
         else { return }
         let driver = self.driver
         // 読み取り(IPC)はロックの外。相手アプリが遅くても他の操作を待たせない。
@@ -809,7 +870,7 @@ public final class TabEngine {
             guard isLatest(id, generation), !isReleasingForShutdown, !isLayoutTransitioning,
                 let found = state.managedWindow(id: id), found.window.windowID == windowID,
                 !parkedWindowIDs.contains(id),
-                found.tab.id == state.activeTabID
+                isActiveTab(found.tab)
             else { return }
             if probed.fullscreen == true {
                 if fullscreenWindowIDs.insert(id).inserted {
@@ -850,7 +911,7 @@ public final class TabEngine {
                     }
                     guard isLatest(id, generation), !isReleasingForShutdown, !isLayoutTransitioning,
                         let rebound = state.managedWindow(id: id), rebound.window.windowID == windowID,
-                        rebound.tab.id == state.activeTabID, !parkedWindowIDs.contains(id),
+                        isActiveTab(rebound.tab), !parkedWindowIDs.contains(id),
                         !opsSuppressed(for: rebound.window)
                     else { return }
                     // 静止後に複数回試しても戻らない = 相手アプリの制約。到達 frame を新しい基準にする。
@@ -888,7 +949,7 @@ public final class TabEngine {
             }
             guard isLatest(id, generation), !isReleasingForShutdown, !isLayoutTransitioning,
                 let rebound = state.managedWindow(id: id), rebound.window.windowID == windowID,
-                rebound.tab.id == state.activeTabID, !parkedWindowIDs.contains(id),
+                isActiveTab(rebound.tab), !parkedWindowIDs.contains(id),
                 !opsSuppressed(for: rebound.window),
                 display.map({ layout.display(id: $0.id) != nil }) ?? true
             else { return }
@@ -978,7 +1039,7 @@ public final class TabEngine {
             }
             var ops: [WindowOp] = []
             for tab in state.tabs {
-                let isActive = tab.id == state.activeTabID
+                let isActive = isActiveTab(tab)
                 for window in tab.windows {
                     guard let windowID = window.windowID, let pid = window.pid else { continue }
                     // 切断退避(D3)・フルスクリーン(段階 2)は補正しない
@@ -1344,7 +1405,7 @@ public final class TabEngine {
         func tabContext(_ tabID: UUID) -> (frames: [UUID: CGRect], isActive: Bool)? {
             if let cached = desiredByTab[tabID] { return cached }
             guard let tab = state.tab(withID: tabID) else { return nil }
-            let context = (desiredFrames(for: tab), tab.id == state.activeTabID)
+            let context = (desiredFrames(for: tab), isActiveTab(tab))
             desiredByTab[tabID] = context
             return context
         }
@@ -1598,7 +1659,7 @@ public final class TabEngine {
         let tab = state.tabs[index]
         let desired = desiredFrames(for: tab)
         guard !desired.isEmpty else { return }
-        let isActive = tab.id == state.activeTabID
+        let isActive = isActiveTab(tab)
         var ops: [WindowOp] = []
         for window in tab.windows {
             guard let target = desired[window.id] else { continue }  // unbound / 切断退避は列に入らない
