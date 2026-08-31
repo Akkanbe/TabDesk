@@ -47,6 +47,18 @@ public struct StateStore: Sendable {
         try data.write(to: fileURL, options: .atomic)
     }
 
+    /// 移行前の状態を 1 回だけ退避する(state.<suffix>.bak.json)。既にあれば何もしない。
+    /// 戻り値: 今回コピーしたか(v4 移行の初回だけログを出す用)。原本は消さない。
+    public func backupFileOnce(suffix: String) throws -> Bool {
+        let backup = fileURL.deletingPathExtension().appendingPathExtension("\(suffix).bak.json")
+        guard FileManager.default.fileExists(atPath: fileURL.path),
+            !FileManager.default.fileExists(atPath: backup.path)
+        else { return false }
+        let data = try Data(contentsOf: fileURL)
+        try data.write(to: backup, options: .atomic)
+        return true
+    }
+
     /// 読めなかったファイルを退避する(上書きして履歴を失わないため)。
     public func backupCorruptFile() throws {
         let backup = fileURL.deletingPathExtension().appendingPathExtension("bak.json")

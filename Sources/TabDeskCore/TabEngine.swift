@@ -124,7 +124,9 @@ public final class TabEngine {
         self.driver = driver
         self.layout = layout
         self.config = configuration
-        self.state = initialState
+        // v4: タブをディスプレイ単位に正規化してから使う(冪等。init 中は didSet が発火しないので
+        // 余計な保存・通知は出ない)。テストの固定フィクスチャにも同じ正規化がかかる。
+        self.state = initialState.migratedForPerDisplayTabs(primaryID: layout.primaryDisplay?.id)
     }
 
     // MARK: - タブ CRUD

@@ -60,20 +60,25 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
     public var lastFocusedWindowID: UUID?
     /// 配置方式(v2 段階 C)。
     public var layout: TabLayout
+    /// 所属ディスプレイ(v4)。nil =「そのときの主ディスプレイ」(v1〜v3 データと空タブ。
+    /// 主画面の役割が移っても凍結しないための意味論)。具体 ID は物理画面に固定される。
+    /// 不変量(v4 段階 3 以降): タブ内の全窓の displayID はタブの displayID と一致する。
+    public var displayID: DisplayID?
 
     public init(
         id: UUID = UUID(), name: String, windows: [ManagedWindow] = [],
-        lastFocusedWindowID: UUID? = nil, layout: TabLayout = .free
+        lastFocusedWindowID: UUID? = nil, layout: TabLayout = .free, displayID: DisplayID? = nil
     ) {
         self.id = id
         self.name = name
         self.windows = windows
         self.lastFocusedWindowID = lastFocusedWindowID
         self.layout = layout
+        self.displayID = displayID
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, windows, lastFocusedWindowID, layout
+        case id, name, windows, lastFocusedWindowID, layout, displayID
     }
 
     /// タブを代表する実ウィンドウ(サムネイル撮影の対象。v3 段階 5)。
@@ -95,6 +100,7 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
         windows = try c.decode([ManagedWindow].self, forKey: .windows)
         lastFocusedWindowID = try c.decodeIfPresent(UUID.self, forKey: .lastFocusedWindowID)
         layout = (try? c.decode(TabLayout.self, forKey: .layout)) ?? .free
+        displayID = try c.decodeIfPresent(DisplayID.self, forKey: .displayID)  // キー無し(v3 以前)= nil = 主
     }
 }
 
@@ -104,12 +110,31 @@ public struct WorkspaceState: Codable, Sendable, Hashable {
 
     public var version: Int
     public var tabs: [Tab]
+    /// v3 まで唯一のアクティブタブ。v4 以降は「主ディスプレイのアクティブ」のミラーとして
+    /// 書き続ける(旧バイナリで開いても v3 モードで動くダウングレード耐性のため。docs/06_v4_design.md)。
     public var activeTabID: UUID?
+    /// ディスプレイごとのアクティブタブ(v4)。キーは接続時の具体 DisplayID
+    /// (nil タブ = 主の意味のタブも、そのときの主ディスプレイの具体 ID で載る)。
+    public var activeTabIDs: [DisplayID: UUID]
 
-    public init(tabs: [Tab] = [], activeTabID: UUID? = nil) {
+    public init(tabs: [Tab] = [], activeTabID: UUID? = nil, activeTabIDs: [DisplayID: UUID] = [:]) {
         self.version = Self.currentVersion
         self.tabs = tabs
         self.activeTabID = activeTabID
+        self.activeTabIDs = activeTabIDs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case version, tabs, activeTabID, activeTabIDs
+    }
+
+    /// activeTabIDs はキーが無い v3 以前のファイルでも読めるよう寛容にデコードする(version は 1 のまま)。
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decode(Int.self, forKey: .version)
+        tabs = try c.decode([Tab].self, forKey: .tabs)
+        activeTabID = try c.decodeIfPresent(UUID.self, forKey: .activeTabID)
+        activeTabIDs = (try? c.decode([DisplayID: UUID].self, forKey: .activeTabIDs)) ?? [:]
     }
 
     public func tab(withID id: UUID) -> Tab? {
@@ -118,6 +143,16 @@ public struct WorkspaceState: Codable, Sendable, Hashable {
 
     public var activeTab: Tab? {
         activeTabID.flatMap(tab(withID:))
+    }
+
+    /// 指定ディスプレイに属するタブ(並び順維持)。nil タブは主ディスプレイ扱い。
+    public func tabs(on displayID: DisplayID, primaryID: DisplayID?) -> [Tab] {
+        tabs.filter { ($0.displayID ?? primaryID) == displayID }
+    }
+
+    /// 指定ディスプレイのアクティブタブ。
+    public func activeTab(on displayID: DisplayID) -> Tab? {
+        activeTabIDs[displayID].flatMap(tab(withID:))
     }
 
     /// 実ウィンドウ ID から登録情報を引く。

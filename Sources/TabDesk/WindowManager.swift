@@ -113,6 +113,21 @@ final class WindowManager {
             if let loaded = try store.load() {
                 initial = loaded
                 logger.log("state loaded: \(loaded.tabs.count) tab(s), \(loaded.allWindows.count) window(s) from \(store.fileURL.path)")
+                // v4 移行がタブを分割する場合は、初回だけ移行前のファイルを退避して要約を残す
+                // (エンジン内の適用は冪等なので、ここは診断とバックアップだけが目的)。
+                let migrated = loaded.migratedForPerDisplayTabs(primaryID: layout.primaryDisplay?.id)
+                if migrated.tabs.map(\.id) != loaded.tabs.map(\.id) {
+                    do {
+                        if try store.backupFileOnce(suffix: "v3") {
+                            logger.log("v4 migration: pre-split state backed up to state.v3.bak.json")
+                        }
+                    } catch {
+                        logger.log("v4 migration: backup failed (continuing): \(error)")
+                    }
+                    let added = migrated.tabs.filter { tab in !loaded.tabs.contains { $0.id == tab.id } }
+                    logger.log("v4 migration: \(loaded.tabs.count) → \(migrated.tabs.count) tab(s); "
+                        + "split into: \(added.map(\.name))")
+                }
             }
         } catch {
             // 読めないファイルは退避して初期状態から始める(履歴は .bak.json に残る)。
