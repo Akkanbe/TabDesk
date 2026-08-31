@@ -52,6 +52,22 @@
 **過渡状態(段階2〜4)**: サイドバーは 1 本のままで、主ディスプレイ以外のアクティブ表示が
 正確でない。旧 activeTabID ミラーにより主画面は v3 同等に動く。段階5 で解消。
 
+## 段階1〜3 の記録(2026-08-31 実装)
+
+- 段階1: スキーマ+移行(挙動変更なし)。移行は TabEngine.init で毎回適用(冪等)。
+  分割が起きる初回は WindowManager が `state.v3.bak.json` に退避し、要約をログに残す
+- 段階2: アクティブ判定 17 箇所を `isActiveTab`(activeTabIDs ベース)に集約。
+  activateUnlocked は対象タブの画面内だけを park/restore し、凍結タブは throw。
+  deleteTab の後継は同一画面から。activateAdjacent(offset:on:) は画面内巡回
+- 段階3: register/bind は**タブの画面が正**(別画面の窓はタブの画面へ引き込み、
+  凍結タブへの登録は throw)。bind コミット時に窓の displayID をタブ値へ正規化。
+  編集モードの画面間ドラッグは移籍(reassignForEditedCrossDisplayMove — removeFromState を
+  通らないので binding・vanished 猶予・復元世代・parked/fullscreen 状態を保持。
+  clearRuntimeTracking の分割は不要になった)。移動先が columns なら組み直す
+- **移籍は free タブからのみ**: columns タブは v2 以来「列が唯一の正・ドラッグは常に
+  スナップバック」なので、画面間ドラッグも列へ戻す。columns の窓を別画面へ移したいときは
+  レイアウトを自由配置に切り替えるか、解除→移動先で登録し直す(確定判断からの詳細化)
+
 ## 段階0 の記録(2026-08-31 実装)
 
 - 0945a38(他 AI の v3 修正。精査済みクリーン)の残件: `setFrame` の IPC 後チェック順を

@@ -169,6 +169,11 @@ public final class TabEngine {
         return layout.display(id: id) == nil
     }
 
+    /// タブの所属ディスプレイ(nil タブ = 主)。
+    private func display(forTab tab: Tab) -> DisplayLayout? {
+        layout.display(id: tab.displayID) ?? layout.primaryDisplay
+    }
+
     public func activeTabID(on displayID: DisplayID) -> UUID? {
         state.activeTabIDs[displayID]
     }
@@ -282,12 +287,18 @@ public final class TabEngine {
             if let existing = state.managedWindow(forWindowID: windowID) {
                 throw EngineError.windowAlreadyRegistered(windowID: windowID, managedID: existing.window.id)
             }
-            // 窓がいたディスプレイに留める(主ディスプレイへの引き込みは段階 D で廃止)。
-            let display = layout.display(containing: frame) ?? layout.primaryDisplay
+            let targetTab = try tab(tabID)
+            // v4: 凍結タブへは登録できない(タブの画面が無いので配置先が決められない)。
+            guard !isTabDisplayDisconnected(targetTab) else {
+                throw EngineError.tabDisplayDisconnected(tabID)
+            }
+            // v4: 配置先は**タブの画面**(タブが正)。別画面にある窓はタブの画面へ引き込まれる
+            // (「このタブはこの画面を管理する」)。窓の displayID はタブの生値を継承 = 不変量。
+            let display = display(forTab: targetTab)
             let frame = clamped(frame, in: display?.contentArea ?? layout.contentArea)
             var managed = ManagedWindow(
-                frame: frame, identity: identity, windowID: windowID, pid: pid, displayID: display?.id)
-            let intoActive = isActiveTab(try tab(tabID))
+                frame: frame, identity: identity, windowID: windowID, pid: pid, displayID: targetTab.displayID)
+            let intoActive = isActiveTab(targetTab)
 
             let outcome = try await place(
                 windowID: windowID, frame: frame, intoActive: intoActive,
@@ -425,6 +436,10 @@ public final class TabEngine {
                 committedFrame = frame
             }
             state.tabs[location.tabIndex].windows[location.windowIndex].windowID = windowID
+            // v4 の不変量: 窓の displayID はタブの値に揃える(再起動後に別画面で見つかった窓も
+            // タブの画面へ帰属。実窓は reconcile / 次の切替がタブの画面へ寄せる)。
+            state.tabs[location.tabIndex].windows[location.windowIndex].displayID =
+                state.tabs[location.tabIndex].displayID
             state.tabs[location.tabIndex].windows[location.windowIndex].pid = pid
             state.tabs[location.tabIndex].windows[location.windowIndex].frame = committedFrame
             if let identity {
@@ -931,12 +946,20 @@ public final class TabEngine {
     private func recordEditedFrame(
         id: UUID, windowID: CGWindowID, current: CGRect, attempt: Int, generation: UInt64, appName: String
     ) async {
+        guard let found = state.managedWindow(id: id) else { return }
         let display = layout.display(containing: current) ?? layout.primaryDisplay
-        let target = clamped(current, in: display?.contentArea ?? layout.contentArea)
+        // v4: 別ディスプレイに置かれたら「移籍」— 移動先画面のアクティブタブへタブごと移る
+        // (ドラッグ = 移動の意思表示。タブが無ければ自動作成)。同一画面なら従来どおり記録のみ。
+        let crossDisplay = display.map { $0.id != resolvedDisplayID(of: found.tab) } ?? false
+        let area = display?.contentArea ?? layout.contentArea
+        let target = clamped(current, in: area)
         if approximatelyEqual(target, current) {
-            updateFrame(id, current)
-            updateDisplayID(id, display?.id)
-            log("edit: recorded \(current) for \(appName)")
+            if crossDisplay, let display {
+                await reassignForEditedCrossDisplayMove(id: id, to: display, frame: current, appName: appName)
+            } else {
+                updateFrame(id, current)
+                log("edit: recorded \(current) for \(appName)")
+            }
             return
         }
         let driver = self.driver
@@ -953,15 +976,57 @@ public final class TabEngine {
                 !opsSuppressed(for: rebound.window),
                 display.map({ layout.display(id: $0.id) != nil }) ?? true
             else { return }
-            updateFrame(id, actual)
-            updateDisplayID(id, display?.id)
-            log("edit: nudged into content area and recorded \(actual) for \(appName)")
+            if crossDisplay, let display {
+                await reassignForEditedCrossDisplayMove(id: id, to: display, frame: actual, appName: appName)
+            } else {
+                updateFrame(id, actual)
+                log("edit: nudged into content area and recorded \(actual) for \(appName)")
+            }
         } catch {
             guard isLatest(id, generation) else { return }
             log("edit: could not nudge \(appName) (\(error)); keeping previous frame")
             if attempt < config.maxRestoreAttempts {
                 scheduleRestore(id, attempt: attempt + 1)
             }
+        }
+    }
+
+    /// 編集モードの画面間ドラッグによる「移籍」(v4 段階 3。docs/06_v4_design.md)。
+    /// 移動先ディスプレイのアクティブタブへ ManagedWindow を移す(タブが無ければ自動作成)。
+    /// removeFromState / clearRuntimeTracking を**通らない**移動なので、binding・vanished 猶予・
+    /// 復元世代・parked/fullscreen 状態は生きた窓と一緒に保たれる。
+    /// 呼び出しは performRestore の直列区間内(前提の再検証は呼び手が済ませている)。
+    private func reassignForEditedCrossDisplayMove(
+        id: UUID, to display: DisplayLayout, frame: CGRect, appName: String
+    ) async {
+        let destTab: Tab
+        if let activeID = state.activeTabIDs[display.id], let tab = state.tab(withID: activeID) {
+            destTab = tab
+        } else {
+            let count = state.tabs.filter { resolvedDisplayID(of: $0) == display.id }.count
+            destTab = createTab(name: "タブ\(count + 1)", on: display.id)  // first-tab-wins で active 化
+        }
+        guard let source = windowLocation(of: id) else { return }
+        let sourceTab = state.tabs[source.tabIndex]
+        guard sourceTab.id != destTab.id, let destIndex = state.tabs.firstIndex(where: { $0.id == destTab.id })
+        else { return }
+        var next = state
+        var window = next.tabs[source.tabIndex].windows.remove(at: source.windowIndex)
+        if next.tabs[source.tabIndex].lastFocusedWindowID == id {
+            next.tabs[source.tabIndex].lastFocusedWindowID = nil
+        }
+        window.displayID = destTab.displayID  // 不変量: タブの生値を継承
+        window.frame = frame
+        next.tabs[destIndex].windows.append(window)
+        next.tabs[destIndex].lastFocusedWindowID = id  // ユーザーが掴んでいる窓
+        state = next
+        log("edit: moved \(appName) to display \(display.id) → tab \(destTab.name)")
+        // columns は両側で組み直す(直列区間内なので直接呼べる)。
+        if sourceTab.layout == .columns {
+            await retileUnlocked(sourceTab.id)
+        }
+        if state.tabs[destIndex].layout == .columns {
+            await retileUnlocked(destTab.id)
         }
     }
 
@@ -1615,10 +1680,6 @@ public final class TabEngine {
     /// その隅が配置の内側なら外縁ディスプレイへ fallback する。
     private func parkPoint(for window: ManagedWindow) -> CGPoint {
         display(for: window)?.parkPoint ?? layout.parkPoint
-    }
-
-    private func updateDisplayID(_ id: UUID, _ displayID: DisplayID?) {
-        updateManagedWindow(id) { $0.displayID = displayID }
     }
 
     // MARK: - タイルレイアウト(段階 C)
