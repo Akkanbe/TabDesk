@@ -188,13 +188,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleThumbnails(_ sender: NSMenuItem) {
         ThumbnailStore.enabledSetting.value.toggle()
-        sender.state = ThumbnailStore.enabledSetting.value ? .on : .off
+        let enabled = ThumbnailStore.enabledSetting.value
+        sender.state = enabled ? .on : .off
+        if !enabled {
+            // opt-out 後に開始済みの ScreenCaptureKit 処理を継続させず、再ON時の古い表示も防ぐ。
+            manager.thumbnails.cancelAll(clearImages: true)
+        }
         // 有効化時にまだ権限が無ければ、この場でシステムのプロンプトを出す(初回のみ表示される)。
-        if ThumbnailStore.enabledSetting.value, !ThumbnailStore.hasPermission {
+        if enabled, !ThumbnailStore.hasPermission {
             CGRequestScreenCaptureAccess()
         }
         sidebar?.refreshThumbnailPresentation()
-        logger.log("tabThumbnailsEnabled=\(ThumbnailStore.enabledSetting.value) permission=\(ThumbnailStore.hasPermission)")
+        logger.log("tabThumbnailsEnabled=\(enabled) permission=\(ThumbnailStore.hasPermission)")
     }
 
     @objc private func toggleFrameWindows(_ sender: NSMenuItem) {

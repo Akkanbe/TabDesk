@@ -4,7 +4,7 @@ macOS で他アプリのウィンドウを「タブ」として管理するユ�
 リポジトリ: https://github.com/Akkanbe/TabDesk
 仕様は [docs/01_spec.md](docs/01_spec.md) を参照。
 
-## 現在の状態: v2 実装済み(実機確認中)
+## 現在の状態: v3 実装済み(実機確認中)
 
 フル Xcode は不要(Command Line Tools の Swift で足ります)。
 

@@ -31,6 +31,20 @@ struct SidebarMetricsTests {
         #expect(metrics.expandedWidth == SidebarMetrics.minWidth)
     }
 
+    @Test func nonFiniteWidthsFallBackToDefault() {
+        let (metrics, defaults, suite) = makeMetrics()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        for invalid in [Double.nan, Double.infinity, -Double.infinity] {
+            defaults.set(invalid, forKey: "SidebarExpandedWidth")
+            #expect(metrics.expandedWidth == SidebarMetrics.defaultWidth)
+        }
+        for invalid in [CGFloat.nan, CGFloat.infinity, -CGFloat.infinity] {
+            metrics.expandedWidth = invalid
+            #expect(metrics.expandedWidth == SidebarMetrics.defaultWidth)
+        }
+    }
+
     @Test func effectiveWidthFollowsCollapse() {
         let (metrics, defaults, suite) = makeMetrics()
         defer { defaults.removePersistentDomain(forName: suite) }

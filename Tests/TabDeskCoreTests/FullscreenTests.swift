@@ -197,6 +197,63 @@ struct FullscreenTests {
         #expect(driver.currentFrame(1) == fullscreenRect)
     }
 
+    /// 登録の配置 IPC 中に fullscreen へ入っても、その寸法を初期の固定 frame にしない。
+    @Test func registerDuringFullscreenEntryKeepsLogicalFrame() async throws {
+        let (engine, driver) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: recorded, delay: 0.08)
+
+        let registration = Task {
+            try await engine.register(
+                windowID: 1, pid: 100, identity: identity("a"), frame: recorded, into: tab.id)
+        }
+        try await withDeadline {
+            while driver.callCount("setFrame:1") == 0 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        driver.setFullscreen(1)
+        driver.moveExternally(1, to: fullscreenRect)
+        let managed = try await registration.value
+
+        #expect(managed.frame == recorded)
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == recorded)
+        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(driver.currentFrame(1) == fullscreenRect)
+    }
+
+    /// 保存エントリの bind 中に fullscreen へ入っても、現在領域へclampした論理frameを保持する。
+    @Test func bindDuringFullscreenEntryKeepsClampedLogicalFrame() async throws {
+        let driver = FakeWindowDriver()
+        let saved = CGRect(x: 2_500, y: 900, width: 800, height: 600)
+        let managed = ManagedWindow(
+            frame: saved, identity: identity("old"), windowID: nil, pid: nil)
+        let tab = Tab(name: "A", windows: [managed])
+        let engine = TabEngine(
+            driver: driver,
+            layout: FixedScreenLayout(parkPoint: park, contentArea: content),
+            initialState: WorkspaceState(tabs: [tab], activeTabID: tab.id))
+        driver.add(11, frame: CGRect(x: 0, y: 0, width: 640, height: 480), delay: 0.08)
+
+        let binding = Task { try await engine.bind(managed.id, windowID: 11, pid: 110) }
+        try await withDeadline {
+            while driver.callCount("setFrame:11") == 0 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        driver.setFullscreen(11)
+        driver.moveExternally(11, to: fullscreenRect)
+        try await binding.value
+
+        let expected = CGRect(x: 1_120, y: 520, width: 800, height: 600)
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == expected)
+        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(driver.currentFrame(11) == fullscreenRect)
+    }
+
     /// reconcile はフルスクリーンの出入りに追従して集合を更新する。
     @Test func reconcileRefreshesFullscreenMembership() async throws {
         let (engine, driver) = makeEngine()
@@ -212,5 +269,172 @@ struct FullscreenTests {
         driver.setFullscreen(1, false)
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
         #expect(engine.fullscreenWindowIDs.isEmpty)
+    }
+
+    /// reconcile の次回 tick より先に終了しても、フルスクリーン寸法を保存値へ採用しない。
+    @Test func shutdownBeforeReconcileDoesNotAdoptFullscreenFrame() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let inactive = engine.createTab(name: "B")
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: recorded)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("b"), frame: recorded, into: inactive.id)
+        #expect(engine.parkedWindowIDs.contains(managed.id))
+
+        // fullscreen 集合を更新する reconcile より先に終了する。
+        driver.setFullscreen(1)
+        driver.moveExternally(1, to: fullscreenRect)
+        let writesBefore = driver.callCount("setFrame") + driver.callCount("setPosition")
+        await engine.releaseAllParkedWindows()
+
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == recorded)
+        #expect(driver.currentFrame(1) == fullscreenRect)
+        #expect(driver.callCount("setFrame") + driver.callCount("setPosition") == writesBefore,
+            "終了処理は未検出のフルスクリーン窓にも書き込まない")
+    }
+
+    /// release直前の属性読取りが失敗しても、既知fullscreenの前回判定を維持して触らない。
+    @Test func shutdownKeepsKnownFullscreenWhenProbeIsUnreadable() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let inactive = engine.createTab(name: "B")
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: recorded)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("b"), frame: recorded, into: inactive.id)
+        driver.setFullscreen(1)
+        driver.moveExternally(1, to: fullscreenRect)
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+        driver.setFullscreenReadFails(1)
+        let writesBefore = driver.callCount("setFrame") + driver.callCount("setPosition")
+
+        await engine.releaseAllParkedWindows()
+
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == recorded)
+        #expect(driver.currentFrame(1) == fullscreenRect)
+        #expect(driver.callCount("setFrame") + driver.callCount("setPosition") == writesBefore)
+        #expect(!engine.parkedWindowIDs.contains(managed.id))
+    }
+
+    /// 復元不要な表示中の窓はfullscreen preflight対象にせず、終了期限を消費しない。
+    @Test func shutdownDoesNotProbeUnchangedActiveWindows() async throws {
+        let (engine, driver) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: recorded)
+        try await engine.register(
+            windowID: 1, pid: 100, identity: identity("a"), frame: recorded, into: tab.id)
+        let probesBefore = driver.callCount("isFullscreen:1")
+
+        await engine.releaseAllParkedWindows()
+
+        #expect(driver.callCount("isFullscreen:1") == probesBefore)
+        #expect(driver.currentFrame(1) == recorded)
+    }
+
+    /// 同一アプリに復元候補が複数あっても、全窓のpreflight待ちで最初の復元を遅らせない。
+    @Test func shutdownInterleavesFullscreenProbeAndRestorePerPID() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let inactive = engine.createTab(name: "B")
+        let first = CGRect(x: 300, y: 100, width: 500, height: 400)
+        let second = CGRect(x: 900, y: 200, width: 500, height: 400)
+        driver.add(1, frame: first)
+        driver.add(2, frame: second)
+        try await engine.register(
+            windowID: 1, pid: 100, identity: identity("one"), frame: first, into: inactive.id)
+        try await engine.register(
+            windowID: 2, pid: 100, identity: identity("two"), frame: second, into: inactive.id)
+        let callsBefore = driver.totalCallCount()
+
+        await engine.releaseAllParkedWindows()
+
+        let releaseCalls = Array(driver.callLog().dropFirst(callsBefore))
+        let firstRestore = try #require(releaseCalls.firstIndex(of: "setFrame:1"))
+        let secondProbe = try #require(releaseCalls.firstIndex(of: "isFullscreen:2"))
+        #expect(firstRestore < secondProbe, "probe→restoreを窓ごとに進める")
+        #expect(driver.currentFrame(1) == first)
+        #expect(driver.currentFrame(2) == second)
+    }
+
+    /// 古い実窓の観測結果を、同じ managed ID に再紐付けされた新しい実窓へ適用しない。
+    @Test func staleReconcileObservationDoesNotAffectReboundWindow() async throws {
+        let (engine, driver) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let inactive = engine.createTab(name: "B")
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        let staleFrame = CGRect(x: 700, y: 300, width: 500, height: 400)
+        driver.add(1, frame: recorded, delay: 0.08)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("old"), frame: recorded, into: inactive.id)
+        driver.setFullscreen(1)
+        driver.moveExternally(1, to: staleFrame)
+
+        // frame + fullscreen の遅い読み取り中に、同じ entry を別の通常窓へ再紐付けする。
+        let readsBefore = driver.callCount("frame:1")
+        let reconciliation = Task {
+            await engine.reconcile(liveWindowIDs: [1], livePIDs: [100, 200])
+        }
+        try await withDeadline {
+            while driver.callCount("frame:1") == readsBefore {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        engine.unbindWindows(pid: 100)
+        driver.add(2, frame: recorded)
+        try await engine.bind(managed.id, windowID: 2, pid: 200)
+        let parksAfterBind = driver.callCount("setPosition:2")
+        await reconciliation.value
+
+        #expect(engine.state.managedWindow(id: managed.id)?.window.windowID == 2)
+        #expect(!engine.fullscreenWindowIDs.contains(managed.id),
+            "旧窓の fullscreen=true を新しい binding へ持ち越さない")
+        #expect(driver.callCount("setPosition:2") == parksAfterBind,
+            "旧窓の frame を新しい binding の退避ずれ判定に使わない")
+    }
+
+    /// destroyed で binding を外した時点で、binding 固有の runtime 状態も破棄する。
+    @Test func vanishedWindowClearsFullscreenAndRestoreTracking() async throws {
+        let (engine, driver) = makeEngine(debounceMs: 500)
+        let tab = engine.createTab(name: "A")
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: recorded)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("a"), frame: recorded, into: tab.id)
+        engine.windowFrameDidChange(windowID: 1)  // restoreGeneration を作る
+        driver.setFullscreen(1)
+        driver.moveExternally(1, to: fullscreenRect)
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.restoreGenerationCountForTesting > 0)
+
+        engine.noteWindowDestroyed(windowID: 1)
+
+        #expect(engine.state.managedWindow(id: managed.id)?.window.isBound == false)
+        #expect(!engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.restoreGenerationCountForTesting == 0)
+    }
+
+    /// タブを丸ごと削除する経路も、窓ごとの runtime 状態を残さない。
+    @Test func deletingTabClearsFullscreenAndRestoreTracking() async throws {
+        let (engine, driver) = makeEngine(debounceMs: 500)
+        _ = engine.createTab(name: "A")
+        let doomed = engine.createTab(name: "B")
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: recorded)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("b"), frame: recorded, into: doomed.id)
+        driver.setFullscreen(1)
+        driver.moveExternally(1, to: fullscreenRect)
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+
+        _ = try await engine.deleteTab(doomed.id)
+
+        #expect(engine.state.managedWindow(id: managed.id) == nil)
+        #expect(!engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.restoreGenerationCountForTesting == 0)
     }
 }

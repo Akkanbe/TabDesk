@@ -386,6 +386,9 @@ final class WindowManager {
             if focusSwitchDepth == 0 { schedulePendingFocusFollow() }
         }
         let report = try await operation()
+        // 終了開始前に入った切替は AX IPC 待ちから後で戻り得る。beginTermination() が
+        // 既存撮影を止めたあとに、新しい撮影 Task を作り直さない。
+        guard !isTerminating else { return }
         // タブが実際に替わったら、離れたタブの代表窓を撮影する(v3 段階 5。無効時は Store 側で即 return)。
         // 「離れたタブ」は直列区間内で確定した report の値を使う(切替連打時、入口で読んだ
         // activeTabID は待ち行列の間に古くなり、間のタブの撮影が抜けるため)。
@@ -641,6 +644,7 @@ final class WindowManager {
         layoutReapplyTask?.cancel()
         restoreTask?.cancel()
         focusFollowTask?.cancel()
+        thumbnails.cancelAll(clearImages: false)
         focusGeneration &+= 1
         pendingFocusedWindowID = nil
         // 全窓解放が遅くても、最新の登録情報だけは期限前に保存しておく。

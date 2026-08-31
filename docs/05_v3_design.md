@@ -71,8 +71,10 @@ ScreenCaptureKit は TabDesk モジュールの 1 ファイルに隔離。
 - 解除は次の reconcile(2 秒以内)が検出して自動復帰。解除直後のずれは既存のずれ検知が復元
 - 解除・タブ削除・終了はフルスクリーン窓に触れず登録だけ手放す。`tabdesk://status` に
   fullscreen カウントを追加
-- 残存する既知の狭い競合: op の IPC 実行中とちょうど同時に進入した場合、その 1 op 分の採用が
-  起こりうる(次の構造イベントまで無害、ウィンドウは最大 2 秒で集合入り)
+- **IPC中の進入競合も再検証**: register / bind / snapback / 編集clamp / 通常op / 解除の各frame採用経路は、
+  書込み後にもbinding・fullscreen・ディスプレイ接続状態を確認し、fullscreen寸法や切断後の到達値を
+  論理frameへ保存しない。終了時は復元候補だけを対象に、同一pid内で窓ごとの
+  fullscreen確認→復元を続けて実行し、3秒の終了期限内のbest-effort復元も維持する
 
 ## 段階3 の判断(2026-08-30 実装): サイドバー幅ドラッグ+折りたたみ
 
@@ -83,7 +85,8 @@ ScreenCaptureKit は TabDesk モジュールの 1 ファイルに隔離。
   共有参照が本質(固定幅の互換 init も残した)
 - `WindowManager.applySidebarWidthChange()`: ユーザー操作起点なので 1 秒デバウンスを挟まず
   begin → reapply → end を即時実行。generation を進めて並行する画面変更 Task の早期解除を防ぐ。
-  完了後に `onContentAreaChanged` フック(段階 4 の枠が使う)。権限が無くてもフックは呼ぶ
+  `onContentAreaChanged` フック(段階 4 の枠が使う)は同期で即時通知し、並行 Task が世代負けしても
+  枠を取り残さない。権限が無くてもフックは呼ぶ
 - リサイズハンドル(右端 8px): パネルは `.nonactivatingPanel` でキーにならないため、
   カーソル追跡は `.activeAlways` が必須。ドラッグ中はパネルだけライブリサイズし、
   離した時点で幅を確定して窓をリフローする(ドラッグ中に窓を動かすと 100ms 級の AX IPC が連発するため)

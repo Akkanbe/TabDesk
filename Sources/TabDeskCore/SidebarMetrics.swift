@@ -24,8 +24,18 @@ public struct SidebarMetrics: Sendable {
 
     /// 展開時の幅。読み書きの両方で [minWidth, maxWidth] に丸める(手書きの defaults にも耐える)。
     public var expandedWidth: CGFloat {
-        get { min(max(CGFloat(width.value), Self.minWidth), Self.maxWidth) }
-        nonmutating set { width.value = Double(min(max(newValue, Self.minWidth), Self.maxWidth)) }
+        get {
+            let stored = CGFloat(width.value)
+            guard stored.isFinite else {
+                width.value = Double(Self.defaultWidth)  // 起動クラッシュが再発しないよう壊れた保存値も自己修復する
+                return Self.defaultWidth
+            }
+            return min(max(stored, Self.minWidth), Self.maxWidth)
+        }
+        nonmutating set {
+            let finite = newValue.isFinite ? newValue : Self.defaultWidth
+            width.value = Double(min(max(finite, Self.minWidth), Self.maxWidth))
+        }
     }
 
     public var isCollapsed: Bool {

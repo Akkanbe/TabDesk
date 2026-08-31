@@ -61,6 +61,8 @@ final class FrameWindowController: NSObject {
         window.level = NSWindow.Level(rawValue: NSWindow.Level.normal.rawValue - 1)
         // クリック素通しは必須(無いと管理対象ウィンドウの隙間のクリックを枠が奪う)。
         window.ignoresMouseEvents = true
+        // 見た目だけの装飾を VoiceOver の「空のウィンドウ」として列挙させない。
+        window.setAccessibilityElement(false)
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         window.isReleasedWhenClosed = false
         window.backgroundColor = .clear

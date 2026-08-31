@@ -21,7 +21,11 @@ final class ThumbnailStore {
     /// tab.id キー。行ビューは state 変更のたびに作り直されるので、キャッシュはここに置く。
     private(set) var images: [UUID: NSImage] = [:]
     var onUpdated: (@MainActor (UUID) -> Void)?
-    private var captureTasks: [UUID: Task<Void, Never>] = [:]
+    private struct CaptureJob {
+        let generation: UUID
+        let task: Task<Void, Never>
+    }
+    private var captureTasks: [UUID: CaptureJob] = [:]
     /// 失敗ログは 1 回だけ(切替のたびに同じ失敗を書かない)。
     private var loggedFailure = false
     private let logger: FileLogger
@@ -33,21 +37,42 @@ final class ThumbnailStore {
     /// タブの代表窓を非同期で撮影する(同じタブの前回の撮影が残っていれば置き換える)。
     func capture(tabID: UUID, windowID: CGWindowID) {
         guard Self.enabledSetting.value, Self.hasPermission else { return }
-        captureTasks[tabID]?.cancel()
-        captureTasks[tabID] = Task { [weak self] in
-            await self?.performCapture(tabID: tabID, windowID: windowID)
+        captureTasks[tabID]?.task.cancel()
+        let generation = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performCapture(tabID: tabID, windowID: windowID)
+            self.finishCapture(tabID: tabID, generation: generation)
         }
+        captureTasks[tabID] = CaptureJob(generation: generation, task: task)
     }
 
     func remove(tabID: UUID) {
-        captureTasks[tabID]?.cancel()
+        captureTasks[tabID]?.task.cancel()
         captureTasks[tabID] = nil
         images[tabID] = nil
     }
 
+    /// 機能OFF・終了時に、開始済みの画面撮影も止める。OFF時は再ONで古い画像を
+    /// 即表示しないようキャッシュも破棄し、終了時は不要なUI更新を避けて画像だけ残してよい。
+    func cancelAll(clearImages: Bool) {
+        captureTasks.values.forEach { $0.task.cancel() }
+        captureTasks.removeAll()
+        if clearImages { images.removeAll() }
+    }
+
+    private func finishCapture(tabID: UUID, generation: UUID) {
+        guard captureTasks[tabID]?.generation == generation else { return }
+        captureTasks[tabID] = nil
+    }
+
     private func performCapture(tabID: UUID, windowID: CGWindowID) async {
+        guard Self.enabledSetting.value, !Task.isCancelled else { return }
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            // Task.cancel は ScreenCaptureKit の await を即中断するとは限らない。撮影開始前にも
+            // opt-in 状態を見直し、OFF/削除/終了後に新しい撮影を始めない。
+            guard Self.enabledSetting.value, !Task.isCancelled else { return }
             guard let scWindow = content.windows.first(where: { $0.windowID == windowID }) else { return }
             let size = scWindow.frame.size
             guard size.width > 0, size.height > 0 else { return }
@@ -58,11 +83,12 @@ final class ThumbnailStore {
             config.height = Int(size.height * scale * 2)
             config.showsCursor = false
             let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-            guard !Task.isCancelled else { return }
+            guard Self.enabledSetting.value, !Task.isCancelled else { return }
             images[tabID] = NSImage(
                 cgImage: image, size: NSSize(width: size.width * scale, height: size.height * scale))
             onUpdated?(tabID)
         } catch {
+            guard !Task.isCancelled else { return }
             // 権限剥奪・窓の消滅などは静かに劣化する(古いサムネイルを残す)。
             if !loggedFailure {
                 loggedFailure = true

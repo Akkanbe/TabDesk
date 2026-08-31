@@ -418,7 +418,7 @@ struct ReconcileHeuristicTests {
 }
 
 /// デッドロックしたらテストが永久に止まるので、期限付きで待つ。
-private func withDeadline<T: Sendable>(_ ms: Int = 1000, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+func withDeadline<T: Sendable>(_ ms: Int = 1000, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
     try await withThrowingTaskGroup(of: T.self) { group in
         group.addTask { try await body() }
         group.addTask {
@@ -430,7 +430,7 @@ private func withDeadline<T: Sendable>(_ ms: Int = 1000, _ body: @escaping @Send
         return result
     }
 }
-private struct DeadlineExceeded: Error {}
+struct DeadlineExceeded: Error {}
 
 @MainActor
 struct ReviewFollowUpTests {

@@ -31,11 +31,12 @@ private func identity(_ name: String) -> WindowIdentity {
 }
 
 @MainActor
-private func makeEngine() -> (TabEngine, FakeWindowDriver, MutableScreenLayout) {
+private func makeEngine(maxRestoreAttempts: Int = 3) -> (TabEngine, FakeWindowDriver, MutableScreenLayout) {
     let driver = FakeWindowDriver()
     let layout = MutableScreenLayout(displays: [mainDisplay, secondDisplay])
     var config = TabEngine.Configuration()
     config.debounce = .milliseconds(20)
+    config.maxRestoreAttempts = maxRestoreAttempts
     let engine = TabEngine(driver: driver, layout: layout, configuration: config)
     return (engine, driver, layout)
 }
@@ -256,6 +257,150 @@ struct MultiDisplayTests {
         #expect(engine.state.managedWindow(id: managed.id)?.window.frame == externalFrame, "保存値は凍結のまま")
         #expect(driver.currentFrame(1) == osPlaced, "実窓は動かさない")
         #expect(engine.parkedWindowIDs.isEmpty, "退避フラグは畳んで手放す")
+    }
+
+    /// fullscreen確認の待機中に切断された場合、その確認後に新しいrestoreを発行しない。
+    @Test func shutdownDoesNotStartRestoreAfterDisconnectDuringProbe() async throws {
+        let (engine, driver, layout) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let inactive = engine.createTab(name: "B")
+        let externalFrame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: externalFrame, delay: 0.08)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("ext"), frame: externalFrame, into: inactive.id)
+        let probesBefore = driver.callCount("isFullscreen:1")
+        let writesBefore = driver.callCount("setFrame:1")
+
+        let release = Task { await engine.releaseAllParkedWindows() }
+        try await withDeadline {
+            while driver.callCount("isFullscreen:1") == probesBefore {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        layout.change(displays: [soloMainDisplay])
+        let osPlaced = CGRect(x: 500, y: 200, width: 800, height: 600)
+        driver.moveExternally(1, to: osPlaced)
+        await release.value
+
+        #expect(driver.callCount("setFrame:1") == writesBefore)
+        #expect(driver.currentFrame(1) == osPlaced)
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == externalFrame)
+        #expect(!engine.parkedWindowIDs.contains(managed.id))
+    }
+
+    /// 復元 IPC の開始後にディスプレイが切断されても、到達 frame を保存値へ採用しない。
+    @Test func shutdownReleaseDoesNotAdoptFrameAfterMidIPCDisconnect() async throws {
+        let (engine, driver, layout) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let inactive = engine.createTab(name: "B")
+        let externalFrame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: externalFrame, delay: 0.15)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("ext"), frame: externalFrame, into: inactive.id)
+        driver.setMinSize(CGSize(width: 900, height: 0), of: 1)
+
+        let writesBefore = driver.callCount("setFrame:1")
+        let release = Task { await engine.releaseAllParkedWindows() }
+        try await withDeadline {
+            while driver.callCount("setFrame:1") == writesBefore {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        // setFrame は既に IPC 中。macOS がその途中で外部画面を切断した状況を模す。
+        layout.change(displays: [soloMainDisplay])
+        await release.value
+
+        #expect(driver.currentFrame(1)?.width == 900, "開始済み IPC 自体は取り消せない")
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == externalFrame,
+            "切断後の到達 frame を保存値へ採用しない")
+        #expect(!engine.parkedWindowIDs.contains(managed.id))
+    }
+
+    /// スナップバック最終試行のIPC中に切断されても、制約後の到達frameを保存しない。
+    @Test func snapbackDoesNotAdoptFrameAfterMidIPCDisconnect() async throws {
+        let (engine, driver, layout) = makeEngine(maxRestoreAttempts: 1)
+        let tab = engine.createTab(name: "A")
+        let externalFrame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: externalFrame, delay: 0.08)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("ext"), frame: externalFrame, into: tab.id)
+        driver.setMinSize(CGSize(width: 900, height: 0), of: 1)
+        driver.moveExternally(1, to: CGRect(x: 2500, y: 300, width: 800, height: 600))
+
+        let writesBefore = driver.callCount("setFrame:1")
+        engine.windowFrameDidChange(windowID: 1)
+        engine.flushPendingRestores()
+        try await withDeadline {
+            while driver.callCount("setFrame:1") == writesBefore {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        layout.change(displays: [soloMainDisplay])
+        // restore が持つ直列区間の完了を待つ。reconcile 自体は切断中なのでopを出さない。
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+
+        #expect(driver.currentFrame(1)?.width == 900, "開始済みIPC自体は取り消せない")
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == externalFrame)
+    }
+
+    /// 編集モードのclamp IPC中に切断されても、OS側の到達値と所属を編集結果として採用しない。
+    @Test func editClampDoesNotAdoptFrameAfterMidIPCDisconnect() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let externalFrame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: externalFrame, delay: 0.08)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("ext"), frame: externalFrame, into: tab.id)
+        engine.editMode = true
+        let outside = CGRect(x: 4300, y: 1200, width: 800, height: 600)
+        driver.moveExternally(1, to: outside)
+
+        let writesBefore = driver.callCount("setFrame:1")
+        engine.windowFrameDidChange(windowID: 1)
+        engine.flushPendingRestores()
+        try await withDeadline {
+            while driver.callCount("setFrame:1") == writesBefore {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        layout.change(displays: [soloMainDisplay])
+        await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
+
+        let saved = try #require(engine.state.managedWindow(id: managed.id)?.window)
+        #expect(driver.currentFrame(1) != outside, "開始済みclamp IPC自体は取り消せない")
+        #expect(saved.frame == externalFrame)
+        #expect(saved.displayID == secondDisplay.id)
+    }
+
+    /// 失敗opの読み戻し中に切断された場合も、D3として手放しfailure/parkedを残さない。
+    @Test func failedRestoreReadbackHandlesMidIPCDisconnect() async throws {
+        let (engine, driver, layout) = makeEngine()
+        _ = engine.createTab(name: "A")
+        let inactive = engine.createTab(name: "B")
+        let externalFrame = CGRect(x: 2400, y: 200, width: 800, height: 600)
+        driver.add(1, frame: externalFrame, delay: 0.08)
+        let managed = try await engine.register(
+            windowID: 1, pid: 100, identity: identity("ext"), frame: externalFrame, into: inactive.id)
+        driver.setFailWrites(1)
+
+        let readsBefore = driver.callCount("frame:1")
+        let activation = Task { try await engine.activate(inactive.id) }
+        try await withDeadline {
+            while driver.callCount("frame:1") == readsBefore {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        layout.change(displays: [soloMainDisplay])
+        let report = try await activation.value
+
+        #expect(report.failures.isEmpty)
+        #expect(!engine.parkedWindowIDs.contains(managed.id))
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == externalFrame)
     }
 
     /// reconcile は切断中の窓に補正 op を出さない(park 再試行・ずれ検知・フラグ修復すべて対象外)。

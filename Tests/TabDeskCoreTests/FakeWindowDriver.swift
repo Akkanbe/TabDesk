@@ -83,6 +83,10 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         lock.withLock { calls.count }
     }
 
+    func callLog() -> [String] {
+        lock.withLock { calls }
+    }
+
     private func withWindow<T>(_ id: CGWindowID, _ name: String, _ body: (inout Window) throws -> T) throws -> T {
         let delay: TimeInterval = lock.withLock {
             calls.append("\(name):\(id)")
@@ -94,10 +98,11 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         if delay > 0 { Thread.sleep(forTimeInterval: delay) }
         return try lock.withLock {
             guard var w = windows[id], w.alive else { throw WindowDriverError.unknownWindow(id) }
-            if w.failWrites, name != "frame" { throw SimulatedTimeout() }
+            let isWrite = name == "setFrame" || name == "setPosition" || name == "raise"
+            if w.failWrites, isWrite { throw SimulatedTimeout() }
             let result = try body(&w)
             windows[id] = w
-            if w.throwAfterApply, name != "frame" { throw SimulatedTimeout() }
+            if w.throwAfterApply, isWrite { throw SimulatedTimeout() }
             return result
         }
     }

@@ -203,6 +203,7 @@ final class SidebarPanel: NSPanel {
         expand.isBordered = false
         expand.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         expand.toolTip = "サイドバーを展開"
+        expand.setAccessibilityLabel("サイドバーを展開")
         expand.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(expand)
         NSLayoutConstraint.activate([
@@ -219,6 +220,7 @@ final class SidebarPanel: NSPanel {
         let collapse = NSButton(title: "«", target: self, action: #selector(toggleCollapseAction))
         collapse.bezelStyle = .inline
         collapse.toolTip = "サイドバーを折りたたむ"
+        collapse.setAccessibilityLabel("サイドバーを折りたたむ")
         let addTab = NSButton(title: "＋", target: self, action: #selector(addTab))
         addTab.bezelStyle = .inline
         addTab.toolTip = "タブを追加"
@@ -602,6 +604,32 @@ private final class SidebarResizeHandle: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    // マウスドラッグだけでなく VoiceOver の増減アクションからも同じ確定経路を通す。
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .slider }
+    override func accessibilityLabel() -> String? { "サイドバーの幅" }
+    override func accessibilityValue() -> Any? { window?.frame.width }
+    override func accessibilityMinValue() -> Any? { SidebarMetrics.minWidth }
+    override func accessibilityMaxValue() -> Any? { SidebarMetrics.maxWidth }
+
+    override func accessibilityPerformIncrement() -> Bool {
+        adjustWidth(by: 16)
+    }
+
+    override func accessibilityPerformDecrement() -> Bool {
+        adjustWidth(by: -16)
+    }
+
+    private func adjustWidth(by delta: CGFloat) -> Bool {
+        guard let width = window?.frame.width else { return false }
+        let target = min(max(width + delta, SidebarMetrics.minWidth), SidebarMetrics.maxWidth)
+        guard target != width else { return false }
+        onDrag?(target)
+        onCommit?()
+        NSAccessibility.post(element: self, notification: .valueChanged)
+        return true
+    }
+
     override func updateTrackingAreas() {
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(
@@ -627,6 +655,7 @@ private final class SidebarResizeHandle: NSView {
 
     override func mouseUp(with event: NSEvent) {
         onCommit?()
+        NSAccessibility.post(element: self, notification: .valueChanged)
     }
 }
 
