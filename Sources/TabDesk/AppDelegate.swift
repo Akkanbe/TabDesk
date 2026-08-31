@@ -74,7 +74,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return }
             switch action {
             case .activateTab(let number):
-                let tabs = self.manager.engine.state.tabs
+                // v4: 「選択中のディスプレイ」の n 番目のタブ(フォーカス窓の画面 → マウスの画面)。
+                guard let displayID = self.manager.selectedDisplayID() else { return }
+                let tabs = self.manager.engine.state.tabs(
+                    on: displayID, primaryID: self.manager.layout.primaryDisplay?.id)
                 guard tabs.indices.contains(number - 1) else { return }
                 let tabID = tabs[number - 1].id
                 Task { [weak self] in

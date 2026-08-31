@@ -146,9 +146,12 @@ final class WindowManager {
             self?.scheduleSave()
             self?.onStateChanged?(state)
         }
-        engine.activateApplication = { [weak self] pid, _ in
-            // TODO(v4 段階 4): 切替した画面 == 選択中の画面のときだけ前面化する(displayID を使う)。
-            if self?.suppressAppActivation?() == true { return }
+        engine.activateApplication = { [weak self] pid, displayID in
+            guard let self else { return }
+            if self.suppressAppActivation?() == true { return }
+            // v4: 切替した画面が「選択中の画面」のときだけ前面化する。別画面のサイドバークリックや
+            // URL 起点の切替が、いま作業中の画面からキーボードフォーカスを奪わない。
+            guard displayID == nil || displayID == self.selectedDisplayID() else { return }
             NSRunningApplication(processIdentifier: pid)?.activate()
         }
 
@@ -387,9 +390,9 @@ final class WindowManager {
     }
 
     /// 隣のタブへ(ホットキー用)。ターゲット解決はエンジンの直列区間内で行うため、連打しても 1 押下 = 1 タブ進む。
-    /// TODO(v4 段階 4): 選択中のディスプレイを解決して渡す(それまでは主ディスプレイ固定)。
+    /// v4: 選択中のディスプレイ(フォーカス窓 → マウスの画面)のタブを巡回する。
     func activateAdjacent(offset: Int) async throws {
-        guard let displayID = layout.primaryDisplay?.id else { return }
+        guard let displayID = selectedDisplayID() else { return }
         try await performFocusSwitch {
             try await engine.activateAdjacent(offset: offset, on: displayID)
         }
@@ -450,7 +453,7 @@ final class WindowManager {
         }
         guard focusGeneration == generation, focusFollows.value, !isTerminating,
             let found = engine.state.managedWindow(forWindowID: windowID),
-            found.window.isBound, found.tab.id != engine.state.activeTabID,
+            found.window.isBound, !isTabItsDisplaysActive(found.tab),  // v4: 判定はその画面のアクティブと
             let pid = found.window.pid,
             NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
         else { return }
@@ -465,7 +468,7 @@ final class WindowManager {
             focusGeneration == generation, focusFollows.value, !isTerminating,
             NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
             let current = engine.state.managedWindow(forWindowID: windowID),
-            current.tab.id != engine.state.activeTabID
+            !isTabItsDisplaysActive(current.tab)
         else { return }
         // AX 再確認の await 中にユーザーの切替が始まっていたら、それを上書きせず保留に回す。
         guard focusSwitchDepth == 0 else {
@@ -500,16 +503,40 @@ final class WindowManager {
 
     private func recordFocusedWindow(_ windowID: CGWindowID) {
         engine.noteWindowFocused(windowID: windowID)
+        // v4: 「選択中のディスプレイ」のキャッシュをフォーカス通知で無料更新する
+        // (管理対象の窓なら AX なしでタブから画面が引ける)。
+        if let found = engine.state.managedWindow(forWindowID: windowID), let pid = found.window.pid,
+            let key = found.tab.displayID ?? layout.primaryDisplay?.id
+        {
+            lastFocusedDisplay = (pid, key)
+        }
         maybeFollowFocus(windowID: windowID)
     }
 
-    /// ホットキーから: いまフォーカスしている他アプリの窓をアクティブタブに登録する。
+    // MARK: - 選択中のディスプレイ(v4 段階 4)
+
+    private var lastFocusedDisplay: (pid: pid_t, displayID: DisplayID)?
+
+    /// ホットキーが作用する画面。フォーカス窓の画面 → マウスカーソルの画面 → 主、の順で解決。
+    func selectedDisplayID() -> DisplayID? {
+        SelectedDisplayResolver.resolve(
+            frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+            ownPID: getpid(),
+            cached: lastFocusedDisplay,
+            mousePointAX: ScreenGeometry.axRect(fromCocoa: CGRect(origin: NSEvent.mouseLocation, size: .zero)).origin,
+            layout: layout)
+    }
+
+    /// タブが自分の画面のアクティブか(フォーカス連動の判定用)。
+    private func isTabItsDisplaysActive(_ tab: Tab) -> Bool {
+        guard let key = tab.displayID ?? layout.primaryDisplay?.id else { return false }
+        return engine.activeTabID(on: key) == tab.id
+    }
+
+    /// ホットキーから: いまフォーカスしている他アプリの窓を、**その窓の画面**のアクティブタブに登録する
+    /// (v4。タブが無ければ自動作成)。
     func registerFocusedWindow() async {
         guard !isTerminating else { return }
-        guard let tabID = engine.state.activeTabID else {
-            logger.log("register-focused: no active tab")
-            return
-        }
         guard let app = NSWorkspace.shared.frontmostApplication, app != NSRunningApplication.current else {
             logger.log("register-focused: no frontmost app")
             return
@@ -547,6 +574,19 @@ final class WindowManager {
         guard engine.state.managedWindow(forWindowID: record.window.windowID) == nil else {
             logger.log("register-focused: window \(record.window.windowID) is already registered")
             return
+        }
+        // 窓がいる画面のアクティブタブへ。タブが無い画面なら自動作成する(v4)。
+        guard let display = layout.display(containing: record.frame ?? .zero) else {
+            logger.log("register-focused: no display for the focused window")
+            return
+        }
+        let tabID: UUID
+        if let active = engine.activeTabID(on: display.id) {
+            tabID = active
+        } else {
+            let count = engine.state.tabs(on: display.id, primaryID: layout.primaryDisplay?.id).count
+            tabID = engine.createTab(name: "タブ\(count + 1)", on: display.id).id
+            logger.log("register-focused: created tab on display \(display.id)")
         }
         do {
             try await register(record, into: tabID)
@@ -604,7 +644,7 @@ final class WindowManager {
 
     // MARK: - 登録 / 解除
 
-    /// ウィンドウをタブに登録する。主ディスプレイのコンテンツ領域に収まっていなければ引き込む。
+    /// ウィンドウをタブに登録する。配置先は**タブの画面**のコンテンツ領域(v4: タブが正)。
     func register(_ record: WindowRecord, into tabID: UUID) async throws {
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
         let window = record.window
@@ -616,8 +656,11 @@ final class WindowManager {
         guard !fullscreen, !minimized else {
             throw RegistrationError.notRegistrable(reason: fullscreen ? "fullscreen" : "minimized")
         }
-        // 窓がいまいるディスプレイのコンテンツ領域に収める(v1 の「主ディスプレイへ引き込み」は段階 D で廃止)。
-        let area = layout.display(containing: current)?.contentArea ?? layout.contentArea
+        // v4: 配置先はタブの画面(エンジン側の判定と揃える。別画面の窓はタブの画面へ引き込まれる)。
+        let tabDisplay = engine.state.tab(withID: tabID).flatMap { tab in
+            layout.display(id: tab.displayID) ?? layout.primaryDisplay
+        }
+        let area = tabDisplay?.contentArea ?? layout.contentArea
         let frame: CGRect
         if area.contains(current) {
             frame = current

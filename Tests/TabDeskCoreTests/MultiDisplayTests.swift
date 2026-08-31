@@ -872,3 +872,51 @@ struct PerDisplayActivationTests {
         #expect(engine.state.activeTabID == a2.id)
     }
 }
+
+/// v4 段階 4: 「選択中のディスプレイ」解決の純関数テスト。
+struct SelectedDisplayResolverTests {
+    private let layout = FixedScreenLayout(displays: [mainDisplay, secondDisplay])
+    private let mouseOnSecond = CGPoint(x: 3000, y: 500)
+    private let mouseOnMain = CGPoint(x: 800, y: 500)
+
+    @Test func frontmostIsSelfUsesCache() {
+        // TabDesk が前面(改名ダイアログ中など)でも、直前のフォーカスの画面を保つ。
+        let result = SelectedDisplayResolver.resolve(
+            frontmostPID: 42, ownPID: 42, cached: (pid: 100, displayID: "second"),
+            mousePointAX: mouseOnMain, layout: layout)
+        #expect(result == "second")
+    }
+
+    @Test func frontmostMatchingCacheUsesCache() {
+        let result = SelectedDisplayResolver.resolve(
+            frontmostPID: 100, ownPID: 42, cached: (pid: 100, displayID: "second"),
+            mousePointAX: mouseOnMain, layout: layout)
+        #expect(result == "second")
+    }
+
+    @Test func frontmostMismatchFallsBackToMouse() {
+        // 前面アプリが変わっていてキャッシュが古い可能性 → マウスの画面へ。
+        let result = SelectedDisplayResolver.resolve(
+            frontmostPID: 999, ownPID: 42, cached: (pid: 100, displayID: "second"),
+            mousePointAX: mouseOnMain, layout: layout)
+        #expect(result == "main")
+    }
+
+    @Test func disconnectedCachedDisplayFallsBackToMouse() {
+        let result = SelectedDisplayResolver.resolve(
+            frontmostPID: 100, ownPID: 42, cached: (pid: 100, displayID: "gone"),
+            mousePointAX: mouseOnSecond, layout: layout)
+        #expect(result == "second")
+    }
+
+    @Test func noCacheUsesMouseThenPrimary() {
+        let onSecond = SelectedDisplayResolver.resolve(
+            frontmostPID: 999, ownPID: 42, cached: nil, mousePointAX: mouseOnSecond, layout: layout)
+        #expect(onSecond == "second")
+        // どの画面にも属さない座標は display(containing:) の fallback で主へ。
+        let nowhere = SelectedDisplayResolver.resolve(
+            frontmostPID: 999, ownPID: 42, cached: nil,
+            mousePointAX: CGPoint(x: -5000, y: -5000), layout: layout)
+        #expect(nowhere == "main")
+    }
+}
