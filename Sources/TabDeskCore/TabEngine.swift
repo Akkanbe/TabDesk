@@ -178,6 +178,44 @@ public final class TabEngine {
         state.activeTabIDs[displayID]
     }
 
+    /// 主ディスプレイの役割が実行中に移った(クラムシェル・配置変更で nil タブの実効キーが変わった)
+    /// あとの整合(v4)。接続中の画面にタブがあるのにアクティブ entry が無ければ、旧キーに残った
+    /// entry を引き継ぐか、先頭タブを充てる。これが無いと役割移動後の最初の reapplyLayout で
+    /// 主画面の全窓が「非アクティブ」として退避されてしまう。
+    private func reseedActiveTabsForConnectedDisplays() {
+        var next = state
+        // 1. キーとタブの実効ディスプレイが食い違う entry(役割移動後の旧キー等)は外し、
+        //    そのタブが新しく解決される画面への「引き継ぎ候補」にする。放置すると、その画面の
+        //    サイドバーが別画面のタブを active として表示し、新規タブも active になれない。
+        var carried: [DisplayID: UUID] = [:]
+        for (key, id) in next.activeTabIDs {
+            guard let tab = next.tab(withID: id) else {
+                next.activeTabIDs[key] = nil
+                continue
+            }
+            let resolved = resolvedDisplayID(of: tab)
+            if resolved != key {
+                next.activeTabIDs[key] = nil
+                if let resolved, carried[resolved] == nil { carried[resolved] = id }
+            }
+        }
+        // 2. 接続中の各画面: entry が無ければ引き継ぎ候補 → その画面の先頭タブ。
+        for display in layout.displays where next.activeTabIDs[display.id] == nil {
+            if let id = carried[display.id] {
+                next.activeTabIDs[display.id] = id
+            } else if let first = next.tabs.first(where: { resolvedDisplayID(of: $0) == display.id }) {
+                next.activeTabIDs[display.id] = first.id
+            }
+        }
+        if let primary = layout.primaryDisplay?.id {
+            next.activeTabID = next.activeTabIDs[primary]
+        }
+        if next != state {
+            state = next
+            log("reapplyLayout: re-seeded active tabs for the connected displays")
+        }
+    }
+
     /// アクティブの更新。旧 activeTabID は主ディスプレイのミラーとして併記する(ダウングレード耐性)。
     /// didSet(保存・UI 通知)を 1 回にまとめるため、まとめて代入する。
     private func setActiveTab(_ id: UUID?, on displayID: DisplayID) {
@@ -754,6 +792,7 @@ public final class TabEngine {
     public func reapplyLayout() async {
         await serialized {
             guard !isReleasingForShutdown else { return }
+            reseedActiveTabsForConnectedDisplays()
             // columns はコンテンツ領域の変化に追従して列を計算し直す(free は従来どおり位置 clamp のみ)。
             // 窓のディスプレイが切断されていれば主ディスプレイへ clamp される(段階 D の消失ポリシー)。
             var ops: [WindowOp] = []

@@ -920,3 +920,27 @@ struct SelectedDisplayResolverTests {
         #expect(nowhere == "main")
     }
 }
+
+
+/// v4: 主ディスプレイの役割が実行中に移っても、nil タブ(主画面の意味)のアクティブが引き継がれる。
+@MainActor
+struct PrimaryRoleChangeTests {
+    @Test func primaryRoleMoveCarriesActiveOverAndKeepsWindowsVisible() async throws {
+        let (engine, driver, layout) = makeEngine()
+        let tab = engine.createTab(name: "Main")  // nil = そのときの主(main)
+        let frame = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: frame)
+        try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: frame, into: tab.id)
+        #expect(engine.activeTabID(on: "main") == tab.id)
+
+        // 主の役割が second へ移る(配列の先頭 = 主)。nil タブの実効キーは "second" になる。
+        layout.change(displays: [secondDisplay, mainDisplay])
+        await engine.reapplyLayout()
+
+        #expect(engine.activeTabID(on: "second") == tab.id, "旧キーの entry を新しい主へ引き継ぐ")
+        #expect(engine.state.activeTabIDs["main"] == nil, "旧キーは掃除される")
+        #expect(engine.state.activeTabID == tab.id, "ミラーも新しい主を映す")
+        #expect(driver.currentFrame(1)?.origin != secondDisplay.parkPoint, "窓は退避されない")
+        #expect(engine.parkedWindowIDs.isEmpty)
+    }
+}
