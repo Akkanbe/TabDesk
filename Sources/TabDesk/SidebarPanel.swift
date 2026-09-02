@@ -643,7 +643,19 @@ private final class SidebarResizeHandle: NSView {
 
     /// push した ⇔ カーソルを pop していないか。ドラッグ中にビューの外へ出ても pop しない。
     private var cursorPushed = false
-    private var isDragging = false
+    private var isDragging = false { didSet { needsDisplay = true } }
+    private var isHovering = false { didSet { needsDisplay = true } }
+
+    /// ドラッグできる場所を色で示す(非アクティブ時は ⇔ カーソルが安定して出ないため)。
+    /// 通常はうっすら、ホバー/ドラッグ中はアクセントカラーで強調する。
+    override func draw(_ dirtyRect: NSRect) {
+        let color: NSColor = (isHovering || isDragging)
+            ? .controlAccentColor.withAlphaComponent(0.8)
+            : .tertiaryLabelColor.withAlphaComponent(0.5)
+        color.setFill()
+        // 端に 1pt 空けて、境界線ではなく「つまみ」として見えるようにする。
+        bounds.insetBy(dx: 1, dy: 0).fill()
+    }
 
     override func updateTrackingAreas() {
         trackingAreas.forEach(removeTrackingArea)
@@ -656,6 +668,7 @@ private final class SidebarResizeHandle: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
+        isHovering = true
         pushCursor()
     }
 
@@ -664,6 +677,7 @@ private final class SidebarResizeHandle: NSView {
     }
 
     override func mouseExited(with event: NSEvent) {
+        isHovering = false
         guard !isDragging else { return }
         popCursor()
     }
