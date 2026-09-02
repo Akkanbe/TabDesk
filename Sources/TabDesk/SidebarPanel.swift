@@ -641,20 +641,45 @@ private final class SidebarResizeHandle: NSView {
         return true
     }
 
+    /// push した ⇔ カーソルを pop していないか。ドラッグ中にビューの外へ出ても pop しない。
+    private var cursorPushed = false
+    private var isDragging = false
+
     override func updateTrackingAreas() {
         trackingAreas.forEach(removeTrackingArea)
+        // cursorUpdate イベントはキーウィンドウにしか届かない(非アクティブ化パネルでは出ない)ので、
+        // mouseEntered / mouseExited で push / pop する。
         addTrackingArea(NSTrackingArea(
-            rect: bounds, options: [.cursorUpdate, .activeAlways], owner: self, userInfo: nil))
+            rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self, userInfo: nil))
         super.updateTrackingAreas()
     }
 
-    override func cursorUpdate(with event: NSEvent) {
-        NSCursor.resizeLeftRight.set()
+    override func mouseEntered(with event: NSEvent) {
+        pushCursor()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard !isDragging else { return }
+        popCursor()
+    }
+
+    private func pushCursor() {
+        guard !cursorPushed else { return }
+        cursorPushed = true
+        NSCursor.resizeLeftRight.push()
+    }
+
+    private func popCursor() {
+        guard cursorPushed else { return }
+        cursorPushed = false
+        NSCursor.pop()
     }
 
     // イベントを受け取り、以降の mouseDragged / mouseUp がこのビューへ届くようにする
     // (responder chain へ流すとパネル移動などの既定処理に化けうる)。
     override func mouseDown(with event: NSEvent) {
+        isDragging = true
+        pushCursor()
         grabOffset = (window?.frame.maxX ?? 0) - NSEvent.mouseLocation.x
     }
 
@@ -665,8 +690,12 @@ private final class SidebarResizeHandle: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        isDragging = false
         onCommit?()
         NSAccessibility.post(element: self, notification: .valueChanged)
+        // 幅の確定でビューが移動するので、離した位置がハンドル上でなければここで pop する。
+        let local = convert(event.locationInWindow, from: nil)
+        if !bounds.contains(local) { popCursor() }
     }
 }
 

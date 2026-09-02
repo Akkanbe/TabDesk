@@ -121,6 +121,10 @@ public final class TabEngine {
     /// タイルの再計算を構造イベント時に限定するための仕組み(毎 reconcile で理想値を書き直すと、
     /// 最小サイズ制約のあるアプリと「理想値→失敗→到達値採用→また理想値」の発振になる)。
     private var pendingRetileTabIDs: Set<UUID> = []
+    /// 画面ごとの直前のコンテンツ領域(非永続)。reapplyLayout で free の窓を境界へ追従させる比較元。
+    private var lastContentAreas: [DisplayID: CGRect] = [:]
+    /// 境界追従で縮めた結果がこれ未満になる場合は、従来の clamp(位置の押し戻し)に任せる。
+    static let minFollowedWidth: CGFloat = 200
 
     public init(
         driver: any WindowDriver,
@@ -134,6 +138,7 @@ public final class TabEngine {
         // v4: タブをディスプレイ単位に正規化してから使う(冪等。init 中は didSet が発火しないので
         // 余計な保存・通知は出ない)。テストの固定フィクスチャにも同じ正規化がかかる。
         self.state = initialState.migratedForPerDisplayTabs(primaryID: layout.primaryDisplay?.id)
+        snapshotContentAreas()
     }
 
     // MARK: - タブ CRUD
@@ -806,7 +811,8 @@ public final class TabEngine {
         await serialized {
             guard !isReleasingForShutdown else { return }
             reseedActiveTabsForConnectedDisplays()
-            // columns はコンテンツ領域の変化に追従して列を計算し直す(free は従来どおり位置 clamp のみ)。
+            // columns はコンテンツ領域の変化に追従して列を計算し直す。free は、サイドバー境界に
+            // 接していた窓だけ境界へ追従させ(右端固定)、それ以外は従来どおり位置 clamp のみ。
             // 窓のディスプレイが切断されていれば主ディスプレイへ clamp される(段階 D の消失ポリシー)。
             var ops: [WindowOp] = []
             for tab in state.tabs {
@@ -818,7 +824,12 @@ public final class TabEngine {
                     guard !isDisplayDisconnected(window) else { continue }
                     // 接続中の窓は、非アクティブでも論理 frame を現在の画面構成へ更新する。更新しないと、
                     // 画面リサイズ後にそのタブを表示せず解除・削除・終了した際、旧座標へ復元してしまう。
-                    let target = desired[window.id] ?? clamped(window.frame, for: window)
+                    let target: CGRect
+                    if tab.layout == .free {
+                        target = clamped(followingSidebarEdge(window.frame, for: window), for: window)
+                    } else {
+                        target = desired[window.id] ?? clamped(window.frame, for: window)
+                    }
                     if target != window.frame { updateFrame(window.id, target) }
                     guard let windowID = window.windowID, let pid = window.pid else { continue }
                     // フルスクリーン中は論理 frame の更新だけ行い、op は出さない(段階 2)。
@@ -831,10 +842,28 @@ public final class TabEngine {
                     }
                 }
             }
+            snapshotContentAreas()
             guard !ops.isEmpty else { return }
             let failures = await apply(await run(ops))
             log("reapplyLayout: \(ops.count) ops" + (failures.isEmpty ? "" : "; failures: \(failures.map(\.message))"))
         }
+    }
+
+    private func snapshotContentAreas() {
+        lastContentAreas = Dictionary(
+            layout.displays.map { ($0.id, $0.contentArea) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    /// サイドバー境界(コンテンツ領域の左端)に接していた free の窓は、境界の移動に右端固定で追従する。
+    /// 狭める・折りたたむと広がり、広げる・展開すると縮む(往復で元に戻る)。縮めた結果が
+    /// minFollowedWidth を切るときは追従せず、呼び手の clamp(位置の押し戻し)に任せる。
+    private func followingSidebarEdge(_ frame: CGRect, for window: ManagedWindow) -> CGRect {
+        guard let display = display(for: window), let previous = lastContentAreas[display.id] else { return frame }
+        let area = display.contentArea
+        guard area.minX != previous.minX, abs(frame.minX - previous.minX) <= config.frameTolerance else { return frame }
+        let width = frame.maxX - area.minX
+        guard width >= Self.minFollowedWidth else { return frame }
+        return CGRect(x: area.minX, y: frame.minY, width: width, height: frame.height)
     }
 
     /// 画面変更通知を受けた同期地点で立てる barrier。OS が先に動かした窓を編集モードで記録しない。
