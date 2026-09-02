@@ -811,6 +811,18 @@ struct PerDisplayActivationTests {
         _ = (a1, b1)
     }
 
+    @Test func defaultTabNamesCountOnlyTheirDisplay() {
+        let (engine, _, _) = makeEngine()
+        _ = engine.createTab(name: "Custom A", on: "main")
+        _ = engine.createTab(name: "Custom B", on: "main")
+
+        let first = engine.createTab(on: "second")
+        let second = engine.createTab(on: "second")
+
+        #expect(first.name == "タブ1")
+        #expect(second.name == "タブ2")
+    }
+
     /// 順送りは選択画面のタブだけを巡回する。
     @Test func adjacentCyclesOnlyWithinTheDisplay() async throws {
         let (engine, _, _) = makeEngine()
@@ -894,6 +906,20 @@ struct SelectedDisplayResolverTests {
         #expect(result == "second")
     }
 
+    @Test func frontmostWindowBeatsMouseAndStaleCache() {
+        let result = SelectedDisplayResolver.resolve(
+            frontmostPID: 999, ownPID: 42, cached: (pid: 100, displayID: "main"),
+            frontmostWindowDisplayID: "second", mousePointAX: mouseOnMain, layout: layout)
+        #expect(result == "second")
+    }
+
+    @Test func frontmostSelfKeepsThePreviousApplicationCache() {
+        let result = SelectedDisplayResolver.resolve(
+            frontmostPID: 42, ownPID: 42, cached: (pid: 100, displayID: "second"),
+            frontmostWindowDisplayID: "main", mousePointAX: mouseOnMain, layout: layout)
+        #expect(result == "second")
+    }
+
     @Test func frontmostMismatchFallsBackToMouse() {
         // 前面アプリが変わっていてキャッシュが古い可能性 → マウスの画面へ。
         let result = SelectedDisplayResolver.resolve(
@@ -925,6 +951,20 @@ struct SelectedDisplayResolverTests {
 /// v4: 主ディスプレイの役割が実行中に移っても、nil タブ(主画面の意味)のアクティブが引き継がれる。
 @MainActor
 struct PrimaryRoleChangeTests {
+    @Test func stalePrimaryEntryIsNotExposedBeforeReseed() {
+        let (engine, _, layout) = makeEngine()
+        let moving = engine.createTab(name: "Moving")  // nil = そのときの主(main)
+        #expect(engine.activeTabID(on: "main") == moving.id)
+
+        // 画面変更通知後の reapplyLayout までにも、旧 main キーを別画面へ移った nil タブの
+        // active として公開してはいけない。ここを誤ると新規タブも active になれない。
+        layout.change(displays: [secondDisplay, mainDisplay])
+        #expect(engine.activeTabID(on: "main") == nil)
+
+        let replacement = engine.createTab(name: "Physical Main", on: "main")
+        #expect(engine.activeTabID(on: "main") == replacement.id)
+    }
+
     @Test func primaryRoleMoveCarriesActiveOverAndKeepsWindowsVisible() async throws {
         let (engine, driver, layout) = makeEngine()
         let tab = engine.createTab(name: "Main")  // nil = そのときの主(main)

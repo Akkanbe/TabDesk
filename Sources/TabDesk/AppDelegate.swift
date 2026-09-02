@@ -102,8 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .registerFocusedWindow:
                 Task { [manager = self.manager] in await manager.registerFocusedWindow() }
             case .toggleEditMode:
-                self.manager.engine.editMode.toggle()
-                self.sidebars?.render()
+                self.manager.setEditMode(!self.manager.engine.editMode)
                 self.logger.log("editMode=\(self.manager.engine.editMode) (hotkey)")
             case .toggleSidebar:
                 // v4: 折りたたみは「選択中のディスプレイ」のパネルに作用する。
@@ -314,7 +313,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let engine = manager.engine
 
         func tab(named name: String?) -> Tab? {
-            guard let name else { return engine.state.activeTab }
+            guard let name else {
+                guard let displayID = manager.selectedDisplayID() else { return engine.state.activeTab }
+                guard let activeID = engine.activeTabID(on: displayID) else { return nil }
+                return engine.state.tab(withID: activeID)
+            }
             return engine.state.tabs.first { $0.name == name }
         }
 
@@ -344,14 +347,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "tab":
             // v4: display=<layout.displays の index> で作成先を指定できる。省略時は選択中の画面。
             let displayID: DisplayID?
-            if let indexText = q["display"], let index = Int(indexText),
-                manager.layout.displays.indices.contains(index)
-            {
+            if let indexText = q["display"] {
+                guard let index = Int(indexText), manager.layout.displays.indices.contains(index) else {
+                    logger.log("url: tab: invalid display index \(indexText)")
+                    return
+                }
                 displayID = manager.layout.displays[index].id
             } else {
                 displayID = manager.selectedDisplayID()
             }
-            engine.createTab(name: q["name"] ?? "タブ\(engine.state.tabs.count + 1)", on: displayID)
+            if let name = q["name"] {
+                engine.createTab(name: name, on: displayID)
+            } else {
+                engine.createTab(on: displayID)
+            }
         case "add":
             guard let wid = CGWindowID(q["wid"] ?? ""), let target = tab(named: q["tab"]) else {
                 logger.log("url: add needs wid=<available window id> [&tab=name]")
@@ -381,8 +390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 do { try await manager.unregister(found.window.id) } catch { logger.log("remove failed: \(error)") }
             }
         case "edit":
-            engine.editMode = (q["on"] ?? "1") != "0"
-            sidebars?.render()
+            manager.setEditMode((q["on"] ?? "1") != "0")
             logger.log("editMode=\(engine.editMode)")
         case "restore":
             Task { [manager] in await manager.restoreUnboundWindows(strictness: (q["strict"] ?? "0") == "1" ? .strict : .lenient) }

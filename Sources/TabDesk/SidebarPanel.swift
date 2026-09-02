@@ -81,6 +81,9 @@ final class SidebarPanel: NSPanel {
 
     /// 画面構成・contentArea の変化を controller から受ける(差分キャッシュも捨てる)。
     func refreshAfterLayoutChange() {
+        // 展開幅は全画面共有。別パネルで変更された場合も contentView の固定幅を同期しないと、
+        // パネル枠だけが広がって透明・クリック不能な余白が残る。
+        widthConstraint?.constant = metrics.effectiveWidth
         reposition()
         lastRendered = nil
         render()
@@ -313,10 +316,11 @@ final class SidebarPanel: NSPanel {
         lastRendered = (state, manager.engine.editMode)
         // v4: 自分の画面のタブだけを描く。
         let tabs = state.tabs(on: displayID, primaryID: manager.layout.primaryDisplay?.id)
+        let activeTabID = manager.engine.activeTabID(on: displayID)
         tabsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for (index, tab) in tabs.enumerated() {
             let row = TabRowView(
-                tab: tab, isActive: tab.id == state.activeTabIDs[displayID],
+                tab: tab, isActive: tab.id == activeTabID,
                 canMoveUp: index > 0, canMoveDown: index < tabs.count - 1,
                 thumbnail: ThumbnailStore.enabledSetting.value ? manager.thumbnails.images[tab.id] : nil)
             row.onSelect = { [weak self] in self?.activate(tab.id) }
@@ -335,7 +339,7 @@ final class SidebarPanel: NSPanel {
         }
 
         windowsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        if let active = state.activeTab(on: displayID) {
+        if let activeTabID, let active = state.tab(withID: activeTabID) {
             windowsHeader.stringValue = "\(active.name) のウィンドウ(\(active.windows.count))"
                 + (active.layout == .columns ? " — 縦に等分割" : "")
             // 切断退避(displayID があるのに接続中の画面に無い)を行の表示に反映する。
@@ -388,12 +392,11 @@ final class SidebarPanel: NSPanel {
 
     @objc private func addTab() {
         // v4: このパネルの画面にタブを作る(連番も画面ごと)。
-        let count = manager.engine.state.tabs(on: displayID, primaryID: manager.layout.primaryDisplay?.id).count + 1
-        manager.engine.createTab(name: "タブ\(count)", on: displayID)
+        manager.engine.createTab(on: displayID)
     }
 
     @objc private func toggleEditMode() {
-        manager.engine.editMode = editModeCheck.state == .on
+        manager.setEditMode(editModeCheck.state == .on)
         logger.log("editMode=\(manager.engine.editMode)")
     }
 

@@ -99,12 +99,16 @@ struct MigrationTests {
     }
 
     @Test func windowDisplayIDIsSyncedToTab() {
-        // 具体タブに nil 窓が混ざるケース(タブが具体 ID を持つ既移行データへ nil 窓が入った等)。
+        // 既移行の v4 タブではタブが正。窓側の古い・欠落した値で再分割してはいけない。
         let w1 = window("a", display: "second")
-        let w2 = window("b", display: "second")
-        var tab = Tab(name: "T", windows: [w1, w2])
-        tab.displayID = "second"
+        let w2 = window("b", display: nil)
+        let w3 = window("c", display: "main")
+        let tab = Tab(name: "T", windows: [w1, w2, w3], displayID: "second")
         let migrated = WorkspaceState(tabs: [tab]).migratedForPerDisplayTabs(primaryID: primary)
+
+        #expect(migrated.tabs.count == 1, "既移行タブを窓側の不整合で再分割しない")
+        #expect(migrated.tabs[0].id == tab.id)
+        #expect(migrated.tabs[0].displayID == "second")
         #expect(migrated.tabs[0].windows.allSatisfy { $0.displayID == "second" })
     }
 

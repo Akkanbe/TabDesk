@@ -143,10 +143,20 @@ public final class TabEngine {
         let tab = Tab(name: name, displayID: displayID)
         state.tabs.append(tab)
         // その画面の最初のタブがアクティブになる(v4: first-tab-wins は画面ごと)。
-        if let key = resolvedDisplayID(of: tab), state.activeTabIDs[key] == nil {
+        if let key = resolvedDisplayID(of: tab), activeTabID(on: key) == nil {
             setActiveTab(tab.id, on: key)
         }
         return tab
+    }
+
+    /// 画面内のタブ数から既定名を付けて作成する。画面をまたぐ同名は許容する。
+    @discardableResult
+    public func createTab(on displayID: DisplayID? = nil) -> Tab {
+        let key = displayID ?? layout.primaryDisplay?.id
+        let count = key.map { displayID in
+            state.tabs.filter { resolvedDisplayID(of: $0) == displayID }.count
+        } ?? state.tabs.count
+        return createTab(name: "タブ\(count + 1)", on: displayID)
     }
 
     // MARK: - ディスプレイ別アクティブ(v4)
@@ -175,7 +185,10 @@ public final class TabEngine {
     }
 
     public func activeTabID(on displayID: DisplayID) -> UUID? {
-        state.activeTabIDs[displayID]
+        guard let id = state.activeTabIDs[displayID], let tab = state.tab(withID: id),
+            resolvedDisplayID(of: tab) == displayID
+        else { return nil }
+        return id
     }
 
     /// 主ディスプレイの役割が実行中に移った(クラムシェル・配置変更で nil タブの実効キーが変わった)
@@ -712,7 +725,7 @@ public final class TabEngine {
             }
             guard !tabsOnDisplay.isEmpty else { return nil }
             let index: Int
-            if let current = state.activeTabIDs[displayID],
+            if let current = activeTabID(on: displayID),
                 let i = tabsOnDisplay.firstIndex(where: { $0.id == current })
             {
                 index = ((i + offset) % tabsOnDisplay.count + tabsOnDisplay.count) % tabsOnDisplay.count
@@ -1039,11 +1052,10 @@ public final class TabEngine {
         id: UUID, to display: DisplayLayout, frame: CGRect, appName: String
     ) async {
         let destTab: Tab
-        if let activeID = state.activeTabIDs[display.id], let tab = state.tab(withID: activeID) {
+        if let activeID = activeTabID(on: display.id), let tab = state.tab(withID: activeID) {
             destTab = tab
         } else {
-            let count = state.tabs.filter { resolvedDisplayID(of: $0) == display.id }.count
-            destTab = createTab(name: "タブ\(count + 1)", on: display.id)  // first-tab-wins で active 化
+            destTab = createTab(on: display.id)  // first-tab-wins で active 化
         }
         guard let source = windowLocation(of: id) else { return }
         let sourceTab = state.tabs[source.tabIndex]

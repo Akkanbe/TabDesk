@@ -79,7 +79,7 @@ public struct FixedScreenLayout: ScreenLayout {
 
 /// 本番用。NSScreen.screens から全ディスプレイ分を構築する(v1 の PrimaryScreenLayout を置き換え。
 /// 先頭が主ディスプレイなのは NSScreen.screens の仕様と一致)。
-/// sidebarWidth はサイドバーのある主ディスプレイのコンテンツ領域からだけ除く。
+/// sidebarWidth は各ディスプレイのコンテンツ領域から除く。
 public struct SystemScreenLayout: ScreenLayout {
     /// サイドバー幅は毎回読む(v3 段階 3: 幅変更・折りたたみに追従)。
     /// TabEngine は existential(any ScreenLayout)として独立コピーを持つため、

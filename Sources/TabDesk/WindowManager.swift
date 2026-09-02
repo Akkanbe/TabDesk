@@ -33,6 +33,13 @@ final class WindowManager {
     var suppressAppActivation: (@MainActor () -> Bool)?
     /// UI 向けの状態変更通知(エンジンの onStateChanged はここが占有し、保存とあわせて配る)。
     var onStateChanged: (@MainActor (WorkspaceState) -> Void)?
+
+    /// 編集モードは永続 state の外にあるが全サイドバーで共有するため、変更時は同じ UI 通知で再描画する。
+    func setEditMode(_ enabled: Bool) {
+        guard engine.editMode != enabled else { return }
+        engine.editMode = enabled
+        onStateChanged?(engine.state)
+    }
     private let driver = AXWindowDriver()
     private let logger: FileLogger
     private var saveTask: Task<Void, Never>?
@@ -523,10 +530,16 @@ final class WindowManager {
 
     /// ホットキーが作用する画面。フォーカス窓の画面 → マウスカーソルの画面 → 主、の順で解決。
     func selectedDisplayID() -> DisplayID? {
-        SelectedDisplayResolver.resolve(
-            frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let frontmostWindowDisplayID = frontmostPID.flatMap { pid -> DisplayID? in
+            guard pid != getpid(), let frame = WindowEnumerator.frontmostWindowFrame(of: pid) else { return nil }
+            return layout.display(containing: frame)?.id
+        }
+        return SelectedDisplayResolver.resolve(
+            frontmostPID: frontmostPID,
             ownPID: getpid(),
             cached: lastFocusedDisplay,
+            frontmostWindowDisplayID: frontmostWindowDisplayID,
             mousePointAX: ScreenGeometry.axRect(fromCocoa: CGRect(origin: NSEvent.mouseLocation, size: .zero)).origin,
             layout: layout)
     }
@@ -580,16 +593,15 @@ final class WindowManager {
             return
         }
         // 窓がいる画面のアクティブタブへ。タブが無い画面なら自動作成する(v4)。
-        guard let display = layout.display(containing: record.frame ?? .zero) else {
-            logger.log("register-focused: no display for the focused window")
+        guard let frame = record.frame, let display = layout.display(containing: frame) else {
+            logger.log("register-focused: could not read the focused window frame")
             return
         }
         let tabID: UUID
         if let active = engine.activeTabID(on: display.id) {
             tabID = active
         } else {
-            let count = engine.state.tabs(on: display.id, primaryID: layout.primaryDisplay?.id).count
-            tabID = engine.createTab(name: "タブ\(count + 1)", on: display.id).id
+            tabID = engine.createTab(on: display.id).id
             logger.log("register-focused: created tab on display \(display.id)")
         }
         do {

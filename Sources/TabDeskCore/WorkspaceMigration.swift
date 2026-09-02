@@ -3,9 +3,10 @@ import Foundation
 extension WorkspaceState {
     /// v4: タブをディスプレイ単位に正規化する(純関数・冪等。docs/06_v4_design.md)。
     ///
-    /// - 複数ディスプレイの窓が混在するタブは、窓の実効ディスプレイ(`displayID ?? primaryID`)で
-    ///   自動分割する。最大グループ(同数なら先頭の窓のグループ)が元の id と名前を維持し、
-    ///   兄弟は「名前 (2)」…の連番で直後に挿入される
+    /// - `Tab.displayID` が無い旧タブに複数ディスプレイの窓が混在する場合、窓の実効ディスプレイ
+    ///   (`displayID ?? primaryID`)で自動分割する。最大グループ(同数なら先頭の窓のグループ)が
+    ///   元の id と名前を維持し、兄弟は「名前 (2)」…の連番で直後に挿入される
+    /// - `Tab.displayID` がある既移行データはタブを正とし、窓側の displayID だけを揃える
     /// - 空タブは素通し(displayID は現状維持 = 通常 nil で主ディスプレイに載る)
     /// - v1 純データ(タブも窓も displayID が nil で主画面のみ)は nil のまま =「そのときの主」の
     ///   意味を保ち、主画面の役割が移っても凍結しない
@@ -19,6 +20,19 @@ extension WorkspaceState {
 
         var newTabs: [Tab] = []
         for tab in tabs {
+            // displayID を持つタブは既に v4 の所属が確定しているため、タブ側を正として
+            // 窓の欠落・古い値だけを修復する。窓側の不整合で再分割するとタブの ID・名前・
+            // active が意図せず別画面へ移ってしまう。
+            if let displayID = tab.displayID {
+                var normalized = tab
+                normalized.windows = tab.windows.map { window in
+                    var window = window
+                    window.displayID = displayID
+                    return window
+                }
+                newTabs.append(normalized)
+                continue
+            }
             guard !tab.windows.isEmpty else {
                 newTabs.append(tab)
                 continue

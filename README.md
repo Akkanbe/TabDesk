@@ -4,7 +4,7 @@ macOS で他アプリのウィンドウを「タブ」として管理するユ�
 リポジトリ: https://github.com/Akkanbe/TabDesk
 仕様は [docs/01_spec.md](docs/01_spec.md) を参照。
 
-## 現在の状態: v3 実装済み(実機確認中)
+## 現在の状態: v4 実装済み(実機確認中)
 
 フル Xcode は不要(Command Line Tools の Swift で足ります)。
 
@@ -60,8 +60,9 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
   編集モードで窓を別の画面へドラッグすると、その画面のアクティブタブへ移る(自由配置のタブのみ。
   「縦に等分割」のタブの窓は列へ戻る)。ディスプレイを抜くと、その画面のタブは保存されたまま凍結し、
   差し直すとタブも配置も復活する
-- 「＋ ウィンドウを追加」で開いているウィンドウをアクティブタブに登録。ウィンドウはそのときいた
-  ディスプレイに留まる。退避は原則その画面の右下隅だが、そこから別画面へ窓が露出する配置では
+- 「＋ ウィンドウを追加」で開いているウィンドウを、そのサイドバーのアクティブタブに登録。
+  別画面の窓を選んだ場合はタブが属する画面へ移動する。Ctrl+Option+R ではフォーカス窓の画面の
+  アクティブタブへ登録する。退避は原則その画面の右下隅だが、そこから別画面へ窓が露出する配置では
   配置全体の安全な右端へ退避する(退避先に 1px の線が残る)。
   ネイティブフルスクリーン中・最小化中のウィンドウは登録候補に出ない(登録済みの窓を後から最小化した場合は登録のまま)
 - ウィンドウ行の「×」で登録解除(退避中なら元の位置に戻してから解除)
@@ -112,8 +113,9 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
 ```bash
 open -g 'tabdesk://status'
 open -g 'tabdesk://windows'                # 登録可能なウィンドウ一覧をログに出す
-open -g 'tabdesk://tab?name=Work'
-open -g 'tabdesk://add?wid=123&tab=Work'   # tab 省略時はアクティブタブ
+open -g 'tabdesk://tab?name=Work'          # 選択中の画面に作成
+open -g 'tabdesk://tab?display=1'          # 画面 index を指定(名前は画面ごとの連番)
+open -g 'tabdesk://add?wid=123&tab=Work'   # tab 省略時は選択中の画面のアクティブタブ
 open -g 'tabdesk://activate?name=Work'
 open -g 'tabdesk://remove?wid=123'
 open -g 'tabdesk://edit?on=1'
