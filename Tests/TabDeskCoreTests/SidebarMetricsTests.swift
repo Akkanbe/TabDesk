@@ -230,14 +230,28 @@ struct SidebarEdgeFollowTests {
         #expect(driver.currentFrame(1) == CGRect(x: 400, y: 100, width: 340, height: 400))
     }
 
-    @Test func tooNarrowResultFallsBackToClamp() async throws {
+    @Test func narrowResultStillFollowsKeepingRightEdgeOnScreen() async throws {
         let edge = CGRect(x: 240, y: 100, width: 300, height: 400)  // 右端 540
         let middle = CGRect(x: 900, y: 100, width: 500, height: 400)
         let (engine, driver, layout) = try await makeEngine(edge: edge, middle: middle)
 
-        // 追従すると幅 140(< 200)になるので、サイズ維持で押し戻される。
+        // 下限は設けない: 幅 140 に縮めてでも右端を動かさない。
         layout.change(parkPoint: park, contentArea: area(sidebar: 400))
         await engine.reapplyLayout()
-        #expect(driver.currentFrame(1) == CGRect(x: 400, y: 100, width: 300, height: 400))
+        #expect(driver.currentFrame(1) == CGRect(x: 400, y: 100, width: 140, height: 400))
+    }
+
+    /// タイトルバーのダブルクリック等でサイドバー分を無視した寸法になった窓は、領域の大きさまで縮める。
+    @Test func oversizedWindowShrinksToContentArea() async throws {
+        let edge = CGRect(x: 240, y: 100, width: 500, height: 400)
+        let middle = CGRect(x: 900, y: 100, width: 500, height: 400)
+        let (engine, driver, _) = try await makeEngine(edge: edge, middle: middle)
+        let zoomed = CGRect(x: 0, y: 30, width: 1920, height: 1090)  // 画面の visibleFrame 相当
+        guard let managed = engine.state.tabs[0].windows.first(where: { $0.windowID == 1 }) else {
+            Issue.record("窓が見つからない"); return
+        }
+        let result = try await engine.setFrame(zoomed, of: managed.id)
+        #expect(result == area(sidebar: 240), "右端が画面外へ出ないよう領域の大きさに縮む")
+        #expect(driver.currentFrame(1) == area(sidebar: 240))
     }
 }

@@ -123,8 +123,6 @@ public final class TabEngine {
     private var pendingRetileTabIDs: Set<UUID> = []
     /// 画面ごとの直前のコンテンツ領域(非永続)。reapplyLayout で free の窓を境界へ追従させる比較元。
     private var lastContentAreas: [DisplayID: CGRect] = [:]
-    /// 境界追従で縮めた結果がこれ未満になる場合は、従来の clamp(位置の押し戻し)に任せる。
-    static let minFollowedWidth: CGFloat = 200
 
     public init(
         driver: any WindowDriver,
@@ -855,14 +853,14 @@ public final class TabEngine {
     }
 
     /// サイドバー境界(コンテンツ領域の左端)に接していた free の窓は、境界の移動に右端固定で追従する。
-    /// 狭める・折りたたむと広がり、広げる・展開すると縮む(往復で元に戻る)。縮めた結果が
-    /// minFollowedWidth を切るときは追従せず、呼び手の clamp(位置の押し戻し)に任せる。
+    /// 狭める・折りたたむと広がり、広げる・展開すると縮む(往復で元に戻る)。下限は設けない
+    /// (右端を画面内に保つのが優先。アプリ側の最小幅は AX が拒むので到達値の記録に任せる)。
     private func followingSidebarEdge(_ frame: CGRect, for window: ManagedWindow) -> CGRect {
         guard let display = display(for: window), let previous = lastContentAreas[display.id] else { return frame }
         let area = display.contentArea
         guard area.minX != previous.minX, abs(frame.minX - previous.minX) <= config.frameTolerance else { return frame }
         let width = frame.maxX - area.minX
-        guard width >= Self.minFollowedWidth else { return frame }
+        guard width > 0 else { return frame }
         return CGRect(x: area.minX, y: frame.minY, width: width, height: frame.height)
     }
 
@@ -1921,9 +1919,13 @@ public final class TabEngine {
         clamped(frame, in: display(for: window)?.contentArea ?? layout.contentArea)
     }
 
+    /// 領域に収める。位置だけでなく、領域より大きい窓は領域の大きさまで縮める(タイトルバーの
+    /// ダブルクリック等でサイドバー分を無視した寸法になった窓の右端が画面外へ出ないように)。
     private func clamped(_ frame: CGRect, in area: CGRect) -> CGRect {
         guard area.width > 0, area.height > 0 else { return frame }
         var f = frame
+        f.size.width = min(f.width, area.width)
+        f.size.height = min(f.height, area.height)
         f.origin.x = min(max(f.minX, area.minX), max(area.minX, area.maxX - f.width))
         f.origin.y = min(max(f.minY, area.minY), max(area.minY, area.maxY - f.height))
         return f

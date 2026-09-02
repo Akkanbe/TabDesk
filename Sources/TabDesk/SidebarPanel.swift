@@ -648,14 +648,19 @@ private final class SidebarResizeHandle: NSView {
     override func updateTrackingAreas() {
         trackingAreas.forEach(removeTrackingArea)
         // cursorUpdate イベントはキーウィンドウにしか届かない(非アクティブ化パネルでは出ない)ので、
-        // mouseEntered / mouseExited で push / pop する。
+        // mouseEntered / mouseExited で push / pop する。さらに TabDesk が非アクティブだと、マウスが
+        // 動くたびにシステムが矢印へ戻すので、mouseMoved / mouseDragged のたびに再設定する。
         addTrackingArea(NSTrackingArea(
-            rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self, userInfo: nil))
+            rect: bounds, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways], owner: self, userInfo: nil))
         super.updateTrackingAreas()
     }
 
     override func mouseEntered(with event: NSEvent) {
         pushCursor()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        NSCursor.resizeLeftRight.set()
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -684,6 +689,7 @@ private final class SidebarResizeHandle: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        NSCursor.resizeLeftRight.set()
         guard let window else { return }
         // 希望幅 = (マウスの画面 x + 掴みオフセット) − パネル左端(Cocoa 座標だが x はそのまま使える)。
         onDrag?(NSEvent.mouseLocation.x + grabOffset - window.frame.minX)

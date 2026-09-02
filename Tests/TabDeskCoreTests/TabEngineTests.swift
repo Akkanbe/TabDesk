@@ -696,7 +696,8 @@ struct ContentAreaClampTests {
         let managed = try await engine.register(
             windowID: 1, pid: 100, identity: identity("big"), frame: CGRect(x: -500, y: -200, width: 2000, height: 1500), into: a.id)
         #expect(managed.frame.origin == content.origin)
-        #expect(managed.frame.size == CGSize(width: 2000, height: 1500), "size is not changed by clamping")
+        // 2026-09-02: 領域より大きい窓は領域の大きさまで縮める(右端・下端が画面外へ出ないように)。
+        #expect(managed.frame.size == content.size, "clamping shrinks oversized windows to the content area")
     }
 }
 
