@@ -68,6 +68,12 @@ final class SidebarPanel: NSPanel {
         updatePermissionBanner()
     }
 
+    override func close() {
+        // カーソルはグローバルな push/pop スタックなので、画面切断でパネルを閉じる前に必ず戻す。
+        resizeHandle?.cancelInteraction()
+        super.close()
+    }
+
     // MARK: - 配置
 
     func reposition() {
@@ -135,6 +141,8 @@ final class SidebarPanel: NSPanel {
     private func applyCollapsedAppearance() {
         let collapsed = metrics.isCollapsed
         scrollView?.isHidden = collapsed
+        // ホバー中やドラッグ中にホットキー等で折りたたむと mouseExited が届かないことがある。
+        if collapsed { resizeHandle?.cancelInteraction() }
         resizeHandle?.isHidden = collapsed
         expandButton?.isHidden = !collapsed
         widthConstraint?.constant = metrics.effectiveWidth
@@ -694,6 +702,13 @@ private final class SidebarResizeHandle: NSView {
         NSCursor.pop()
     }
 
+    /// 非表示・破棄時は mouseExited / mouseUp に依存せず、カーソルと描画状態を片付ける。
+    func cancelInteraction() {
+        isDragging = false
+        isHovering = false
+        popCursor()
+    }
+
     // イベントを受け取り、以降の mouseDragged / mouseUp がこのビューへ届くようにする
     // (responder chain へ流すとパネル移動などの既定処理に化けうる)。
     override func mouseDown(with event: NSEvent) {
@@ -703,6 +718,7 @@ private final class SidebarResizeHandle: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard isDragging else { return }
         NSCursor.resizeLeftRight.set()
         guard let window else { return }
         // 希望幅 = (マウスの画面 x + 掴みオフセット) − パネル左端(Cocoa 座標だが x はそのまま使える)。
@@ -710,6 +726,11 @@ private final class SidebarResizeHandle: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        // 折りたたみやパネル破棄で既にキャンセル済みなら、幅の確定を再実行しない。
+        guard isDragging else {
+            popCursor()
+            return
+        }
         isDragging = false
         onCommit?()
         NSAccessibility.post(element: self, notification: .valueChanged)

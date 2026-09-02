@@ -858,7 +858,12 @@ public final class TabEngine {
     private func followingSidebarEdge(_ frame: CGRect, for window: ManagedWindow) -> CGRect {
         guard let display = display(for: window), let previous = lastContentAreas[display.id] else { return frame }
         let area = display.contentArea
-        guard area.minX != previous.minX, abs(frame.minX - previous.minX) <= config.frameTolerance else { return frame }
+        // サイドバー幅変更では配置領域の左端だけが動く。右端も動いた場合は解像度・画面配置・
+        // Dock 等の変更なので、右端固定で幅を作り直さず通常の clamp に任せる。
+        guard area.minX != previous.minX,
+            abs(area.maxX - previous.maxX) <= config.frameTolerance,
+            abs(frame.minX - previous.minX) <= config.frameTolerance
+        else { return frame }
         let width = frame.maxX - area.minX
         guard width > 0 else { return frame }
         return CGRect(x: area.minX, y: frame.minY, width: width, height: frame.height)
@@ -1907,8 +1912,8 @@ public final class TabEngine {
         state.tabs[try tabIndex(id)]
     }
 
-    /// 固定 frame をコンテンツ領域(サイドバーを除いた範囲)に収める。サイズは変えず位置だけ寄せる。
-    /// 領域より大きい窓は領域の原点に揃える(はみ出しは許容)。仕様 §3.2「サイドバー領域は配置領域から除外」。
+    /// 固定 frame をコンテンツ領域(サイドバーを除いた範囲)に収める。
+    /// 領域より大きい窓は領域まで縮める。仕様 §3.2「サイドバー領域は配置領域から除外」。
     /// 主ディスプレイの領域に収める v1 互換版。窓ごとの判定は clamped(_:for:) を使う。
     private func clamped(_ frame: CGRect) -> CGRect {
         clamped(frame, in: layout.contentArea)

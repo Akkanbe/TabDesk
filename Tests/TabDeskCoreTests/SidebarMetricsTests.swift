@@ -230,6 +230,20 @@ struct SidebarEdgeFollowTests {
         #expect(driver.currentFrame(1) == CGRect(x: 400, y: 100, width: 340, height: 400))
     }
 
+    @Test func displayBoundsChangeDoesNotResizeEdgeWindow() async throws {
+        let edge = CGRect(x: 240, y: 100, width: 500, height: 400)
+        let middle = CGRect(x: 900, y: 100, width: 500, height: 400)
+        let (engine, driver, layout) = try await makeEngine(edge: edge, middle: middle)
+
+        // 解像度や画面配置の変更ではコンテンツ領域の右端も動く。左端だけが動く
+        // サイドバー幅変更と区別しないと、右端固定の計算で窓幅が 440pt に縮んでしまう。
+        let resizedArea = CGRect(x: 300, y: 30, width: 1140, height: 800)
+        layout.change(parkPoint: CGPoint(x: 1439, y: 899), contentArea: resizedArea)
+        await engine.reapplyLayout()
+
+        #expect(driver.currentFrame(1) == CGRect(x: 300, y: 100, width: 500, height: 400))
+    }
+
     @Test func narrowResultStillFollowsKeepingRightEdgeOnScreen() async throws {
         let edge = CGRect(x: 240, y: 100, width: 300, height: 400)  // 右端 540
         let middle = CGRect(x: 900, y: 100, width: 500, height: 400)
