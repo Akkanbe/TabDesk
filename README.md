@@ -1,5 +1,7 @@
 # TabDesk
 
+<img src="Resources/TabDesk/Brand/logo.png" alt="TabDesk ロゴ" width="160">
+
 macOS で他アプリのウィンドウを「タブ」として管理するユーティリティ(開発中)。
 リポジトリ: https://github.com/Akkanbe/TabDesk
 仕様は [docs/01_spec.md](docs/01_spec.md) を参照。
