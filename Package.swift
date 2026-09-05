@@ -35,5 +35,10 @@ let package = Package(
             dependencies: ["TabDeskCore"],
             path: "Tests/TabDeskCoreTests"
         ),
+        .testTarget(
+            name: "TabDeskTests",
+            dependencies: ["TabDesk"],
+            path: "Tests/TabDeskTests"
+        ),
     ]
 )

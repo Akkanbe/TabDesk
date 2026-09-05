@@ -33,6 +33,11 @@ final class WindowManager {
     var suppressAppActivation: (@MainActor () -> Bool)?
     /// UI 向けの状態変更通知(エンジンの onStateChanged はここが占有し、保存とあわせて配る)。
     var onStateChanged: (@MainActor (WorkspaceState) -> Void)?
+    var onSaveStatusChanged: (@MainActor () -> Void)?
+    private(set) var saveFailure: String? {
+        didSet { onSaveStatusChanged?() }
+    }
+    var canRetrySave: Bool { stateWritesEnabled && !isTerminating }
 
     /// 編集モードは永続 state の外にあるが全サイドバーで共有するため、変更時は同じ UI 通知で再描画する。
     func setEditMode(_ enabled: Bool) {
@@ -116,7 +121,11 @@ final class WindowManager {
         }
     }
 
-    init(logger: FileLogger, store: StateStore = StateStore(fileURL: StateStore.defaultURL(appName: "TabDesk"))) {
+    init(
+        logger: FileLogger,
+        store: StateStore = StateStore(fileURL: StateStore.defaultURL(appName: "TabDesk")),
+        monitoringEnabled: Bool = true
+    ) {
         self.logger = logger
         self.store = store
         var initial = WorkspaceState()
@@ -148,6 +157,7 @@ final class WindowManager {
             } catch {
                 // 壊れた原本を退避できないまま上書きすると、復旧材料まで失う。
                 stateWritesEnabled = false
+                saveFailure = "元の設定ファイルを退避できないため、自動保存を停止しています。\n\(error)\n保存先とアクセス権を確認し、元ファイルを保護してから再起動してください。"
                 logger.log("state backup failed: \(error); automatic writes disabled to preserve the original file")
             }
         }
@@ -166,6 +176,8 @@ final class WindowManager {
             NSRunningApplication(processIdentifier: pid)?.activate()
         }
 
+        // 保存経路のテストでは、実アプリの監視やウィンドウ復元を開始しない。
+        guard monitoringEnabled else { return }
         reconcileTimer = Timer.scheduledTimer(withTimeInterval: Self.reconcileInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.reconcileTick() }
         }
@@ -234,9 +246,11 @@ final class WindowManager {
             try store.save(engine.state)
             stateIsDirty = false
             saveRetryAttempt = 0
+            saveFailure = nil
             return true
         } catch {
             stateIsDirty = true
+            saveFailure = "タブ構成を保存できませんでした。変更はまだディスクへ保存されていません。\n\(error)"
             logger.log("save failed: \(error)")
             if scheduleRetry, !isTerminating, saveRetryAttempt < 3 {
                 saveRetryAttempt += 1

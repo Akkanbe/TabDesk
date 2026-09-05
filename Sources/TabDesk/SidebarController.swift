@@ -5,7 +5,7 @@ import TabDeskCore
 ///
 /// FrameWindowController と同じ「seen 集合で冪等 rebuild」パターンだが、パネルは
 /// 状態を持つ(改名中・スクロール位置・描画キャッシュ)ので**再利用が必須**。
-/// 単一スロットのコールバック(onStateChanged / thumbnails.onUpdated / suppressAppActivation)と
+/// 単一スロットのコールバック(onStateChanged / thumbnails.onUpdated)と
 /// 権限バナー用の 1 秒タイマー、画面構成変更 observer は controller が 1 つだけ持つ。
 @MainActor
 final class SidebarController: NSObject {
@@ -20,8 +20,6 @@ final class SidebarController: NSObject {
         super.init()
         manager.onStateChanged = { [weak self] _ in self?.render() }
         manager.thumbnails.onUpdated = { [weak self] _ in self?.refreshThumbnailPresentation() }
-        // どれかのパネルで改名中なら、切替先アプリの前面化を抑止する(キーを奪われて編集が終わる)。
-        manager.suppressAppActivation = { [weak self] in self?.isAnyRenaming ?? false }
         manager.addContentAreaObserver { [weak self] in self?.repositionAll() }
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {

@@ -10,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var loginItemMenuItem: NSMenuItem?
     private var sidebarCollapseMenuItem: NSMenuItem?
+    private var saveStatusMenuItem: NSMenuItem?
+    private var hotkeySettings: HotkeySettingsController?
     private var frameWindows: FrameWindowController?
     private var probeWindow: NSWindow?
     private lazy var hotkeys = HotkeyCenter(logger: logger)
@@ -23,8 +25,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // v4: 各ディスプレイに 1 本のサイドバー。生成・破棄は SidebarController が持つ。
         let controller = SidebarController(manager: manager, logger: logger)
         sidebars = controller
+        // サイドバーの改名と設定画面の編集を、切替先アプリの前面化で中断しない。
+        manager.suppressAppActivation = { [weak self] in
+            guard let self else { return false }
+            return self.sidebars?.isAnyRenaming == true || self.hotkeySettings?.window?.isVisible == true
+        }
         frameWindows = FrameWindowController(manager: manager)
         installStatusItem(alwaysOnTop: controller.alwaysOnTop)
+        manager.onSaveStatusChanged = { [weak self] in self?.updateSaveStatus() }
+        updateSaveStatus()
         controller.orderFrontAll()
         installHotkeys()
         if !manager.isTrusted {
@@ -71,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func installHotkeys() {
         hotkeys.onAction = { [weak self] action in
             guard let self else { return }
+            guard self.hotkeySettings?.window?.isKeyWindow != true else { return }
             switch action {
             case .activateTab(let number):
                 // v4: 「選択中のディスプレイ」の n 番目のタブ(フォーカス窓の画面 → マウスの画面)。
@@ -144,7 +154,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         urlCommands.state = Self.urlCommandsEnabled.value ? .on : .off
         menu.addItem(urlCommands)
         menu.addItem(.separator())
-        menu.addItem(withTitle: "ホットキー設定を開く", action: #selector(openHotkeyConfig), keyEquivalent: "")
+        let saveStatus = NSMenuItem(title: "", action: #selector(showSaveFailure), keyEquivalent: "")
+        saveStatusMenuItem = saveStatus
+        menu.addItem(saveStatus)
+        menu.addItem(withTitle: "ホットキー設定を開く", action: #selector(openHotkeySettings), keyEquivalent: "")
+        menu.addItem(withTitle: "ホットキー設定ファイルをFinderで表示", action: #selector(revealHotkeyConfig), keyEquivalent: "")
         menu.addItem(withTitle: "ホットキーを再読み込み", action: #selector(reloadHotkeys), keyEquivalent: "")
         menu.addItem(withTitle: "アクセシビリティ設定を開く", action: #selector(openAccessibilitySettings), keyEquivalent: "")
         menu.addItem(withTitle: "ログを開く", action: #selector(openLog), keyEquivalent: "")
@@ -267,16 +281,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func openHotkeyConfig() {
+    @objc private func revealHotkeyConfig() {
         // 無ければ既定を書いてから開く(reload が生成する)。
         if !FileManager.default.fileExists(atPath: HotkeyCenter.configURL.path) {
             hotkeys.reload()
         }
-        NSWorkspace.shared.open(HotkeyCenter.configURL)
+        // JSON の既定アプリがチャットアプリでも、意図せずファイルを渡さない。
+        NSWorkspace.shared.activateFileViewerSelecting([HotkeyCenter.configURL])
+    }
+
+    @objc private func openHotkeySettings() {
+        if hotkeySettings == nil {
+            hotkeySettings = HotkeySettingsController(
+                configURL: HotkeyCenter.configURL,
+                suspendHotkeys: { [weak self] in self?.hotkeys.suspendForRecording() ?? [] },
+                resumeHotkeys: { [weak self] in self?.hotkeys.resumeAfterRecording() ?? [] }
+            ) { [weak self] in
+                self?.hotkeys.reload() ?? []
+            }
+        }
+        hotkeySettings?.present()
+    }
+
+    private func updateSaveStatus() {
+        let failed = manager.saveFailure != nil
+        saveStatusMenuItem?.isHidden = !failed
+        saveStatusMenuItem?.title = manager.canRetrySave ? "⚠ タブ構成の保存に失敗…" : "⚠ タブ構成の自動保存を停止中…"
+        statusItem?.button?.image = NSImage(
+            systemSymbolName: failed ? "exclamationmark.triangle" : "rectangle.3.group",
+            accessibilityDescription: failed ? "TabDesk：保存エラー" : "TabDesk")
+        statusItem?.button?.toolTip = failed ? "タブ構成を保存できません。メニューから詳細を確認してください。" : "TabDesk"
+    }
+
+    @objc private func showSaveFailure() {
+        guard let failure = manager.saveFailure else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "タブ構成を保存できません"
+        alert.informativeText = "\(failure)\n\n保存先：\(manager.store.fileURL.path)"
+        alert.addButton(withTitle: "閉じる")
+        alert.addButton(withTitle: "保存先を開く")
+        if manager.canRetrySave { alert.addButton(withTitle: "再試行") }
+        NSApp.activate(ignoringOtherApps: true)
+        switch alert.runModal() {
+        case .alertSecondButtonReturn:
+            NSWorkspace.shared.open(manager.store.fileURL.deletingLastPathComponent())
+        case .alertThirdButtonReturn:
+            _ = manager.saveNow()
+        default:
+            break
+        }
     }
 
     @objc private func reloadHotkeys() {
-        hotkeys.reload()
+        let errors = hotkeys.reload()
+        if !errors.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "一部のホットキーを適用できませんでした"
+            alert.informativeText = errors.joined(separator: "\n")
+            alert.runModal()
+        }
     }
 
     @objc private func showSidebar() {

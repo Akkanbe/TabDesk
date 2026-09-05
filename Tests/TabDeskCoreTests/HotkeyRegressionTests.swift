@@ -31,6 +31,30 @@ struct HotkeyRegressionTests {
 }
 
 struct HotkeyCycleConfigTests {
+    @Test func recordedKeysRoundTripToTheSamePhysicalShortcut() throws {
+        for code: UInt32 in [0, 18, 20, 36, 48, 51, 53, 115, 116, 117, 119, 121, 122, 123, 126] {
+            let spec = try #require(HotkeyParser.specification(keyCode: code, modifiers: 0x1b00))
+            let parsed = try HotkeyParser.parse(spec)
+            #expect(parsed.keyCode == code)
+            #expect(parsed.modifiers == 0x1b00)
+        }
+        #expect(HotkeyParser.specification(keyCode: 0, modifiers: 0) == nil)
+        #expect(HotkeyParser.specification(keyCode: 255, modifiers: 0x100) == nil)
+        #expect(try HotkeyParser.parse("ctrl+shift+tab").symbolDisplay == "⌃⇧⇥")
+    }
+
+    @Test func disabledBindingsSurviveEncodingAndReload() throws {
+        let config = HotkeyConfig(
+            activateTab: ["", "ctrl+alt+2", " "], nextTab: nil, previousTab: nil,
+            registerFocusedWindow: nil, toggleEditMode: nil, toggleSidebar: nil)
+        let encoded = try JSONEncoder().encode(config)
+        let decoded = try JSONDecoder().decode(HotkeyConfig.self, from: encoded)
+        #expect(decoded == config)
+        let resolved = decoded.resolve()
+        #expect(resolved.errors.isEmpty)
+        #expect(resolved.bindings.map(\.1) == [.activateTab(2)])
+    }
+
     @Test func defaultsIncludeTabCycling() {
         let (bindings, errors) = HotkeyConfig.default.resolve()
         #expect(errors.isEmpty)

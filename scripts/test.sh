@@ -10,12 +10,20 @@ CLT="$(xcode-select -p)"
 FW="$CLT/Library/Developer/Frameworks"
 INTEROP_DIR="$CLT/Library/Developer/usr/lib"
 
+TEST_ARGS=()
 if [[ -d "$FW/Testing.framework" ]]; then
-  exec swift test \
-    -Xswiftc "-F$FW" \
-    -Xlinker "-F$FW" -Xlinker -rpath -Xlinker "$FW" \
-    -Xlinker -rpath -Xlinker "$INTEROP_DIR" \
-    "$@"
-else
-  exec swift test "$@"
+  TEST_ARGS+=(
+    -Xswiftc "-F$FW"
+    -Xlinker "-F$FW" -Xlinker -rpath -Xlinker "$FW"
+    -Xlinker -rpath -Xlinker "$INTEROP_DIR"
+  )
 fi
+
+if [[ $# -gt 0 ]]; then
+  exec swift test "${TEST_ARGS[@]}" "$@"
+fi
+
+# AppKit の初期化・描画を、Core の MainActor 応答時間テストと同時に走らせない。
+# 全テストを実行するが、UI を含むターゲットは別プロセスで検証する。
+swift test "${TEST_ARGS[@]}" --skip TabDeskTests
+exec swift test "${TEST_ARGS[@]}" --skip-build --filter TabDeskTests

@@ -26,6 +26,19 @@ public struct Hotkey: Sendable, Hashable {
         hasher.combine(keyCode)
         hasher.combine(modifiers)
     }
+
+    public var symbolDisplay: String {
+        let symbols: [(UInt32, String)] = [
+            (HotkeyParser.controlKey, "⌃"), (HotkeyParser.optionKey, "⌥"),
+            (HotkeyParser.shiftKey, "⇧"), (HotkeyParser.cmdKey, "⌘"),
+        ]
+        let key = HotkeyParser.keyName(for: keyCode) ?? display
+        let labels = ["tab": "⇥", "return": "↩", "escape": "⎋", "space": "Space",
+                      "left": "←", "right": "→", "up": "↑", "down": "↓",
+                      "delete": "⌫", "forwarddelete": "⌦", "home": "↖", "end": "↘",
+                      "pageup": "⇞", "pagedown": "⇟"]
+        return symbols.filter { modifiers & $0.0 != 0 }.map(\.1).joined() + (labels[key] ?? key.uppercased())
+    }
 }
 
 /// "ctrl+alt+1" のような表記を Hotkey に変換する。
@@ -67,10 +80,26 @@ public enum HotkeyParser {
         "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
         "-": 27, "=": 24, "[": 33, "]": 30, ";": 41, "'": 39, ",": 43, ".": 47, "/": 44, "\\": 42, "`": 50,
         "tab": 48, "space": 49, "return": 36, "escape": 53,
+        "delete": 51, "forwarddelete": 117, "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
         "left": 123, "right": 124, "down": 125, "up": 126,
         "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
         "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
     ]
+
+    static func keyName(for keyCode: UInt32) -> String? {
+        keyCodes.first { $0.value == keyCode }?.key
+    }
+
+    /// キー記録と文字列パーサでキー表を共有し、保存後も同じ物理キーへ登録できるようにする。
+    public static func specification(keyCode: UInt32, modifiers: UInt32) -> String? {
+        guard let key = keyName(for: keyCode) else { return nil }
+        let names: [(UInt32, String)] = [
+            (controlKey, "ctrl"), (optionKey, "alt"), (shiftKey, "shift"), (cmdKey, "cmd"),
+        ]
+        let selected = names.filter { modifiers & $0.0 != 0 }.map(\.1)
+        guard !selected.isEmpty else { return nil }
+        return (selected + [key]).joined(separator: "+")
+    }
 
     public static func parse(_ spec: String) throws -> Hotkey {
         let parts = spec.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -105,6 +134,9 @@ public enum HotkeyAction: Sendable, Hashable {
 
 /// hotkeys.json の中身。ユーザーが手で編集できるよう、キーは "ctrl+alt+1" 形式の文字列で持つ。
 public struct HotkeyConfig: Codable, Sendable, Equatable {
+    private enum CodingKeys: String, CodingKey {
+        case activateTab, nextTab, previousTab, registerFocusedWindow, toggleEditMode, toggleSidebar
+    }
     public var activateTab: [String]
     public var nextTab: String?
     public var previousTab: String?
@@ -147,6 +179,17 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
             ? try c.decodeIfPresent(String.self, forKey: .toggleSidebar) : d.toggleSidebar
     }
 
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(activateTab, forKey: .activateTab)
+        // nil を省略すると、次回読み込みで「旧設定に存在しないキー」として既定値に戻ってしまう。
+        try c.encode(nextTab, forKey: .nextTab)
+        try c.encode(previousTab, forKey: .previousTab)
+        try c.encode(registerFocusedWindow, forKey: .registerFocusedWindow)
+        try c.encode(toggleEditMode, forKey: .toggleEditMode)
+        try c.encode(toggleSidebar, forKey: .toggleSidebar)
+    }
+
     /// 設定を (Hotkey, HotkeyAction) の組に解決する。解釈できない項目はエラー文字列として返し、他は生かす。
     public func resolve() -> (bindings: [(Hotkey, HotkeyAction)], errors: [String]) {
         var bindings: [(Hotkey, HotkeyAction)] = []
@@ -168,6 +211,8 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
         }
 
         for (index, spec) in activateTab.prefix(9).enumerated() {
+            // 空欄のスロットは無効化する。詰めて後続のタブ番号を変えない。
+            if spec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
             add(spec, .activateTab(index + 1), label: "activateTab[\(index)]")
         }
         if let spec = nextTab { add(spec, .nextTab, label: "nextTab") }
