@@ -14,7 +14,7 @@ extension WorkspaceState {
     /// - actives: 既存 activeTabIDs の掃除 → 旧 activeTabID の播種 → 各画面の先頭タブで補完。
     ///   旧 activeTabID は主ディスプレイのアクティブのミラーとして更新される
     ///
-    /// TabEngine.init が毎回適用する(冪等なのでコストは分割が必要なときだけ)。
+    /// TabEngine.init が毎回適用する。既移行データも走査するが、再分割はしない。
     public func migratedForPerDisplayTabs(primaryID: DisplayID?) -> WorkspaceState {
         guard let primaryID else { return self }
 
@@ -56,7 +56,7 @@ extension WorkspaceState {
                 let isKeeper = key == keeperKey
                 // v1 純データ(主画面・全部 nil・タブも nil)は nil を保つ。それ以外は具体 ID で固定。
                 let tabDisplayID: DisplayID? =
-                    (key == primaryID && tab.displayID == nil && windows.allSatisfy { $0.displayID == nil })
+                    (key == primaryID && windows.allSatisfy { $0.displayID == nil })
                     ? nil : key
                 let normalized = windows.map { window in
                     var w = window

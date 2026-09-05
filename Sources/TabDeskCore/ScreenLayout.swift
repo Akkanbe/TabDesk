@@ -24,7 +24,7 @@ public struct DisplayLayout: Sendable, Hashable {
 
 /// 退避先とコンテンツ領域の提供元。ディスプレイ構成は変わりうるので、値は都度計算する。
 public protocol ScreenLayout: Sendable {
-    /// 接続中の全ディスプレイ。**先頭 = 主ディスプレイ**(メニューバー・サイドバーのある画面)。
+    /// 接続中の全ディスプレイ。先頭は主ディスプレイ。サイドバーは各画面に表示する。
     var displays: [DisplayLayout] { get }
 }
 
@@ -77,15 +77,11 @@ public struct FixedScreenLayout: ScreenLayout {
     }
 }
 
-/// 本番用。NSScreen.screens から全ディスプレイ分を構築する(v1 の PrimaryScreenLayout を置き換え。
-/// 先頭が主ディスプレイなのは NSScreen.screens の仕様と一致)。
+/// 本番用。NSScreen.screens の順序で全ディスプレイ分を構築する。
 /// sidebarWidth は各ディスプレイのコンテンツ領域から除く。
 public struct SystemScreenLayout: ScreenLayout {
-    /// サイドバー幅は毎回読む(v3 段階 3: 幅変更・折りたたみに追従)。
-    /// TabEngine は existential(any ScreenLayout)として独立コピーを持つため、
-    /// 値を stored let で持つと変更が伝わらない — closure 越しの共有参照にするのが本質。
-    /// v4 段階 5: 各画面にサイドバーが載るため、プロバイダは DisplayID を受け取る
-    /// (幅は共有・折りたたみは画面ごと、を呼び手が解決する)。
+    /// エンジンが保持するコピーにも幅変更が反映されるよう、幅はクロージャ経由で毎回読む。
+    /// 共有幅と画面ごとの折りたたみ状態から、呼び手が実効幅を返す。
     private let sidebarWidthProvider: @Sendable (DisplayID) -> CGFloat
 
     public init(sidebarWidth: @escaping @Sendable (DisplayID) -> CGFloat) {

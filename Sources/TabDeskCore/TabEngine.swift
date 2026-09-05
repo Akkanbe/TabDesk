@@ -1824,13 +1824,7 @@ public final class TabEngine {
     // MARK: - 内部ヘルパー
 
     private func focusTargetPID(in tab: Tab) -> pid_t? {
-        // 未復元(実窓なし)のエントリは前面化の対象にしない(消滅保留中は pid だけ残っていることがある)。
-        if let focused = tab.lastFocusedWindowID, let w = tab.windows.first(where: { $0.id == focused }),
-            w.isBound, let pid = w.pid
-        {
-            return pid
-        }
-        return tab.windows.first(where: \.isBound)?.pid
+        tab.representativeWindow?.pid
     }
 
     private func removeFromState(_ id: UUID) {
@@ -1910,13 +1904,6 @@ public final class TabEngine {
 
     private func tab(_ id: UUID) throws -> Tab {
         state.tabs[try tabIndex(id)]
-    }
-
-    /// 固定 frame をコンテンツ領域(サイドバーを除いた範囲)に収める。
-    /// 領域より大きい窓は領域まで縮める。仕様 §3.2「サイドバー領域は配置領域から除外」。
-    /// 主ディスプレイの領域に収める v1 互換版。窓ごとの判定は clamped(_:for:) を使う。
-    private func clamped(_ frame: CGRect) -> CGRect {
-        clamped(frame, in: layout.contentArea)
     }
 
     /// 窓が属するディスプレイのコンテンツ領域に収める(段階 D)。ディスプレイ切断中は主ディスプレイへ。

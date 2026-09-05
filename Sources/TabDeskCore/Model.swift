@@ -81,8 +81,9 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
         case id, name, windows, lastFocusedWindowID, layout, displayID
     }
 
-    /// タブを代表する実ウィンドウ(サムネイル撮影の対象。v3 段階 5)。
-    /// 最後にフォーカスされていた bound な窓 → 無ければ先頭の bound な窓。全滅なら nil。
+    /// サムネイル撮影と切替時の前面化に使う実ウィンドウ。
+    /// 最後にフォーカスされていた紐付け済みの窓、なければ先頭の紐付け済みの窓を返す。
+    /// pid だけ残る消滅保留中の窓は対象外。対象がなければ nil。
     public var representativeWindow: ManagedWindow? {
         if let id = lastFocusedWindowID, let window = windows.first(where: { $0.id == id }), window.isBound {
             return window
