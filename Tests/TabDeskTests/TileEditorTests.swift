@@ -6,6 +6,60 @@ import TabDeskCore
 
 @MainActor
 struct TileEditorTests {
+    @Test func staleEditorCannotOverwriteChangedAssignmentsWithUnchangedPartition() async throws {
+        _ = NSApplication.shared
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = StateStore(fileURL: directory.appendingPathComponent("state.json"))
+        let a = UUID(), b = UUID()
+        let partition = TilePartition.columns([a, b])
+        let identity = WindowIdentity(bundleID: "test.app", appName: "Test", title: "Document", registeredSize: .zero)
+        let first = ManagedWindow(frame: .zero, identity: identity, windowID: nil, pid: nil, tileID: a)
+        let second = ManagedWindow(frame: .zero, identity: identity, windowID: nil, pid: nil, tileID: b)
+        let tab = Tab(name: "Saved", windows: [first, second], layout: .tiled, tiles: partition)
+        try store.save(WorkspaceState(tabs: [tab], activeTabID: tab.id))
+        let manager = WindowManager(logger: FileLogger(fileURL: directory.appendingPathComponent("test.log")),
+                                    store: store, monitoringEnabled: false)
+        let editor = TileEditorController(manager: manager, tabID: tab.id)
+        defer { editor.close() }
+        editor.splitSelected(axis: .vertical)
+        let draft = editor.partition
+        try await manager.engine.updateTiles(tab.id, partition: partition,
+                                             assignments: [first.id: b, second.id: a], expected: partition,
+                                             expectedAssignments: [first.id: a, second.id: b])
+        let current = manager.engine.state
+        editor.refreshState()
+        #expect(editor.partition == draft)
+        #expect(await editor.applyDraft() == false)
+        #expect(manager.engine.state == current)
+        #expect(editor.hasChanges)
+    }
+
+    @Test func operationErrorSurvivesStateRefreshUntilExplicitReload() throws {
+        _ = NSApplication.shared
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manager = WindowManager(logger: FileLogger(fileURL: directory.appendingPathComponent("test.log")),
+                                    store: StateStore(fileURL: directory.appendingPathComponent("state.json")), monitoringEnabled: false)
+        let editor = TileEditorController(manager: manager, tabID: manager.engine.createTab().id)
+        defer { editor.close() }
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let views = descendants(try #require(editor.window?.contentView))
+        let merge = try #require(views.compactMap { $0 as? NSButton }.first { $0.title == L10n.text(.mergeTiles) })
+        merge.performClick(nil)
+        let message = try #require(views.compactMap { $0 as? NSTextField }.first { $0.stringValue == L10n.text(.cannotMerge) })
+        #expect(!editor.hasChanges)
+        editor.refreshState()
+        #expect(message.stringValue == L10n.text(.cannotMerge))
+        L10n.$languageOverride.withValue(.english) {
+            editor.refreshLocalization()
+            #expect(message.stringValue == L10n.text(.cannotMerge))
+        }
+        let reload = try #require(views.compactMap { $0 as? NSButton }.first { $0.action == NSSelectorFromString("reload") })
+        reload.performClick(nil)
+        #expect(message.stringValue.isEmpty)
+    }
+
     @Test(arguments: AppLanguage.allCases, [false, true]) func editorFitsAndDraftDoesNotMoveWindowsUntilApply(language: AppLanguage, dark: Bool) async throws {
         _ = NSApplication.shared
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

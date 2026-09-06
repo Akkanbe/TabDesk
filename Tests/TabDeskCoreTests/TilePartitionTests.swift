@@ -4,6 +4,30 @@ import Testing
 @testable import TabDeskCore
 
 struct TilePartitionTests {
+    @Test(arguments: [false, true]) func preparingTilesPreservesExistingAssignmentsAfterEarlierUnassignedWindow(hasEmptyTile: Bool) throws {
+        let occupiedID = UUID()
+        let partition = hasEmptyTile
+            ? try TilePartition.tile(occupiedID).splitting(occupiedID, axis: .horizontal)
+            : .tile(occupiedID)
+        let identity = WindowIdentity(bundleID: "test.app", appName: "Test", title: "Document", registeredSize: .zero)
+        let added = ManagedWindow(frame: .zero, identity: identity, windowID: nil, pid: nil)
+        let existing = ManagedWindow(frame: .zero, identity: identity, windowID: nil, pid: nil, tileID: occupiedID)
+        var tab = Tab(name: "Saved", windows: [added, existing], layout: .tiled, tiles: partition)
+        try tab.prepareTiles()
+        #expect(tab.windows[1].tileID == occupiedID)
+        #expect(tab.windows[0].tileID != occupiedID)
+        #expect(tab.tiles?.tileIDs.count == 2)
+        if hasEmptyTile { #expect(tab.tiles == partition) }
+        let prepared = tab
+        try tab.prepareTiles()
+        #expect(tab == prepared)
+
+        let saved = Tab(name: "Saved", windows: [added, existing], layout: .tiled, tiles: partition)
+        let restored = try JSONDecoder().decode(Tab.self, from: JSONEncoder().encode(saved))
+        #expect(restored.windows[1].tileID == occupiedID)
+        #expect(restored.windows[0].tileID != occupiedID)
+    }
+
     @Test func nestedPartitionsCoverAreaWithoutOverlapAfterResizing() throws {
         let a = UUID()
         var partition = try TilePartition.tile(a).splitting(a, axis: .horizontal)
@@ -103,13 +127,15 @@ struct ManualTileEngineTests {
         let a = original.tileIDs[0]
         let split = try original.splitting(a, axis: .horizontal)
         let b = split.tileIDs[1]
-        try await engine.updateTiles(tab.id, partition: split, assignments: [:], expected: original)
+        try await engine.updateTiles(tab.id, partition: split, assignments: [:], expected: original,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         let first = try await register(1, engine: engine, driver: driver, tab: tab.id, tile: b)
         let second = try await register(2, engine: engine, driver: driver, tab: tab.id, tile: a)
         let frames = split.geometry(in: area).tiles
         #expect(driver.currentFrame(1) == frames[b])
         #expect(driver.currentFrame(2) == frames[a])
-        try await engine.updateTiles(tab.id, partition: split, assignments: [first.id: a, second.id: b], expected: split)
+        try await engine.updateTiles(tab.id, partition: split, assignments: [first.id: a, second.id: b], expected: split,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         #expect(driver.currentFrame(1) == frames[a])
         #expect(driver.currentFrame(2) == frames[b])
         _ = try await engine.unregister(first.id)
@@ -125,15 +151,18 @@ struct ManualTileEngineTests {
         let original = try #require(tab.tiles)
         let a = original.tileIDs[0]
         let split = try original.splitting(a, axis: .horizontal)
-        try await engine.updateTiles(tab.id, partition: split, assignments: [:], expected: original)
+        try await engine.updateTiles(tab.id, partition: split, assignments: [:], expected: original,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         let first = try await register(1, engine: engine, driver: driver, tab: tab.id)
         let second = try await register(2, engine: engine, driver: driver, tab: tab.id)
         let state = engine.state
         await #expect(throws: TileEditError.self) {
-            try await engine.updateTiles(tab.id, partition: split, assignments: [first.id: a, second.id: a], expected: split)
+            try await engine.updateTiles(tab.id, partition: split, assignments: [first.id: a, second.id: a], expected: split,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         }
         await #expect(throws: TileEditError.self) {
-            try await engine.updateTiles(tab.id, partition: split, assignments: [first.id: a, second.id: split.tileIDs[1]], expected: original)
+            try await engine.updateTiles(tab.id, partition: split, assignments: [first.id: a, second.id: split.tileIDs[1]], expected: original,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         }
         #expect(engine.state == state)
     }
@@ -161,7 +190,8 @@ struct ManualTileEngineTests {
         let tab = engine.createTab()
         let original = try #require(tab.tiles)
         let split = try original.splitting(original.tileIDs[0], axis: .horizontal)
-        try await engine.updateTiles(tab.id, partition: split, assignments: [:], expected: original)
+        try await engine.updateTiles(tab.id, partition: split, assignments: [:], expected: original,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         let first = try await register(1, engine: engine, driver: driver, tab: tab.id)
         let second = try await register(2, engine: engine, driver: driver, tab: tab.id)
         let wider = CGRect(x: 16, y: 30, width: 1904, height: 1000)
@@ -192,7 +222,8 @@ struct ManualTileEngineTests {
         driver.setFullscreen(1)
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
         let fullscreenFrame = driver.currentFrame(1)
-        try await engine.updateTiles(tab.id, partition: split, assignments: [window.id: original.tileIDs[0]], expected: original)
+        try await engine.updateTiles(tab.id, partition: split, assignments: [window.id: original.tileIDs[0]], expected: original,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         #expect(driver.currentFrame(1) == fullscreenFrame)
         #expect(engine.tilePlacementFailures(in: tab.id).isEmpty)
         let recorded = engine.state.managedWindow(id: window.id)?.window.frame
@@ -215,10 +246,12 @@ struct ManualTileEngineTests {
         let original = try #require(tab.tiles)
         let split = try original.splitting(original.tileIDs[0], axis: .horizontal)
         driver.setFailWrites(1)
-        try await engine.updateTiles(tab.id, partition: split, assignments: [window.id: original.tileIDs[0]], expected: original)
+        try await engine.updateTiles(tab.id, partition: split, assignments: [window.id: original.tileIDs[0]], expected: original,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         #expect(engine.tilePlacementFailures(in: tab.id) == [window.id])
         driver.setFailWrites(1, false)
-        try await engine.updateTiles(tab.id, partition: split, assignments: [window.id: original.tileIDs[0]], expected: split)
+        try await engine.updateTiles(tab.id, partition: split, assignments: [window.id: original.tileIDs[0]], expected: split,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         #expect(engine.tilePlacementFailures(in: tab.id).isEmpty)
     }
 
@@ -227,7 +260,8 @@ struct ManualTileEngineTests {
         let tab = engine.createTab()
         let original = try #require(tab.tiles)
         let split = try original.splitting(original.tileIDs[0], axis: .horizontal)
-        try await engine.updateTiles(tab.id, partition: split, assignments: [:], expected: original)
+        try await engine.updateTiles(tab.id, partition: split, assignments: [:], expected: original,
+                                     expectedAssignments: engine.state.tab(withID: tab.id)?.tileAssignments ?? [:])
         let frame = CGRect(x: 400, y: 100, width: 1000, height: 400)
         driver.add(1, frame: frame, minSize: CGSize(width: 1000, height: 100))
         let window = try await engine.register(windowID: 1, pid: 100, identity: identity(1), frame: frame, into: tab.id)
@@ -237,5 +271,35 @@ struct ManualTileEngineTests {
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
         #expect(driver.currentFrame(1) == actual)
         #expect(engine.state.tabs[0].tiles == split)
+    }
+
+    @Test func successfulSnapBackClearsPlacementFailureWithoutWorkspaceChange() async throws {
+        let driver = FakeWindowDriver()
+        var configuration = TabEngine.Configuration()
+        configuration.debounce = .milliseconds(10)
+        let engine = TabEngine(driver: driver,
+                               layout: FixedScreenLayout(parkPoint: CGPoint(x: 1919, y: 1199), contentArea: area),
+                               configuration: configuration)
+        let tab = engine.createTab()
+        let window = try await register(1, engine: engine, driver: driver, tab: tab.id)
+        let original = try #require(tab.tiles)
+        let split = try original.splitting(original.tileIDs[0], axis: .horizontal)
+        driver.setFailWrites(1)
+        try await engine.updateTiles(tab.id, partition: split, assignments: [window.id: original.tileIDs[0]],
+                                     expected: original, expectedAssignments: [window.id: original.tileIDs[0]])
+        #expect(engine.tilePlacementFailures(in: tab.id) == [window.id])
+        let recorded = engine.state
+        var notifiedRecovery = false
+        engine.onStateChanged = { state in
+            if state == recorded && engine.tilePlacementFailures(in: tab.id).isEmpty { notifiedRecovery = true }
+        }
+        defer { engine.onStateChanged = nil }
+        driver.setFailWrites(1, false)
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(driver.currentFrame(1) == recorded.managedWindow(id: window.id)?.window.frame)
+        #expect(engine.state == recorded)
+        #expect(engine.tilePlacementFailures(in: tab.id).isEmpty)
+        #expect(notifiedRecovery)
     }
 }

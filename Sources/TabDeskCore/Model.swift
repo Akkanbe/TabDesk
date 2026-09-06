@@ -91,8 +91,13 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
         guard var partition = tiles else { throw TileEditError.invalidPartition }
         try partition.validate()
         var occupied = Set<UUID>()
+        var unassigned: [Int] = []
+        // 先に既存の割り当てを予約する。前方へ並べ替えた新規窓に既存タイルを奪わせない。
         for index in windows.indices {
             if let id = windows[index].tileID, partition.tileIDs.contains(id), occupied.insert(id).inserted { continue }
+            unassigned.append(index)
+        }
+        for index in unassigned {
             var empty = partition.tileIDs.first { !occupied.contains($0) }
             if empty == nil {
                 // モードを離れている間に増えた窓だけを追加する。既存の空タイル・割り当ては残す。
@@ -109,6 +114,11 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
             occupied.insert(empty)
         }
         tiles = partition
+    }
+
+    public var tileAssignments: [UUID: UUID] {
+        Dictionary(windows.compactMap { window in window.tileID.map { (window.id, $0) } },
+                   uniquingKeysWith: { first, _ in first })
     }
 
     enum CodingKeys: String, CodingKey {

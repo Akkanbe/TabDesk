@@ -370,6 +370,9 @@ final class SidebarPanel: NSPanel {
             tileEditors.removeValue(forKey: id)
         }
         tileEditors.values.forEach { $0.refreshState() }
+        // 操作失敗は永続 state の外で更新される。行の再利用中も警告だけは再評価する。
+        let activeTabID = manager.engine.activeTabID(on: displayID)
+        tileWarning.isHidden = activeTabID.map { manager.engine.tilePlacementFailures(in: $0).isEmpty } ?? true
         // エンジンの state は同じ値でも didSet が発火する。見た目が変わらないなら行を作り直さない
         // (ダブルクリックの 2 回目が作り直し直後の行に届き、レイアウト前で編集欄が出ない事故を防ぐ)。
         // v4: activeTabIDs は state に含まれるので、この差分キーで画面別アクティブの変化も拾える。
@@ -379,7 +382,6 @@ final class SidebarPanel: NSPanel {
         lastRendered = (state, manager.engine.editMode)
         // v4: 自分の画面のタブだけを描く。
         let tabs = state.tabs(on: displayID, primaryID: manager.layout.primaryDisplay?.id)
-        let activeTabID = manager.engine.activeTabID(on: displayID)
         tabsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for (index, tab) in tabs.enumerated() {
             let row = TabRowView(
@@ -430,7 +432,6 @@ final class SidebarPanel: NSPanel {
         editModeCheck.state = manager.engine.editMode ? .on : .off
         let active = activeTabID.flatMap { state.tab(withID: $0) }
         editTilesButton.isEnabled = active?.layout == .tiled
-        tileWarning.isHidden = activeTabID.map { manager.engine.tilePlacementFailures(in: $0).isEmpty } ?? true
     }
 
     private func updatePermissionBanner() {

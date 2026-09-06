@@ -54,21 +54,24 @@ final class TileEditorController: NSWindowController {
     /// 外部の登録・解除は未適用の編集を上書きしない。確定時にもエンジンで競合を検証する。
     func refreshState() {
         guard !busy else { return }
-        if !hasChanges { reload() } else { refreshPresentation() }
+        if !hasChanges { loadState() } else { refreshPresentation() }
     }
 
     func refreshLocalization() { refreshPresentation() }
 
     @objc private func reload() {
+        operationError = nil
+        loadState()
+    }
+
+    private func loadState() {
         guard let tab = manager.engine.state.tab(withID: tabID), tab.layout == .tiled, let tiles = tab.tiles else {
             refreshPresentation()
             return
         }
-        operationError = nil
         original = tiles
         partition = tiles
-        assignments = Dictionary(tab.windows.compactMap { window in window.tileID.map { (window.id, $0) } },
-                                 uniquingKeysWith: { first, _ in first })
+        assignments = tab.tileAssignments
         originalAssignments = assignments
         if !tiles.tileIDs.contains(where: { $0 == selected }) { selected = tiles.tileIDs.first }
         refreshPresentation()
@@ -176,7 +179,8 @@ final class TileEditorController: NSWindowController {
         busy = true
         refreshPresentation()
         do {
-            try await manager.engine.updateTiles(tabID, partition: partition, assignments: assignments, expected: original)
+            try await manager.engine.updateTiles(tabID, partition: partition, assignments: assignments,
+                                                 expected: original, expectedAssignments: originalAssignments)
             busy = false
             reload()
             if manager.engine.tilePlacementFailures(in: tabID).isEmpty { showMessage(L10n.text(.tilesApplied)) }

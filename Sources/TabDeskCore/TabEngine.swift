@@ -310,7 +310,8 @@ public final class TabEngine {
 
     /// エディタの確定だけで実窓へ適用する。IPC 前に全割り当てを検証し、部分保存を防ぐ。
     public func updateTiles(
-        _ tabID: UUID, partition: TilePartition, assignments: [UUID: UUID], expected: TilePartition?
+        _ tabID: UUID, partition: TilePartition, assignments: [UUID: UUID],
+        expected: TilePartition?, expectedAssignments: [UUID: UUID]
     ) async throws {
         try await serialized {
             try rejectIfShuttingDown()
@@ -318,6 +319,7 @@ public final class TabEngine {
             let tab = state.tabs[index]
             try partition.validate()
             guard tab.layout == .tiled, tab.tiles == expected,
+                  tab.tileAssignments == expectedAssignments,
                   Set(assignments.keys) == Set(tab.windows.map(\.id)),
                   Set(assignments.values).count == assignments.count,
                   Set(assignments.values).isSubset(of: Set(partition.tileIDs))
@@ -1069,6 +1071,7 @@ public final class TabEngine {
                 let actual = try await executor.run { try driver.setFrame(recorded, of: windowID) }
                 guard isLatest(id, generation) else { return }
                 if approximatelyEqual(actual, recorded) {
+                    if tileOperationFailures.remove(id) != nil { onStateChanged?(state) }
                     log("snap-back: \(found.window.identity.appName) \(current) → \(actual) (attempt \(attempt))")
                     return
                 }
