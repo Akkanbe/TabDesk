@@ -50,33 +50,35 @@ struct PersistenceStatusTests {
 
 @MainActor
 struct HotkeySettingsTests {
-    @Test func settingsControlsFitInsideWindow() throws {
-        _ = NSApplication.shared
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let controller = HotkeySettingsController(configURL: url) { [] }
-        controller.loadConfiguration()
-        let content = try #require(controller.window?.contentView)
-        controller.window?.appearance = NSAppearance(named: .aqua)
-        content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor(white: 0.95, alpha: 1).cgColor
-        content.layoutSubtreeIfNeeded()
-        for field in controller.fields {
-            let rect = field.convert(field.bounds, to: content)
-            #expect(rect.width >= 300 && rect.height >= 20)
-            #expect(content.bounds.contains(rect))
-        }
-        func checkButtons(_ view: NSView) {
-            for child in view.subviews {
-                if child is NSButton { #expect(content.bounds.contains(child.convert(child.bounds, to: content))) }
-                checkButtons(child)
+    @Test(arguments: AppLanguage.allCases) func settingsControlsFitInsideWindow(language: AppLanguage) throws {
+        try L10n.$languageOverride.withValue(language) {
+            _ = NSApplication.shared
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let controller = HotkeySettingsController(configURL: url) { [] }
+            controller.loadConfiguration()
+            let content = try #require(controller.window?.contentView)
+            controller.window?.appearance = NSAppearance(named: .aqua)
+            content.wantsLayer = true
+            content.layer?.backgroundColor = NSColor(white: 0.95, alpha: 1).cgColor
+            content.layoutSubtreeIfNeeded()
+            for field in controller.fields {
+                let rect = field.convert(field.bounds, to: content)
+                #expect(rect.width >= 300 && rect.height >= 20)
+                #expect(content.bounds.contains(rect))
             }
-        }
-        checkButtons(content)
-        if let path = ProcessInfo.processInfo.environment["TABDESK_TEST_PREVIEW_PATH"] {
-            let bitmap = try #require(content.bitmapImageRepForCachingDisplay(in: content.bounds))
-            content.cacheDisplay(in: content.bounds, to: bitmap)
-            let png = try #require(bitmap.representation(using: .png, properties: [:]))
-            try png.write(to: URL(fileURLWithPath: path))
+            func checkButtons(_ view: NSView) {
+                for child in view.subviews {
+                    if child is NSButton { #expect(content.bounds.contains(child.convert(child.bounds, to: content))) }
+                    checkButtons(child)
+                }
+            }
+            checkButtons(content)
+            if let path = ProcessInfo.processInfo.environment["TABDESK_TEST_PREVIEW_PATH"] {
+                let bitmap = try #require(content.bitmapImageRepForCachingDisplay(in: content.bounds))
+                content.cacheDisplay(in: content.bounds, to: bitmap)
+                let png = try #require(bitmap.representation(using: .png, properties: [:]))
+                try png.write(to: URL(fileURLWithPath: "\(path)-\(language.rawValue).png"))
+            }
         }
     }
 

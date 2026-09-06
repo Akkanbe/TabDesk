@@ -5,6 +5,8 @@ import Foundation
 public enum TabLayout: String, Codable, Sendable {
     /// 自由配置(v1 の挙動)。各窓が個別の固定 frame を持つ。
     case free
+    /// 保存した矩形タイルへ個別に割り当てる。
+    case tiled
     /// 縦の等幅カラム。`Tab.windows` の並び順(bound の窓のみ)に左から等分する。
     case columns
 }

@@ -28,10 +28,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // サイドバーの改名と設定画面の編集を、切替先アプリの前面化で中断しない。
         manager.suppressAppActivation = { [weak self] in
             guard let self else { return false }
-            return self.sidebars?.isAnyRenaming == true || self.hotkeySettings?.window?.isVisible == true
+            return self.sidebars?.isAnyRenaming == true || self.sidebars?.isAnyEditingTiles == true || self.hotkeySettings?.window?.isVisible == true
         }
         frameWindows = FrameWindowController(manager: manager)
         installStatusItem(alwaysOnTop: controller.alwaysOnTop)
+        manager.onOperationError = { message in
+            let alert = NSAlert()
+            alert.messageText = L10n.text(.windowOperationFailed)
+            alert.informativeText = message
+            alert.addButton(withTitle: L10n.text(.close))
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
         manager.onSaveStatusChanged = { [weak self] in self?.updateSaveStatus() }
         updateSaveStatus()
         controller.orderFrontAll()
@@ -126,50 +134,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - メニューバー
 
     private func installStatusItem(alwaysOnTop: Bool) {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: "TabDesk")
+        let item = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = StatusBarIcon.image
         let menu = NSMenu()
-        menu.addItem(withTitle: "サイドバーを表示", action: #selector(showSidebar), keyEquivalent: "")
-        let collapse = NSMenuItem(title: "サイドバーを折りたたむ", action: #selector(toggleSidebarCollapsed(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: L10n.text(.showSidebar), action: #selector(showSidebar), keyEquivalent: "")
+        let collapse = NSMenuItem(title: L10n.text(.collapseSidebar), action: #selector(toggleSidebarCollapsed(_:)), keyEquivalent: "")
         collapse.state = menuCollapseState()
         sidebarCollapseMenuItem = collapse
         menu.addItem(collapse)
-        let onTop = NSMenuItem(title: "サイドバーを常に最前面にする", action: #selector(toggleAlwaysOnTop(_:)), keyEquivalent: "")
+        let onTop = NSMenuItem(title: L10n.text(.alwaysOnTop), action: #selector(toggleAlwaysOnTop(_:)), keyEquivalent: "")
         onTop.state = alwaysOnTop ? .on : .off
         menu.addItem(onTop)
-        let follow = NSMenuItem(title: "フォーカスで自動切替", action: #selector(toggleFocusFollows(_:)), keyEquivalent: "")
+        let follow = NSMenuItem(title: L10n.text(.followFocus), action: #selector(toggleFocusFollows(_:)), keyEquivalent: "")
         follow.state = manager.focusFollows.value ? .on : .off
         menu.addItem(follow)
-        let login = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
+        let login = NSMenuItem(title: L10n.text(.launchAtLogin), action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
         loginItemMenuItem = login
         updateLaunchAtLoginMenuItem()
         menu.addItem(login)
-        let frames = NSMenuItem(title: "背景の枠を表示", action: #selector(toggleFrameWindows(_:)), keyEquivalent: "")
+        let frames = NSMenuItem(title: L10n.text(.showFrames), action: #selector(toggleFrameWindows(_:)), keyEquivalent: "")
         frames.state = FrameWindowController.enabledSetting.value ? .on : .off
         menu.addItem(frames)
-        let thumbnails = NSMenuItem(title: "タブサムネイルを表示", action: #selector(toggleThumbnails(_:)), keyEquivalent: "")
+        let thumbnails = NSMenuItem(title: L10n.text(.showThumbnails), action: #selector(toggleThumbnails(_:)), keyEquivalent: "")
         thumbnails.state = ThumbnailStore.enabledSetting.value ? .on : .off
         menu.addItem(thumbnails)
-        let urlCommands = NSMenuItem(title: "URL コマンドを許可(自動化用)", action: #selector(toggleURLCommands(_:)), keyEquivalent: "")
+        let urlCommands = NSMenuItem(title: L10n.text(.allowURLs), action: #selector(toggleURLCommands(_:)), keyEquivalent: "")
         urlCommands.state = Self.urlCommandsEnabled.value ? .on : .off
         menu.addItem(urlCommands)
         menu.addItem(.separator())
         let saveStatus = NSMenuItem(title: "", action: #selector(showSaveFailure), keyEquivalent: "")
         saveStatusMenuItem = saveStatus
         menu.addItem(saveStatus)
-        menu.addItem(withTitle: "ホットキー設定を開く", action: #selector(openHotkeySettings), keyEquivalent: "")
-        menu.addItem(withTitle: "ホットキー設定ファイルをFinderで表示", action: #selector(revealHotkeyConfig), keyEquivalent: "")
-        menu.addItem(withTitle: "ホットキーを再読み込み", action: #selector(reloadHotkeys), keyEquivalent: "")
-        menu.addItem(withTitle: "アクセシビリティ設定を開く", action: #selector(openAccessibilitySettings), keyEquivalent: "")
-        menu.addItem(withTitle: "ログを開く", action: #selector(openLog), keyEquivalent: "")
+        let languageItem = NSMenuItem(title: "表示言語 / Language", action: nil, keyEquivalent: "")
+        let languages = NSMenu()
+        for language in AppLanguage.allCases {
+            let choice = NSMenuItem(title: language.nativeName, action: #selector(changeLanguage(_:)), keyEquivalent: "")
+            choice.representedObject = language.rawValue
+            choice.state = language == L10n.language ? .on : .off
+            choice.target = self
+            languages.addItem(choice)
+        }
+        languageItem.submenu = languages
+        menu.addItem(languageItem)
+        menu.addItem(withTitle: L10n.text(.openHotkeys), action: #selector(openHotkeySettings), keyEquivalent: "")
+        menu.addItem(withTitle: L10n.text(.revealHotkeys), action: #selector(revealHotkeyConfig), keyEquivalent: "")
+        menu.addItem(withTitle: L10n.text(.reloadHotkeys), action: #selector(reloadHotkeys), keyEquivalent: "")
+        menu.addItem(withTitle: L10n.text(.openAccessibility), action: #selector(openAccessibilitySettings), keyEquivalent: "")
+        menu.addItem(withTitle: L10n.text(.openLog), action: #selector(openLog), keyEquivalent: "")
         menu.addItem(.separator())
-        menu.addItem(withTitle: "TabDesk を終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: L10n.text(.quit), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         for menuItem in menu.items where menuItem.action != #selector(NSApplication.terminate(_:)) {
             menuItem.target = self
         }
         menu.delegate = self
         item.menu = menu
         statusItem = item
+    }
+
+    @objc private func changeLanguage(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let language = AppLanguage(rawValue: rawValue), language != L10n.language else { return }
+        LanguagePreference().value = language
+        installStatusItem(alwaysOnTop: sidebars?.alwaysOnTop ?? SidebarPanel.alwaysOnTopSetting.value)
+        updateSaveStatus()
+        sidebars?.refreshLocalization()
+        hotkeySettings?.refreshLocalization()
     }
 
     /// System Settings 側でログイン項目が変更されることがあるため、メニューを開くたびに実状態を読み直す。
@@ -262,20 +291,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.isEnabled = true
         switch SMAppService.mainApp.status {
         case .enabled:
-            item.title = "ログイン時に起動"
+            item.title = L10n.text(.launchAtLogin)
             item.state = .on
         case .notRegistered:
-            item.title = "ログイン時に起動"
+            item.title = L10n.text(.launchAtLogin)
             item.state = .off
         case .requiresApproval:
-            item.title = "ログイン時に起動（承認が必要）"
+            item.title = L10n.text(.loginApproval)
             item.state = .mixed
         case .notFound:
-            item.title = "ログイン時に起動（利用不可）"
+            item.title = L10n.text(.loginUnavailable)
             item.state = .off
             item.isEnabled = false
         @unknown default:
-            item.title = "ログイン時に起動（状態不明）"
+            item.title = L10n.text(.loginUnknown)
             item.state = .off
             item.isEnabled = false
         }
@@ -306,22 +335,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateSaveStatus() {
         let failed = manager.saveFailure != nil
         saveStatusMenuItem?.isHidden = !failed
-        saveStatusMenuItem?.title = manager.canRetrySave ? "⚠ タブ構成の保存に失敗…" : "⚠ タブ構成の自動保存を停止中…"
-        statusItem?.button?.image = NSImage(
-            systemSymbolName: failed ? "exclamationmark.triangle" : "rectangle.3.group",
-            accessibilityDescription: failed ? "TabDesk：保存エラー" : "TabDesk")
-        statusItem?.button?.toolTip = failed ? "タブ構成を保存できません。メニューから詳細を確認してください。" : "TabDesk"
+        saveStatusMenuItem?.title = manager.canRetrySave ? L10n.text(.saveFailedMenu) : L10n.text(.saveStoppedMenu)
+        statusItem?.button?.image = failed
+            ? NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: L10n.text(.saveErrorAccessibility))
+            : StatusBarIcon.image
+        statusItem?.button?.toolTip = failed ? L10n.text(.saveErrorTooltip) : "TabDesk"
     }
 
     @objc private func showSaveFailure() {
         guard let failure = manager.saveFailure else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "タブ構成を保存できません"
-        alert.informativeText = "\(failure)\n\n保存先：\(manager.store.fileURL.path)"
-        alert.addButton(withTitle: "閉じる")
-        alert.addButton(withTitle: "保存先を開く")
-        if manager.canRetrySave { alert.addButton(withTitle: "再試行") }
+        alert.messageText = L10n.text(.saveErrorTitle)
+        alert.informativeText = L10n.text(.saveLocation, failure, manager.store.fileURL.path)
+        alert.addButton(withTitle: L10n.text(.close))
+        alert.addButton(withTitle: L10n.text(.openSaveFolder))
+        if manager.canRetrySave { alert.addButton(withTitle: L10n.text(.retry)) }
         NSApp.activate(ignoringOtherApps: true)
         switch alert.runModal() {
         case .alertSecondButtonReturn:
@@ -337,7 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let errors = hotkeys.reload()
         if !errors.isEmpty {
             let alert = NSAlert()
-            alert.messageText = "一部のホットキーを適用できませんでした"
+            alert.messageText = L10n.text(.hotkeyApplyError)
             alert.informativeText = errors.joined(separator: "\n")
             alert.runModal()
         }
@@ -421,7 +450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 displayID = manager.selectedDisplayID()
             }
             if let name = q["name"] {
-                engine.createTab(name: name, on: displayID)
+                engine.createTab(name: name, on: displayID, layout: .tiled)
             } else {
                 engine.createTab(on: displayID)
             }

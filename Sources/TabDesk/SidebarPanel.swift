@@ -19,13 +19,45 @@ final class SidebarPanel: NSPanel {
     private let tabsStack = NSStackView()
     private let windowsHeader = NSTextField(labelWithString: "")
     private let windowsStack = NSStackView()
-    private let addWindowButton = NSButton(title: "＋ ウィンドウを追加", target: nil, action: nil)
-    private let editModeCheck = NSButton(checkboxWithTitle: "編集モード(動かした位置を記憶)", target: nil, action: nil)
+    private let editTilesButton = NSButton(title: "", target: nil, action: nil)
+    private let tileWarning = NSTextField(wrappingLabelWithString: "")
+    private var tileEditors: [UUID: TileEditorController] = [:]
+    var isEditingTiles: Bool { tileEditors.values.contains { $0.window?.isVisible == true } }
+    private let addWindowButton = NSButton(title: L10n.text(.addWindow), target: nil, action: nil)
+    private let editModeCheck = NSButton(checkboxWithTitle: L10n.text(.editMode), target: nil, action: nil)
     /// 幅を変えられるように保持する(v3 段階 3。生成時の activate だけだと変更できない)。
     private var widthConstraint: NSLayoutConstraint?
     private var scrollView: NSScrollView?
     private var resizeHandle: SidebarResizeHandle?
     private var expandButton: NSButton?
+    private var collapseButton: NSButton?
+    private var addTabButton: NSButton?
+    private var accessibilityLabelView: NSTextField?
+    private var accessibilityButton: NSButton?
+    private var captureLabelView: NSTextField?
+    private var captureSettingsButton: NSButton?
+    private var isLoadingWindows = false
+
+    func refreshLocalization() {
+        tileEditors.values.forEach { $0.refreshLocalization() }
+        editTilesButton.title = L10n.text(.editTiles)
+        tileWarning.stringValue = L10n.text(.tileFitWarning)
+        expandButton?.toolTip = L10n.text(.expandSidebar)
+        expandButton?.setAccessibilityLabel(L10n.text(.expandSidebar))
+        collapseButton?.toolTip = L10n.text(.collapseSidebar)
+        collapseButton?.setAccessibilityLabel(L10n.text(.collapseSidebar))
+        addTabButton?.toolTip = L10n.text(.addTab)
+        addTabButton?.setAccessibilityLabel(L10n.text(.addTab))
+        accessibilityLabelView?.stringValue = L10n.text(.accessibilityHelp)
+        accessibilityButton?.title = L10n.text(.requestPermission)
+        captureLabelView?.stringValue = L10n.text(.captureHelp)
+        captureSettingsButton?.title = L10n.text(.openCapture)
+        addWindowButton.title = L10n.text(isLoadingWindows ? .loading : .addWindow)
+        editModeCheck.title = L10n.text(.editMode)
+        editModeCheck.toolTip = L10n.text(.editModeHelp)
+        lastRendered = nil
+        render()
+    }
 
     /// 「常に最前面」設定。既定 true。メニューとパネルはこの値を唯一の真実として同期する。
     static let alwaysOnTopSetting = PersistedToggle(key: "SidebarAlwaysOnTop", defaultValue: true)
@@ -64,13 +96,14 @@ final class SidebarPanel: NSPanel {
         contentView = buildContent()
         applyCollapsedAppearance()  // 前回終了時の折りたたみ状態を復元
         reposition()
-        render()
+        refreshLocalization()
         updatePermissionBanner()
     }
 
     override func close() {
         // カーソルはグローバルな push/pop スタックなので、画面切断でパネルを閉じる前に必ず戻す。
         resizeHandle?.cancelInteraction()
+        tileEditors.values.forEach { $0.close() }
         super.close()
     }
 
@@ -209,8 +242,8 @@ final class SidebarPanel: NSPanel {
         expand.bezelStyle = .inline
         expand.isBordered = false
         expand.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        expand.toolTip = "サイドバーを展開"
-        expand.setAccessibilityLabel("サイドバーを展開")
+        expand.toolTip = L10n.text(.expandSidebar)
+        expand.setAccessibilityLabel(L10n.text(.expandSidebar))
         expand.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(expand)
         NSLayoutConstraint.activate([
@@ -226,20 +259,24 @@ final class SidebarPanel: NSPanel {
         title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         let collapse = NSButton(title: "«", target: self, action: #selector(toggleCollapseAction))
         collapse.bezelStyle = .inline
-        collapse.toolTip = "サイドバーを折りたたむ"
-        collapse.setAccessibilityLabel("サイドバーを折りたたむ")
+        collapse.toolTip = L10n.text(.collapseSidebar)
+        collapse.setAccessibilityLabel(L10n.text(.collapseSidebar))
         let addTab = NSButton(title: "＋", target: self, action: #selector(addTab))
         addTab.bezelStyle = .inline
-        addTab.toolTip = "タブを追加"
+        addTab.toolTip = L10n.text(.addTab)
+        collapseButton = collapse
+        addTabButton = addTab
         let header = NSStackView(views: [title, NSView(), collapse, addTab])
         header.orientation = .horizontal
         root.addArrangedSubview(header)
         header.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -20).isActive = true
 
         // 権限バナー
-        let bannerLabel = NSTextField(wrappingLabelWithString: "アクセシビリティ権限が必要です。システム設定で TabDesk を ON にしてください。")
+        let bannerLabel = NSTextField(wrappingLabelWithString: L10n.text(.accessibilityHelp))
         bannerLabel.font = NSFont.systemFont(ofSize: 11)
-        let bannerButton = NSButton(title: "権限をリクエスト", target: self, action: #selector(requestPermission))
+        let bannerButton = NSButton(title: L10n.text(.requestPermission), target: self, action: #selector(requestPermission))
+        accessibilityLabelView = bannerLabel
+        accessibilityButton = bannerButton
         bannerButton.bezelStyle = .rounded
         bannerButton.controlSize = .small
         permissionBanner.orientation = .vertical
@@ -251,9 +288,11 @@ final class SidebarPanel: NSPanel {
 
         // 画面収録権限バナー(タブサムネイル有効時のみ。v3 段階 5)
         let captureLabel = NSTextField(wrappingLabelWithString:
-            "タブサムネイルには画面収録の権限が必要です(付与後は TabDesk の再起動が必要な場合があります)。")
+            L10n.text(.captureHelp))
         captureLabel.font = NSFont.systemFont(ofSize: 11)
-        let captureButton = NSButton(title: "画面収録設定を開く", target: self, action: #selector(openScreenCaptureSettings))
+        let captureButton = NSButton(title: L10n.text(.openCapture), target: self, action: #selector(openScreenCaptureSettings))
+        captureLabelView = captureLabel
+        captureSettingsButton = captureButton
         captureButton.bezelStyle = .rounded
         captureButton.controlSize = .small
         capturePermissionBanner.orientation = .vertical
@@ -275,7 +314,9 @@ final class SidebarPanel: NSPanel {
         // アクティブタブのウィンドウ
         windowsHeader.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
         windowsHeader.textColor = .secondaryLabelColor
+        windowsHeader.lineBreakMode = .byTruncatingTail
         root.addArrangedSubview(windowsHeader)
+        windowsHeader.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -20).isActive = true
         windowsStack.orientation = .vertical
         windowsStack.alignment = .leading
         windowsStack.spacing = 2
@@ -294,6 +335,15 @@ final class SidebarPanel: NSPanel {
         editModeCheck.action = #selector(toggleEditMode)
         editModeCheck.font = NSFont.systemFont(ofSize: 11)
         root.addArrangedSubview(editModeCheck)
+        editTilesButton.target = self
+        editTilesButton.action = #selector(editActiveTiles)
+        editTilesButton.bezelStyle = .rounded
+        editTilesButton.controlSize = .small
+        root.addArrangedSubview(editTilesButton)
+        tileWarning.font = .systemFont(ofSize: 11)
+        tileWarning.textColor = .systemRed
+        root.addArrangedSubview(tileWarning)
+        tileWarning.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -20).isActive = true
 
         return background
     }
@@ -315,6 +365,11 @@ final class SidebarPanel: NSPanel {
 
     func render() {
         let state = manager.engine.state
+        for (id, editor) in tileEditors where state.tab(withID: id) == nil {
+            editor.close()
+            tileEditors.removeValue(forKey: id)
+        }
+        tileEditors.values.forEach { $0.refreshState() }
         // エンジンの state は同じ値でも didSet が発火する。見た目が変わらないなら行を作り直さない
         // (ダブルクリックの 2 回目が作り直し直後の行に届き、レイアウト前で編集欄が出ない事故を防ぐ)。
         // v4: activeTabIDs は state に含まれるので、この差分キーで画面別アクティブの変化も拾える。
@@ -335,12 +390,13 @@ final class SidebarPanel: NSPanel {
             row.onRenameRequested = { [weak self] in self?.promptRename(tab) }
             row.onDelete = { [weak self] in self?.delete(tab.id) }
             row.onMove = { [weak self] offset in self?.moveTab(tab.id, offset: offset) }
+            row.onEditTiles = { [weak self] in self?.editTiles(tab.id) }
             row.onSetLayout = { [weak self] layout in self?.setLayout(tab.id, layout) }
             tabsStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: tabsStack.widthAnchor).isActive = true
         }
         if tabs.isEmpty {
-            let hint = NSTextField(labelWithString: "「＋」でタブを作成")
+            let hint = NSTextField(labelWithString: L10n.text(.emptyTabsHint))
             hint.textColor = .secondaryLabelColor
             hint.font = NSFont.systemFont(ofSize: 11)
             tabsStack.addArrangedSubview(hint)
@@ -348,8 +404,8 @@ final class SidebarPanel: NSPanel {
 
         windowsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         if let activeTabID, let active = state.tab(withID: activeTabID) {
-            windowsHeader.stringValue = "\(active.name) のウィンドウ(\(active.windows.count))"
-                + (active.layout == .columns ? " — 縦に等分割" : "")
+            windowsHeader.stringValue = L10n.text(.windowsHeader, active.name, String(active.windows.count))
+                + (active.layout == .columns ? L10n.text(.columnsSuffix) : active.layout == .tiled ? L10n.text(.tileSuffix) : "")
             // 切断退避(displayID があるのに接続中の画面に無い)を行の表示に反映する。
             let connected = Set(manager.layout.displays.map(\.id))
             for (index, window) in active.windows.enumerated() {
@@ -366,12 +422,15 @@ final class SidebarPanel: NSPanel {
                 windowsStack.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: windowsStack.widthAnchor).isActive = true
             }
-            addWindowButton.isEnabled = true
+            addWindowButton.isEnabled = !isLoadingWindows
         } else {
-            windowsHeader.stringValue = "タブがありません"
+            windowsHeader.stringValue = L10n.text(.noTabs)
             addWindowButton.isEnabled = false
         }
         editModeCheck.state = manager.engine.editMode ? .on : .off
+        let active = activeTabID.flatMap { state.tab(withID: $0) }
+        editTilesButton.isEnabled = active?.layout == .tiled
+        tileWarning.isHidden = activeTabID.map { manager.engine.tilePlacementFailures(in: $0).isEmpty } ?? true
     }
 
     private func updatePermissionBanner() {
@@ -398,6 +457,18 @@ final class SidebarPanel: NSPanel {
         manager.requestPermission()
     }
 
+    @objc private func editActiveTiles() {
+        guard let id = manager.engine.activeTabID(on: displayID) else { return }
+        editTiles(id)
+    }
+
+    private func editTiles(_ tabID: UUID) {
+        guard manager.engine.state.tab(withID: tabID)?.layout == .tiled else { return }
+        let editor = tileEditors[tabID] ?? TileEditorController(manager: manager, tabID: tabID)
+        tileEditors[tabID] = editor
+        editor.present()
+    }
+
     @objc private func addTab() {
         // v4: このパネルの画面にタブを作る(連番も画面ごと)。
         manager.engine.createTab(on: displayID)
@@ -411,14 +482,15 @@ final class SidebarPanel: NSPanel {
     @objc private func showAddWindowMenu(_ sender: NSButton) {
         // 列挙は全アプリへの IPC なのでバックグラウンドで行い、終わってからメニューを出す。
         guard sender.isEnabled else { return }
-        let originalTitle = sender.title
+        isLoadingWindows = true
         sender.isEnabled = false
-        sender.title = "読み込み中…"
+        sender.title = L10n.text(.loading)
         Task { [weak self, weak sender] in
             guard let self else { return }
             let (candidates, unavailable) = await self.manager.availableWindowsAndIssues()
             guard let sender else { return }
-            sender.title = originalTitle
+            self.isLoadingWindows = false
+            sender.title = L10n.text(.addWindow)
             sender.isEnabled = self.manager.engine.activeTabID(on: self.displayID) != nil
             self.presentAddWindowMenu(candidates, unavailableApps: unavailable, anchor: sender)
         }
@@ -427,7 +499,7 @@ final class SidebarPanel: NSPanel {
     private func presentAddWindowMenu(_ candidates: [WindowRecord], unavailableApps: [String], anchor sender: NSView) {
         let menu = NSMenu()
         if candidates.isEmpty {
-            menu.addItem(withTitle: "登録できるウィンドウがありません", action: nil, keyEquivalent: "")
+            menu.addItem(withTitle: L10n.text(.noAvailableWindows), action: nil, keyEquivalent: "")
         }
         for record in candidates {
             let title = SidebarText.windowTitle(appName: record.appName, title: record.title)
@@ -440,7 +512,7 @@ final class SidebarPanel: NSPanel {
             menu.addItem(.separator())
             // AX を拒否するアプリは理由つきでグレー表示する(仕様 §3.3、段階 3)。
             for detail in unavailableApps {
-                let item = NSMenuItem(title: "管理不可: \(String(detail.prefix(60)))", action: nil, keyEquivalent: "")
+                let item = NSMenuItem(title: L10n.text(.unmanageable, String(detail.prefix(60))), action: nil, keyEquivalent: "")
                 item.isEnabled = false
                 menu.addItem(item)
             }
@@ -457,6 +529,7 @@ final class SidebarPanel: NSPanel {
                 try await manager.register(box.record, into: tabID)
             } catch {
                 logger.log("register failed: \(error)")
+                manager.onOperationError?(String(describing: error))
             }
         }
     }
@@ -476,7 +549,7 @@ final class SidebarPanel: NSPanel {
         let sameApp = candidates.filter { $0.bundleID == window.identity.bundleID }
         let others = candidates.filter { $0.bundleID != window.identity.bundleID }
         if candidates.isEmpty {
-            menu.addItem(withTitle: "割り当てできるウィンドウがありません", action: nil, keyEquivalent: "")
+            menu.addItem(withTitle: L10n.text(.noAssignableWindows), action: nil, keyEquivalent: "")
         }
         for (index, record) in (sameApp + others).enumerated() {
             if index == sameApp.count, !sameApp.isEmpty, !others.isEmpty {
@@ -514,10 +587,10 @@ final class SidebarPanel: NSPanel {
         defer { isRenaming = false }
 
         let alert = NSAlert()
-        alert.messageText = "タブ名を変更"
-        alert.informativeText = "「\(tab.name)」の新しい名前を入力してください。"
-        alert.addButton(withTitle: "変更")
-        alert.addButton(withTitle: "キャンセル")
+        alert.messageText = L10n.text(.renameTab)
+        alert.informativeText = L10n.text(.renamePrompt, tab.name)
+        alert.addButton(withTitle: L10n.text(.rename))
+        alert.addButton(withTitle: L10n.text(.cancel))
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
         field.stringValue = tab.name
         alert.accessoryView = field
@@ -568,6 +641,7 @@ final class SidebarPanel: NSPanel {
                 try await manager.setTabLayout(tabID, layout)
             } catch {
                 logger.log("setTabLayout failed: \(error)")
+                manager.onOperationError?(String(describing: error))
             }
         }
     }
@@ -626,7 +700,7 @@ private final class SidebarResizeHandle: NSView {
     // マウスドラッグだけでなく VoiceOver の増減アクションからも同じ確定経路を通す。
     override func isAccessibilityElement() -> Bool { true }
     override func accessibilityRole() -> NSAccessibility.Role? { .slider }
-    override func accessibilityLabel() -> String? { "サイドバーの幅" }
+    override func accessibilityLabel() -> String? { L10n.text(.sidebarWidth) }
     override func accessibilityValue() -> Any? { window?.frame.width }
     override func accessibilityMinValue() -> Any? { SidebarMetrics.minWidth }
     override func accessibilityMaxValue() -> Any? { SidebarMetrics.maxWidth }

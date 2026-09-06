@@ -51,7 +51,7 @@ final class HotkeyCenter {
     func reload() -> [String] {
         guard !isStopped else {
             logger.log("hotkeys: reload ignored after stop")
-            return ["終了処理中のためホットキーを変更できません。"]
+            return [L10n.text(.hotkeysStopping)]
         }
         var config = HotkeyConfig.default
         var issues: [String] = []
@@ -65,7 +65,7 @@ final class HotkeyCenter {
         } catch {
             // 壊れた設定でもアプリは動かす(既定にフォールバック)。ファイルは直せるよう残す。
             logger.log("hotkeys: config unreadable (\(error)); using defaults")
-            issues.append("設定を読み込めないため既定値を使用しています：\(error)")
+            issues.append(L10n.text(.hotkeyLoadFallback, String(describing: error)))
         }
 
         let (bindings, errors) = config.resolve()
@@ -78,7 +78,7 @@ final class HotkeyCenter {
 
     /// 記録するキーをCarbonが先取りしないよう、記録中だけ登録を解除する。
     func suspendForRecording() -> [String] {
-        guard !isStopped else { return ["終了処理中のため記録できません。"] }
+        guard !isStopped else { return [L10n.text(.recordingStopping)] }
         isSuspended = true
         return unregisterHotkeys()
     }
@@ -95,7 +95,7 @@ final class HotkeyCenter {
         // 解除できなかった参照と新しい登録が重ならないよう、再登録を止める。
         guard issues.isEmpty else { return issues }
         if handlerRef == nil {
-            issues.append("ホットキーのイベントハンドラを登録できません。アプリを再起動してください。")
+            issues.append(L10n.text(.handlerFailed))
             return issues
         }
         var id: UInt32 = 1
@@ -106,7 +106,7 @@ final class HotkeyCenter {
                 actionsByID[id] = action
             } else {
                 logger.log("hotkeys: could not register \(hotkey.display) (OSStatus \(status)) — 他アプリが使用中の可能性")
-                issues.append("\(hotkey.display)：登録できません（OSStatus \(status)）。他アプリの割り当てを確認してください。")
+                issues.append(L10n.text(.hotkeyRegisterError, hotkey.display, String(status)))
             }
             id += 1
         }
@@ -140,7 +140,7 @@ final class HotkeyCenter {
             if status != noErr {
                 logger.log("hotkeys: UnregisterEventHotKey failed (OSStatus \(status))")
                 remaining.append(ref)
-                issues.append("ホットキーを一時解除できません（OSStatus \(status)）。")
+                issues.append(L10n.text(.hotkeyUnregisterError, String(status)))
             }
         }
         registeredRefs = remaining

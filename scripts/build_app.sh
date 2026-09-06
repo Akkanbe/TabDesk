@@ -16,7 +16,9 @@ swift build -c "$CONFIG" --product "$PRODUCT"
 BIN="$(swift build -c "$CONFIG" --show-bin-path)/$PRODUCT"
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+# SwiftPM の翻訳リソースも同梱し、開発ディレクトリ外でも言語を切り替えられるようにする。
+cp -R "$(dirname "$BIN")/TabDesk_TabDeskCore.bundle" "$APP/Contents/Resources/"
 cp "$BIN" "$APP/Contents/MacOS/$PRODUCT"
 cp "$PLIST" "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"

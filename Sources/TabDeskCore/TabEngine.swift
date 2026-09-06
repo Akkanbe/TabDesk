@@ -70,6 +70,8 @@ public final class TabEngine {
         }
     }
 
+    private var tileOperationFailures = Set<UUID>()
+
     // MARK: - 公開状態
 
     public private(set) var state: WorkspaceState {
@@ -136,14 +138,23 @@ public final class TabEngine {
         // v4: タブをディスプレイ単位に正規化してから使う(冪等。init 中は didSet が発火しないので
         // 余計な保存・通知は出ない)。テストの固定フィクスチャにも同じ正規化がかかる。
         self.state = initialState.migratedForPerDisplayTabs(primaryID: layout.primaryDisplay?.id)
+        for index in state.tabs.indices where state.tabs[index].layout == .tiled {
+            do { try state.tabs[index].prepareTiles() }
+            catch {
+                // メモリ上で渡された不正データでも窓は失わず、自由配置として保持する。
+                state.tabs[index].layout = .free
+                log("invalid tile configuration; keeping windows in free layout: \(error)")
+            }
+        }
         snapshotContentAreas()
     }
 
     // MARK: - タブ CRUD
 
     @discardableResult
-    public func createTab(name: String, on displayID: DisplayID? = nil) -> Tab {
-        let tab = Tab(name: name, displayID: displayID)
+    public func createTab(name: String, on displayID: DisplayID? = nil, layout: TabLayout = .free) -> Tab {
+        let tab = Tab(name: name, layout: layout, displayID: displayID,
+                      tiles: layout == .tiled ? .tile(UUID()) : nil)
         state.tabs.append(tab)
         // その画面の最初のタブがアクティブになる(v4: first-tab-wins は画面ごと)。
         if let key = resolvedDisplayID(of: tab), activeTabID(on: key) == nil {
@@ -154,12 +165,12 @@ public final class TabEngine {
 
     /// 画面内のタブ数から既定名を付けて作成する。画面をまたぐ同名は許容する。
     @discardableResult
-    public func createTab(on displayID: DisplayID? = nil) -> Tab {
-        let key = displayID ?? layout.primaryDisplay?.id
+    public func createTab(on displayID: DisplayID? = nil, layout: TabLayout = .tiled) -> Tab {
+        let key = displayID ?? self.layout.primaryDisplay?.id
         let count = key.map { displayID in
             state.tabs.filter { resolvedDisplayID(of: $0) == displayID }.count
         } ?? state.tabs.count
-        return createTab(name: "タブ\(count + 1)", on: displayID)
+        return createTab(name: L10n.text(.defaultTabName, String(count + 1)), on: displayID, layout: layout)
     }
 
     // MARK: - ディスプレイ別アクティブ(v4)
@@ -268,7 +279,7 @@ public final class TabEngine {
             }
             let window = state.tabs[location.tabIndex].windows.remove(at: location.windowIndex)
             state.tabs[location.tabIndex].windows.insert(window, at: destination)
-            if state.tabs[location.tabIndex].layout == .columns {
+            if state.tabs[location.tabIndex].layout != .free {
                 await retileUnlocked(state.tabs[location.tabIndex].id)
             }
         }
@@ -281,12 +292,57 @@ public final class TabEngine {
             try rejectIfShuttingDown()
             let index = try tabIndex(tabID)
             guard state.tabs[index].layout != newLayout else { return }
-            state.tabs[index].layout = newLayout
+            if newLayout == .tiled {
+                guard state.tabs[index].windows.count <= 64 else { throw TileEditError.invalidPartition }
+                var updated = state.tabs[index]
+                try updated.prepareTiles()
+                updated.layout = newLayout
+                state.tabs[index] = updated
+            } else {
+                state.tabs[index].layout = newLayout
+            }
             log("layout: \(state.tabs[index].name) → \(newLayout.rawValue)")
-            if newLayout == .columns {
+            if newLayout != .free {
                 await retileUnlocked(tabID)
             }
         }
+    }
+
+    /// エディタの確定だけで実窓へ適用する。IPC 前に全割り当てを検証し、部分保存を防ぐ。
+    public func updateTiles(
+        _ tabID: UUID, partition: TilePartition, assignments: [UUID: UUID], expected: TilePartition?
+    ) async throws {
+        try await serialized {
+            try rejectIfShuttingDown()
+            let index = try tabIndex(tabID)
+            let tab = state.tabs[index]
+            try partition.validate()
+            guard tab.layout == .tiled, tab.tiles == expected,
+                  Set(assignments.keys) == Set(tab.windows.map(\.id)),
+                  Set(assignments.values).count == assignments.count,
+                  Set(assignments.values).isSubset(of: Set(partition.tileIDs))
+            else { throw TileEditError.invalidPartition }
+            if let area = display(forTab: tab)?.contentArea {
+                guard partition.geometry(in: area).tiles.values.allSatisfy({ $0.width >= 40 && $0.height >= 40 })
+                else { throw TileEditError.tooSmall }
+            }
+            var updated = tab
+            updated.tiles = partition
+            for i in updated.windows.indices { updated.windows[i].tileID = assignments[updated.windows[i].id] }
+            state.tabs[index] = updated
+            await retileUnlocked(tabID)
+        }
+    }
+
+    /// 相手アプリの最小サイズ等でタイルに到達しない窓を UI に知らせる。
+    /// 到達 frame は従来どおり保持し、同じ不可能な寸法をポーリングのたびに送り続けない。
+    public func tilePlacementFailures(in tabID: UUID) -> [UUID] {
+        guard let tab = state.tab(withID: tabID), tab.layout == .tiled else { return [] }
+        let desired = desiredFrames(for: tab)
+        return tab.windows.filter { window in
+            guard window.isBound, !opsSuppressed(for: window), let target = desired[window.id] else { return false }
+            return tileOperationFailures.contains(window.id) || !approximatelyEqual(window.frame, target)
+        }.map(\.id)
     }
 
     /// タブを削除する。退避中だったウィンドウは固定 frame に戻してから解放する(画面隅に取り残さない)。
@@ -332,8 +388,9 @@ public final class TabEngine {
         windowID: CGWindowID,
         pid: pid_t,
         identity: WindowIdentity,
-        frame: CGRect,
-        into tabID: UUID
+        frame initialFrame: CGRect,
+        into tabID: UUID,
+        tileID: UUID? = nil
     ) async throws -> ManagedWindow {
         try await serialized {
             try rejectIfShuttingDown()
@@ -349,9 +406,22 @@ public final class TabEngine {
             // v4: 配置先は**タブの画面**(タブが正)。別画面にある窓はタブの画面へ引き込まれる
             // (「このタブはこの画面を管理する」)。窓の displayID はタブの生値を継承 = 不変量。
             let display = display(forTab: targetTab)
-            let frame = clamped(frame, in: display?.contentArea ?? layout.contentArea)
+            let assignedTile: UUID?
+            let frame: CGRect
+            if targetTab.layout == .tiled {
+                let occupied = Set(targetTab.windows.compactMap(\.tileID))
+                let available = targetTab.tiles?.tileIDs.filter { !occupied.contains($0) } ?? []
+                guard let selected = tileID ?? available.first, available.contains(selected),
+                      let tileFrame = targetTab.tiles?.geometry(in: display?.contentArea ?? layout.contentArea).tiles[selected]
+                else { throw TileEditError.noEmptyTile }
+                assignedTile = selected
+                frame = tileFrame
+            } else {
+                assignedTile = nil
+                frame = clamped(initialFrame, in: display?.contentArea ?? layout.contentArea)
+            }
             var managed = ManagedWindow(
-                frame: frame, identity: identity, windowID: windowID, pid: pid, displayID: targetTab.displayID)
+                frame: frame, identity: identity, windowID: windowID, pid: pid, displayID: targetTab.displayID, tileID: assignedTile)
             let intoActive = isActiveTab(targetTab)
 
             let outcome = try await place(
@@ -384,7 +454,7 @@ public final class TabEngine {
             } else if case .parked = outcome, !disconnectedAfterPlacement {
                 parkedWindowIDs.insert(managed.id)
             }
-            if state.tabs[index].layout == .columns {
+            if state.tabs[index].layout != .free {
                 await retileUnlocked(tabID)
             }
             // columns では直前の retile で frame が変わるため、登録前のローカル snapshot を返さない。
@@ -520,7 +590,7 @@ public final class TabEngine {
                 placementDescription = intoActive ? "\(committedFrame)" : "parked"
             }
             log("bind: \(previousIdentity.appName) / \(title ?? previousIdentity.title) → \(placementDescription)")
-            if state.tabs[location.tabIndex].layout == .columns {
+            if state.tabs[location.tabIndex].layout != .free {
                 await retileUnlocked(state.tabs[location.tabIndex].id)
             }
         }
@@ -539,7 +609,7 @@ public final class TabEngine {
                 count += 1
                 // unbound は列数に入らないので、columns では bound 数の減少も構造イベント
                 // (removeFromState と同じく同期経路なので予約だけ立て、reconcile が消化する)。
-                if state.tabs[ti].layout == .columns {
+                if state.tabs[ti].layout != .free {
                     pendingRetileTabIDs.insert(state.tabs[ti].id)
                 }
             }
@@ -602,7 +672,7 @@ public final class TabEngine {
         clearRuntimeTracking(for: id)
         // 実窓との紐付けだけ外す(以後の操作対象から外れる)。pid は生存判定に使うので残す。
         setBinding(id, windowID: nil, pid: pid)
-        if found.tab.layout == .columns {
+        if found.tab.layout != .free {
             // 猶予中もこの窓は操作対象外なので、残った bound 窓だけで列を組み直す。
             pendingRetileTabIDs.insert(found.tab.id)
         }
@@ -981,7 +1051,10 @@ public final class TabEngine {
             if probed.fullscreen == nil, fullscreenWindowIDs.contains(id) { return }
             let recorded = found.window.frame
             // 自分の reapply 等で既に記録値へ到達した通知は、編集モードでも所属変更として扱わない。
-            if approximatelyEqual(current, recorded) { return }
+            if approximatelyEqual(current, recorded) {
+                if tileOperationFailures.remove(id) != nil { onStateChanged?(state) }
+                return
+            }
             // 切断退避中は復元も記録もしない(段階 D3、windowFrameDidChange と同じ理由。
             // 予約後に切断された場合もここで止まる)。
             guard !isDisplayDisconnected(found.window) else { return }
@@ -1087,17 +1160,28 @@ public final class TabEngine {
         if let activeID = activeTabID(on: display.id), let tab = state.tab(withID: activeID) {
             destTab = tab
         } else {
-            destTab = createTab(on: display.id)  // first-tab-wins で active 化
+            // 自由配置の窓をドラッグして作る移籍先は、掴んだ窓の自由配置を引き継ぐ。
+            destTab = createTab(on: display.id, layout: .free)
         }
         guard let source = windowLocation(of: id) else { return }
         let sourceTab = state.tabs[source.tabIndex]
         guard sourceTab.id != destTab.id, let destIndex = state.tabs.firstIndex(where: { $0.id == destTab.id })
         else { return }
+        let destinationTile: UUID?
+        if destTab.layout == .tiled {
+            let occupied = Set(destTab.windows.compactMap(\.tileID))
+            guard let empty = destTab.tiles?.tileIDs.first(where: { !occupied.contains($0) }) else {
+                log("edit: destination has no empty tile; keeping source assignment")
+                return
+            }
+            destinationTile = empty
+        } else { destinationTile = nil }
         var next = state
         var window = next.tabs[source.tabIndex].windows.remove(at: source.windowIndex)
         if next.tabs[source.tabIndex].lastFocusedWindowID == id {
             next.tabs[source.tabIndex].lastFocusedWindowID = nil
         }
+        window.tileID = destinationTile
         window.displayID = destTab.displayID  // 不変量: タブの生値を継承
         window.frame = frame
         next.tabs[destIndex].windows.append(window)
@@ -1105,10 +1189,10 @@ public final class TabEngine {
         state = next
         log("edit: moved \(appName) to display \(display.id) → tab \(destTab.name)")
         // columns は両側で組み直す(直列区間内なので直接呼べる)。
-        if sourceTab.layout == .columns {
+        if sourceTab.layout != .free {
             await retileUnlocked(sourceTab.id)
         }
-        if state.tabs[destIndex].layout == .columns {
+        if state.tabs[destIndex].layout != .free {
             await retileUnlocked(destTab.id)
         }
     }
@@ -1537,6 +1621,15 @@ public final class TabEngine {
                 }
             }
         }
+        let affected = Set(results.compactMap { result -> UUID? in
+            guard let found = state.managedWindow(id: result.op.managedID),
+                  found.window.windowID == result.op.windowID, found.tab.layout == .tiled else { return nil }
+            return found.window.id
+        })
+        let previousFailures = tileOperationFailures
+        tileOperationFailures.subtract(affected)
+        tileOperationFailures.formUnion(failures.map(\.managedID).filter { affected.contains($0) })
+        if tileOperationFailures != previousFailures { onStateChanged?(state) }
         return failures
     }
 
@@ -1769,7 +1862,7 @@ public final class TabEngine {
 
     /// アクティブ化・再適用時の「あるべき frame」。free は clamped(記録 frame)、columns は等幅カラム。
     /// columns はディスプレイごとにグループ化して、それぞれのコンテンツ領域内で等分する(段階 D)。
-    /// columns では未復元(unbound)の窓は列数に入らず、エントリも返らない(呼び手が記録 frame に fallback)。
+    /// columns は未復元窓を列数に含めない。tiled は未復元窓のタイルも予約したまま保持する。
     private func desiredFrames(for tab: Tab) -> [UUID: CGRect] {
         // 切断退避中の窓は対象外(frame 凍結、columns では列数にも入れない)。エントリを返さないだけでなく、
         // 呼び手側も fallback の clamp を踏まないよう isDisplayDisconnected でスキップすること。
@@ -1780,6 +1873,12 @@ public final class TabEngine {
             return Dictionary(
                 windows.map { ($0.id, clamped($0.frame, for: $0)) },
                 uniquingKeysWith: { first, _ in first })
+        case .tiled:
+            guard let area = display(forTab: tab)?.contentArea, let partition = tab.tiles else { return [:] }
+            let tiles = partition.geometry(in: area).tiles
+            return Dictionary(windows.compactMap { window in
+                window.tileID.flatMap { tiles[$0] }.map { (window.id, $0) }
+            }, uniquingKeysWith: { first, _ in first })
         case .columns:
             var frames: [UUID: CGRect] = [:]
             // Dictionary(grouping:) はグループ内の順序を保つので、列順 = 一覧順が画面ごとに維持される。
@@ -1792,13 +1891,13 @@ public final class TabEngine {
         }
     }
 
-    /// columns タブの列を計算し直して記録し、アクティブタブなら実窓にも適用する。冪等。
+    /// タイル配置を計算し直し、アクティブタブなら実窓にも適用する。tiled の区画と割り当ては保持する。
     /// 登録・解除・bind・レイアウト変更などの構造イベントからだけ呼ぶ(定常の reconcile からは呼ばない。
     /// 呼ぶと最小サイズ制約のあるアプリで発振する — pendingRetileTabIDs のコメント参照)。
     private func retileUnlocked(_ tabID: UUID) async {
         pendingRetileTabIDs.remove(tabID)  // 直接消化した予約は reconcile に残さない
         guard let index = state.tabs.firstIndex(where: { $0.id == tabID }),
-            state.tabs[index].layout == .columns
+            state.tabs[index].layout != .free
         else { return }
         let tab = state.tabs[index]
         let desired = desiredFrames(for: tab)
@@ -1834,7 +1933,7 @@ public final class TabEngine {
             state.tabs[index].windows.removeAll { $0.id == id }
             // 同期経路(destroyed / vanish)からは retile の IPC を挟めないので予約だけ立てる。
             // unregister のような直列区間内の呼び手は、この直後に直接 retileUnlocked して予約を消化する。
-            if state.tabs[index].windows.count != before, state.tabs[index].layout == .columns {
+            if state.tabs[index].windows.count != before, state.tabs[index].layout != .free {
                 pendingRetileTabIDs.insert(state.tabs[index].id)
             }
             if state.tabs[index].lastFocusedWindowID == id {
@@ -1846,6 +1945,7 @@ public final class TabEngine {
     /// 実ウィンドウとの binding にだけ属する状態をまとめて破棄する。
     /// cancel で飛行中 Task の世代を無効化してからキー自体も剪定する。
     private func clearRuntimeTracking(for id: UUID) {
+        tileOperationFailures.remove(id)
         cancelPendingRestore(id)
         restoreGeneration.removeValue(forKey: id)  // キー欠損なら飛行中 Task の isLatest は false
         parkedWindowIDs.remove(id)

@@ -22,9 +22,9 @@ final class HotkeyRecorderButton: NSButton {
 
     @objc private func record() { onRecord?() }
 
-    private func refreshTitle() {
-        title = isRecording ? "キーを押してください…" :
-            (specification.isEmpty ? "クリックして設定" : (try? HotkeyParser.parse(specification).symbolDisplay) ?? specification)
+    func refreshTitle() {
+        title = isRecording ? L10n.text(.pressShortcut) :
+            (specification.isEmpty ? L10n.text(.clickToRecord) : (try? HotkeyParser.parse(specification).symbolDisplay) ?? specification)
         setAccessibilityValue(title)
     }
 }

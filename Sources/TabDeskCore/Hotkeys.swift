@@ -200,7 +200,7 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
             do {
                 let hotkey = try HotkeyParser.parse(spec)
                 guard !seen.contains(hotkey) else {
-                    errors.append("\(label): '\(spec)' は他の割り当てと重複しています")
+                    errors.append(L10n.text(.duplicateHotkey, label, spec))
                     return
                 }
                 seen.insert(hotkey)

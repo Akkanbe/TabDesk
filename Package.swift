@@ -3,6 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "TabDesk",
+    defaultLocalization: "ja",
     platforms: [.macOS(.v15)],
     targets: [
         // 私有関数 _AXUIElementGetWindow を dlsym で解決する最小限の C ターゲット。
@@ -15,7 +16,8 @@ let package = Package(
         .target(
             name: "TabDeskCore",
             dependencies: ["AXShim"],
-            path: "Sources/TabDeskCore"
+            path: "Sources/TabDeskCore",
+            resources: [.process("Resources")]
         ),
         // 本体アプリ(サイドバー UI + AX 配線)。
         .executableTarget(

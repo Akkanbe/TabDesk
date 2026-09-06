@@ -26,24 +26,26 @@ public struct ManagedWindow: Codable, Sendable, Hashable, Identifiable {
     /// 所属ディスプレイ(v2 段階 D)。nil = 主ディスプレイ(v1 データもここに落ちる)。
     /// optional なので合成デコーダが decodeIfPresent になり、キーの無い v1 ファイルもそのまま読める。
     public var displayID: DisplayID?
+    public var tileID: UUID?
     /// 実行時にだけ意味を持つ実ウィンドウへの紐付け。永続化しない(nil = 未復元)。
     public var windowID: CGWindowID?
     public var pid: pid_t?
 
     // windowID / pid は CodingKeys から外すことで JSON に出さない。
     enum CodingKeys: String, CodingKey {
-        case id, frame, identity, displayID
+        case id, frame, identity, displayID, tileID
     }
 
     public init(
         id: UUID = UUID(), frame: CGRect, identity: WindowIdentity,
-        windowID: CGWindowID?, pid: pid_t?, displayID: DisplayID? = nil
+        windowID: CGWindowID?, pid: pid_t?, displayID: DisplayID? = nil, tileID: UUID? = nil
     ) {
         self.id = id
         self.frame = frame
         self.identity = identity
         self.windowID = windowID
         self.pid = pid
+        self.tileID = tileID
         self.displayID = displayID
     }
 
@@ -60,6 +62,7 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
     public var lastFocusedWindowID: UUID?
     /// 配置方式(v2 段階 C)。
     public var layout: TabLayout
+    public var tiles: TilePartition?
     /// 所属ディスプレイ(v4)。nil =「そのときの主ディスプレイ」(v1〜v3 データと空タブ。
     /// 主画面の役割が移っても凍結しないための意味論)。具体 ID は物理画面に固定される。
     /// 不変量(v4 段階 3 以降): タブ内の全窓の displayID はタブの displayID と一致する。
@@ -67,18 +70,49 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
 
     public init(
         id: UUID = UUID(), name: String, windows: [ManagedWindow] = [],
-        lastFocusedWindowID: UUID? = nil, layout: TabLayout = .free, displayID: DisplayID? = nil
+        lastFocusedWindowID: UUID? = nil, layout: TabLayout = .free, displayID: DisplayID? = nil, tiles: TilePartition? = nil
     ) {
         self.id = id
         self.name = name
         self.windows = windows
         self.lastFocusedWindowID = lastFocusedWindowID
         self.layout = layout
+        self.tiles = tiles
         self.displayID = displayID
     }
 
+    public mutating func prepareTiles() throws {
+        guard windows.count <= 64 else { throw TileEditError.invalidPartition }
+        if tiles == nil {
+            let ids = windows.map { _ in UUID() }
+            tiles = TilePartition.columns(ids)
+            for (index, id) in ids.enumerated() { windows[index].tileID = id }
+        }
+        guard var partition = tiles else { throw TileEditError.invalidPartition }
+        try partition.validate()
+        var occupied = Set<UUID>()
+        for index in windows.indices {
+            if let id = windows[index].tileID, partition.tileIDs.contains(id), occupied.insert(id).inserted { continue }
+            var empty = partition.tileIDs.first { !occupied.contains($0) }
+            if empty == nil {
+                // モードを離れている間に増えた窓だけを追加する。既存の空タイル・割り当ては残す。
+                let frames = partition.geometry(in: CGRect(x: 0, y: 0, width: 10000, height: 10000)).tiles
+                guard let largest = partition.tileIDs.max(by: {
+                    let a = frames[$0] ?? .zero, b = frames[$1] ?? .zero
+                    return a.width * a.height < b.width * b.height
+                }) else { throw TileEditError.invalidPartition }
+                partition = try partition.splitting(largest, axis: .horizontal)
+                empty = partition.tileIDs.first { !occupied.contains($0) }
+            }
+            guard let empty else { throw TileEditError.invalidPartition }
+            windows[index].tileID = empty
+            occupied.insert(empty)
+        }
+        tiles = partition
+    }
+
     enum CodingKeys: String, CodingKey {
-        case id, name, windows, lastFocusedWindowID, layout, displayID
+        case id, name, windows, lastFocusedWindowID, layout, displayID, tiles
     }
 
     /// サムネイル撮影と切替時の前面化に使う実ウィンドウ。
@@ -101,7 +135,10 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
         windows = try c.decode([ManagedWindow].self, forKey: .windows)
         lastFocusedWindowID = try c.decodeIfPresent(UUID.self, forKey: .lastFocusedWindowID)
         layout = (try? c.decode(TabLayout.self, forKey: .layout)) ?? .free
+        tiles = try c.decodeIfPresent(TilePartition.self, forKey: .tiles)
+        try tiles?.validate()
         displayID = try c.decodeIfPresent(DisplayID.self, forKey: .displayID)  // キー無し(v3 以前)= nil = 主
+        if layout == .tiled { try prepareTiles() }
     }
 }
 

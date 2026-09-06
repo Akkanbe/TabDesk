@@ -149,6 +149,22 @@ open -g 'tabdesk://dump'                  # 座標の突き合わせ(診断)
 open -g 'tabdesk://quit'
 ```
 
+## タイルモード
+
+新しいタブはタイルモードで作成されます。タブを右クリックすると自由配置へ切り替えられます。既存のタブの配置は維持します。
+
+1. 「タイルを編集…」を開き、タイルを左右・上下に分割します。境界をドラッグして比率を調整し、「適用」を押します。
+2. 空タイルを選び、「このタイルにウィンドウを追加…」で窓を登録します。登録済みの窓はプルダウンで割り当てを変更できます。
+3. サイドバーを広げたり折りたたむと、全タイルが利用可能な領域に追従します。窓の登録を解除しても空タイルは残ります。
+
+同じ分割から生まれた隣接タイルは、少なくとも片方が空なら結合できます。他アプリの最小サイズなどでタイルへ配置できない場合は警告を表示します。[操作・保存形式・制約](docs/12_tile_mode.md)も参照してください。
+
+## 表示言語 / Display Language
+
+メニューバーの「表示言語 / Language」で「日本語」「English」を選べます。変更はすぐに反映され、次回起動時にも保持されます。既存のタブ名と、編集中のホットキー設定はそのままです。
+
+Choose **表示言語 / Language → English** from the TabDesk menu. The change takes effect immediately and is remembered across launches. Existing tab names and unsaved shortcut edits are preserved.
+
 ## v0 技術検証 PoC(TabDeskPoC)
 
 `TabDeskPoC` は仕様書 §5 の v0 チェックリストを実機で確認した検証アプリ(結果は docs/02_poc_results.md)。

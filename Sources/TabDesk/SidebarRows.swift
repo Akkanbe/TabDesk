@@ -15,6 +15,7 @@ final class TabRowView: NSView {
     var onDelete: (() -> Void)?
     /// 並べ替え(-1 = 上へ、+1 = 下へ)。
     var onMove: ((Int) -> Void)?
+    var onEditTiles: (() -> Void)?
     var onSetLayout: ((TabLayout) -> Void)?
 
     private let tab: Tab
@@ -90,23 +91,32 @@ final class TabRowView: NSView {
         let menu = NSMenu()
         // 端のタブでは移動項目を無効化する(自動 enable は端の判定を知らないので手動制御)。
         menu.autoenablesItems = false
-        let up = menu.addItem(withTitle: "上へ移動", action: #selector(moveUpAction), keyEquivalent: "")
+        let up = menu.addItem(withTitle: L10n.text(.moveUp), action: #selector(moveUpAction), keyEquivalent: "")
         up.target = self
         up.isEnabled = canMoveUp
-        let down = menu.addItem(withTitle: "下へ移動", action: #selector(moveDownAction), keyEquivalent: "")
+        let down = menu.addItem(withTitle: L10n.text(.moveDown), action: #selector(moveDownAction), keyEquivalent: "")
         down.target = self
         down.isEnabled = canMoveDown
         menu.addItem(.separator())
         // レイアウト切替。現在値にチェックを付ける(仕様 §3.1: タブごとに自由配置/タイルを選択)。
-        let free = menu.addItem(withTitle: "レイアウト: 自由配置", action: #selector(layoutFreeAction), keyEquivalent: "")
+        let free = menu.addItem(withTitle: L10n.text(.layoutFree), action: #selector(layoutFreeAction), keyEquivalent: "")
         free.target = self
         free.state = tab.layout == .free ? .on : .off
-        let columns = menu.addItem(withTitle: "レイアウト: 縦に等分割", action: #selector(layoutColumnsAction), keyEquivalent: "")
+        let tiled = menu.addItem(withTitle: L10n.text(.layoutTiled), action: #selector(layoutTiledAction), keyEquivalent: "")
+        tiled.target = self
+        tiled.state = tab.layout == .tiled ? .on : .off
+        let edit = menu.addItem(withTitle: L10n.text(.editTiles), action: #selector(editTilesAction), keyEquivalent: "")
+        edit.target = self
+        edit.isEnabled = tab.layout == .tiled
+        // 保存済みの旧カラム配置は選択状態を示す。新規の選択肢はタイル／自由配置にする。
+        if tab.layout == .columns {
+        let columns = menu.addItem(withTitle: L10n.text(.layoutColumns), action: #selector(layoutColumnsAction), keyEquivalent: "")
         columns.target = self
-        columns.state = tab.layout == .columns ? .on : .off
+        columns.state = .on
+        }
         menu.addItem(.separator())
-        menu.addItem(withTitle: "名前を変更", action: #selector(renameAction), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "タブを削除", action: #selector(deleteAction), keyEquivalent: "").target = self
+        menu.addItem(withTitle: L10n.text(.renameAction), action: #selector(renameAction), keyEquivalent: "").target = self
+        menu.addItem(withTitle: L10n.text(.deleteTab), action: #selector(deleteAction), keyEquivalent: "").target = self
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
@@ -114,6 +124,8 @@ final class TabRowView: NSView {
     @objc private func deleteAction() { onDelete?() }
     @objc private func moveUpAction() { onMove?(-1) }
     @objc private func moveDownAction() { onMove?(1) }
+    @objc private func layoutTiledAction() { onSetLayout?(.tiled) }
+    @objc private func editTilesAction() { onEditTiles?() }
     @objc private func layoutFreeAction() { onSetLayout?(.free) }
     @objc private func layoutColumnsAction() { onSetLayout?(.columns) }
 }
@@ -139,7 +151,7 @@ final class WindowRowView: NSView {
         super.init(frame: .zero)
         let title = SidebarText.windowTitle(appName: window.identity.appName, title: window.identity.title)
         // 切断退避(v3 段階 D3): 記録位置を凍結して管理を止めていることをユーザーに伝える。
-        let suffix = !isBound ? "(未復元)" : (isDisplayDisconnected ? "(別ディスプレイ待機)" : "")
+        let suffix = !isBound ? L10n.text(.unrestored) : (isDisplayDisconnected ? L10n.text(.disconnected) : "")
         let label = NSTextField(labelWithString: title + suffix)
         label.font = NSFont.systemFont(ofSize: 11)
         label.lineBreakMode = .byTruncatingTail
@@ -147,14 +159,14 @@ final class WindowRowView: NSView {
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.textColor = (isBound && !isDisplayDisconnected) ? .labelColor : .secondaryLabelColor
         label.toolTip = !isBound
-            ? "\(title)\nクリックして、いま開いているウィンドウを割り当てます"
+            ? L10n.text(.assignWindowHelp, title)
             : (isDisplayDisconnected
-                ? "\(title)\nディスプレイ切断中のため、再接続まで位置を管理しません(位置を変えたい場合は解除して登録し直してください)"
+                ? L10n.text(.disconnectedHelp, title)
                 : title)
         let remove = NSButton(title: "×", target: self, action: #selector(removeAction))
         remove.bezelStyle = .inline
         remove.isBordered = false
-        remove.toolTip = "登録を解除"
+        remove.toolTip = L10n.text(.removeWindow)
         let stack = NSStackView(views: [label, NSView(), remove])
         stack.orientation = .horizontal
         stack.edgeInsets = NSEdgeInsets(top: 2, left: 8, bottom: 2, right: 4)
@@ -180,10 +192,10 @@ final class WindowRowView: NSView {
     override func rightMouseDown(with event: NSEvent) {
         let menu = NSMenu()
         menu.autoenablesItems = false  // 端の行では移動項目を無効化する(TabRowView と同じ手動制御)
-        let up = menu.addItem(withTitle: "上へ移動", action: #selector(moveUpAction), keyEquivalent: "")
+        let up = menu.addItem(withTitle: L10n.text(.moveUp), action: #selector(moveUpAction), keyEquivalent: "")
         up.target = self
         up.isEnabled = canMoveUp
-        let down = menu.addItem(withTitle: "下へ移動", action: #selector(moveDownAction), keyEquivalent: "")
+        let down = menu.addItem(withTitle: L10n.text(.moveDown), action: #selector(moveDownAction), keyEquivalent: "")
         down.target = self
         down.isEnabled = canMoveDown
         NSMenu.popUpContextMenu(menu, with: event, for: self)

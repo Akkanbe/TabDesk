@@ -13,8 +13,39 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
     private var extraTabBindings: [String] = []
     private(set) var fields: [HotkeyRecorderButton] = []
     private(set) var messageView = NSTextView()
-    private let saveButton = NSButton(title: "保存して適用", target: nil, action: nil)
-    private let resetButton = NSButton(title: "既定値を入力", target: nil, action: nil)
+    private var helpLabel: NSTextField?
+    private var actionLabels: [NSTextField] = []
+    private var clearButtons: [NSButton] = []
+    private var closeButton: NSButton?
+    private var currentMessage: (() -> String)?
+    private var messageIsError = false
+
+    private var localizedActionNames: [String] {
+        (1...9).map { L10n.text(.activateTab, String($0)) } + [
+            L10n.text(.nextTab), L10n.text(.previousTab), L10n.text(.registerFocused),
+            L10n.text(.toggleEdit), L10n.text(.toggleSidebar),
+        ]
+    }
+
+    /// コントロールは再生成せず、未保存の入力と記録状態を保持する。
+    func refreshLocalization() {
+        window?.title = L10n.text(.hotkeySettings)
+        helpLabel?.stringValue = L10n.text(.hotkeyHelp)
+        saveButton.title = L10n.text(.saveHotkeys)
+        resetButton.title = L10n.text(.defaultHotkeys)
+        closeButton?.title = L10n.text(.close)
+        for (index, name) in localizedActionNames.enumerated() {
+            actionLabels[index].stringValue = name
+            fields[index].setAccessibilityLabel(name)
+            fields[index].refreshTitle()
+            clearButtons[index].setAccessibilityLabel(L10n.text(.clearShortcutLabel, name))
+            clearButtons[index].toolTip = L10n.text(.clearShortcut)
+        }
+        renderMessage()
+    }
+
+    private let saveButton = NSButton(title: L10n.text(.saveHotkeys), target: nil, action: nil)
+    private let resetButton = NSButton(title: L10n.text(.defaultHotkeys), target: nil, action: nil)
 
     init(
         configURL: URL,
@@ -29,7 +60,7 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 640, height: 710),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "ホットキー設定"
+        window.title = L10n.text(.hotkeySettings)
         window.isReleasedWhenClosed = false
         super.init(window: window)
         window.delegate = self
@@ -52,11 +83,11 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
             fill(try HotkeyConfig.load(from: configURL) ?? .default)
             saveButton.isEnabled = true
             resetButton.isEnabled = true
-            showMessage("設定欄をクリックしてキーを押してください。×で解除できます。変更後は「保存して適用」を押してください。")
+            showMessage(L10n.text(.hotkeyInstructions))
         } catch {
             saveButton.isEnabled = false
             resetButton.isEnabled = false
-            showMessage("設定を読み込めませんでした。元のファイルは上書きしません。メニューの「ホットキー設定ファイルをFinderで表示」で場所を確認し、エディタで修正してから、この画面を開き直してください。\n\(error)", error: true)
+            showMessage(L10n.text(.hotkeyLoadError, String(describing: error)), error: true)
         }
     }
 
@@ -83,27 +114,26 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
             activateTab: Array(values.prefix(9)) + extraTabBindings,
             nextTab: optional(9), previousTab: optional(10), registerFocusedWindow: optional(11),
             toggleEditMode: optional(12), toggleSidebar: optional(13))
-        let errors = config.resolve().errors
-        guard errors.isEmpty else {
-            showMessage("保存していません。入力を確認してください。\n" + errors.joined(separator: "\n"), error: true)
+        guard config.resolve().errors.isEmpty else {
+            showMessage(L10n.text(.hotkeyNotSaved) + config.resolve().errors.joined(separator: "\n"), error: true)
             return
         }
         do {
             try config.save(to: configURL)
         } catch {
-            showMessage("保存できませんでした。現在の割り当ては変更していません。\n\(error)", error: true)
+            showMessage(L10n.text(.hotkeySaveError, String(describing: error)), error: true)
             return
         }
         let issues = apply()
-        showMessage(issues.isEmpty ? "保存し、すべての割り当てを適用しました。" :
-            "設定は保存しましたが、一部を適用できませんでした。\n" + issues.joined(separator: "\n"),
+        showMessage(issues.isEmpty ? L10n.text(.hotkeySaved) :
+            L10n.text(.hotkeyPartial) + issues.joined(separator: "\n"),
             error: !issues.isEmpty)
     }
 
     @objc private func reset() {
         let issues = finishRecording()
         fill(.default)
-        showRecordingResult("既定値を入力しました。まだ保存していません。", issues: issues)
+        showRecordingResult(L10n.text(.defaultsFilled), issues: issues)
     }
 
     @objc private func dismiss() { close() }
@@ -112,17 +142,17 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         guard saveButton.isEnabled, fields.indices.contains(index) else { return }
         let previousIssues = finishRecording()
         guard previousIssues.isEmpty else {
-            showRecordingResult("記録を開始できませんでした。", issues: previousIssues)
+            showRecordingResult(L10n.text(.recordingFailed), issues: previousIssues)
             return
         }
         let issues = suspendHotkeys()
         guard issues.isEmpty else {
-            showRecordingResult("記録を開始できませんでした。", issues: issues + resumeHotkeys())
+            showRecordingResult(L10n.text(.recordingFailed), issues: issues + resumeHotkeys())
             return
         }
         recordingIndex = index
         fields[index].isRecording = true
-        showMessage("キーの組み合わせを押してください。Escでキャンセル、Deleteで解除します。")
+        showMessage(L10n.text(.recordingInstructions))
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // NSEvent 自体を actor 境界の戻り値にせず、消費するかだけを返す。
             let consumed = MainActor.assumeIsolated {
@@ -132,7 +162,7 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
             return consumed ? nil : event
         }
         if eventMonitor == nil {
-            showRecordingResult("キー入力の監視を開始できませんでした。", issues: finishRecording())
+            showRecordingResult(L10n.text(.monitorFailed), issues: finishRecording())
         }
     }
 
@@ -143,16 +173,16 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         if flags.isEmpty {
             switch event.keyCode {
             case UInt16(kVK_Escape):
-                showRecordingResult("記録をキャンセルしました。", issues: finishRecording())
+                showRecordingResult(L10n.text(.recordingCancelled), issues: finishRecording())
                 return nil
             case UInt16(kVK_Delete), UInt16(kVK_ForwardDelete):
                 clearBinding(at: index)
                 return nil
             case UInt16(kVK_Tab):
-                showRecordingResult("記録をキャンセルしました。", issues: finishRecording())
+                showRecordingResult(L10n.text(.recordingCancelled), issues: finishRecording())
                 return event
             default:
-                showMessage("⌃ Control・⌥ Option・⇧ Shift・⌘ Commandのいずれかを一緒に押してください。", error: true)
+                showMessage(L10n.text(.modifierRequired), error: true)
                 return nil
             }
         }
@@ -162,11 +192,11 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         if flags.contains(.shift) { modifiers |= UInt32(shiftKey) }
         if flags.contains(.command) { modifiers |= UInt32(cmdKey) }
         guard let specification = HotkeyParser.specification(keyCode: UInt32(event.keyCode), modifiers: modifiers) else {
-            showMessage("このキーには対応していません。別のキーを押すか、Escでキャンセルしてください。", error: true)
+            showMessage(L10n.text(.unsupportedKey), error: true)
             return nil
         }
         fields[index].specification = specification
-        showRecordingResult("キーを記録しました。「保存して適用」で反映します。", issues: finishRecording())
+        showRecordingResult(L10n.text(.recorded), issues: finishRecording())
         return nil
     }
 
@@ -184,56 +214,63 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         guard saveButton.isEnabled, fields.indices.contains(index) else { return }
         let issues = finishRecording()
         fields[index].specification = ""
-        showRecordingResult("割り当てを解除しました。「保存して適用」で反映します。", issues: issues)
+        showRecordingResult(L10n.text(.cleared), issues: issues)
     }
 
     @objc private func clearBinding(_ sender: NSButton) { clearBinding(at: sender.tag) }
 
     func windowDidResignKey(_ notification: Notification) {
         guard recordingIndex != nil else { return }
-        showRecordingResult("記録をキャンセルしました。", issues: finishRecording())
+        showRecordingResult(L10n.text(.recordingCancelled), issues: finishRecording())
     }
 
     func windowWillClose(_ notification: Notification) {
         let issues = finishRecording()
         if !issues.isEmpty {
             let alert = NSAlert()
-            alert.messageText = "ホットキーを復帰できませんでした"
-            alert.informativeText = issues.joined(separator: "\n") + "\nメニューの「ホットキーを再読み込み」で再試行してください。"
+            alert.messageText = L10n.text(.resumeFailed)
+            alert.informativeText = issues.joined(separator: "\n") + L10n.text(.resumeHelp)
             alert.runModal()
         }
     }
 
-    private func showRecordingResult(_ message: String, issues: [String]) {
-        showMessage(message + (issues.isEmpty ? "" : "\n" + issues.joined(separator: "\n")), error: !issues.isEmpty)
+    private func showRecordingResult(_ message: @autoclosure @escaping () -> String, issues: [String]) {
+        showMessage(message() + (issues.isEmpty ? "" : "\n" + issues.joined(separator: "\n")), error: !issues.isEmpty)
     }
 
-    private func showMessage(_ message: String, error: Bool = false) {
-        messageView.string = message
-        messageView.textColor = error ? .systemRed : .secondaryLabelColor
+    private func showMessage(_ message: @autoclosure @escaping () -> String, error: Bool = false) {
+        currentMessage = message
+        messageIsError = error
+        renderMessage()
+    }
+
+    private func renderMessage() {
+        messageView.string = currentMessage?() ?? ""
+        messageView.textColor = messageIsError ? .systemRed : .secondaryLabelColor
         messageView.scrollRangeToVisible(NSRange(location: 0, length: 0))
     }
 
     private func buildContent() {
         guard let content = window?.contentView else { return }
         let help = NSTextField(wrappingLabelWithString:
-            "設定欄をクリックし、使いたいキーの組み合わせを押してください。\n記録中はTabDeskのホットキーを一時停止します。Escでキャンセル、×で解除できます。")
+            L10n.text(.hotkeyHelp))
         help.font = .systemFont(ofSize: 12)
-        let labels = (1...9).map { "タブ \($0) に切替" } + [
-            "次のタブ", "前のタブ", "フォーカス窓を登録", "編集モード切替", "サイドバー折りたたみ",
-        ]
+        helpLabel = help
+        let labels = localizedActionNames
         let rows: [[NSView]] = labels.enumerated().map { index, title in
             let label = NSTextField(labelWithString: title)
+            actionLabels.append(label)
             let field = HotkeyRecorderButton()
             field.onRecord = { [weak self] in self?.beginRecording(at: index) }
             field.setAccessibilityLabel(title)
             fields.append(field)
             field.widthAnchor.constraint(equalToConstant: 310).isActive = true
             let clear = NSButton(title: "×", target: self, action: #selector(clearBinding(_:)))
+            clearButtons.append(clear)
             clear.tag = index
             clear.bezelStyle = .rounded
-            clear.setAccessibilityLabel("\(title)の割り当てを解除")
-            clear.toolTip = "割り当てを解除"
+            clear.setAccessibilityLabel(L10n.text(.clearShortcutLabel, title))
+            clear.toolTip = L10n.text(.clearShortcut)
             let controls = NSStackView(views: [field, clear])
             controls.spacing = 6
             return [label, controls]
@@ -264,7 +301,8 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         saveButton.keyEquivalent = "\r"
         resetButton.target = self
         resetButton.action = #selector(reset)
-        let cancel = NSButton(title: "閉じる", target: self, action: #selector(dismiss))
+        let cancel = NSButton(title: L10n.text(.close), target: self, action: #selector(dismiss))
+        closeButton = cancel
         cancel.keyEquivalent = "\u{1b}"
         let buttons = NSStackView(views: [resetButton, NSView(), cancel, saveButton])
         buttons.orientation = .horizontal

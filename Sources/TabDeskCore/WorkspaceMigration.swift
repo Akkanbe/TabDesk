@@ -72,7 +72,7 @@ extension WorkspaceState {
                     windows: normalized,
                     lastFocusedWindowID: containsLastFocused ? tab.lastFocusedWindowID : nil,
                     layout: tab.layout,
-                    displayID: tabDisplayID))
+                    displayID: tabDisplayID, tiles: tab.tiles))
                 if !isKeeper { suffix += 1 }
             }
         }

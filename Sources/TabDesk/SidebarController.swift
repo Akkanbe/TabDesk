@@ -32,6 +32,8 @@ final class SidebarController: NSObject {
         rebuild()
     }
 
+    var isAnyEditingTiles: Bool { panels.values.contains { $0.isEditingTiles } }
+
     var isAnyRenaming: Bool {
         panels.values.contains { $0.isRenaming }
     }
@@ -65,6 +67,10 @@ final class SidebarController: NSObject {
 
     @objc private func screenParametersChanged() {
         rebuild()
+    }
+
+    func refreshLocalization() {
+        panels.values.forEach { $0.refreshLocalization() }
     }
 
     func render() {

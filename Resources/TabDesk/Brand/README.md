@@ -4,6 +4,9 @@
 
 生成方法：Codexの組み込み image_gen ツール。
 
+メニューバーでは、縦タブとウィンドウの輪郭を18pt向けに描いた単色版を使う。
+描画は [StatusBarIcon.swift](../../../Sources/TabDesk/StatusBarIcon.swift) にあり、macOSのテンプレート画像として明暗に追従する。
+
 ## 生成プロンプト
 
 ```text

@@ -33,9 +33,14 @@ final class WindowManager {
     var suppressAppActivation: (@MainActor () -> Bool)?
     /// UI 向けの状態変更通知(エンジンの onStateChanged はここが占有し、保存とあわせて配る)。
     var onStateChanged: (@MainActor (WorkspaceState) -> Void)?
+    var onOperationError: (@MainActor (String) -> Void)?
     var onSaveStatusChanged: (@MainActor () -> Void)?
-    private(set) var saveFailure: String? {
+    private var saveError: String? {
         didSet { onSaveStatusChanged?() }
+    }
+    var saveFailure: String? {
+        guard let saveError else { return nil }
+        return L10n.text(stateWritesEnabled ? .stateSaveError : .stateBackupError, saveError)
     }
     var canRetrySave: Bool { stateWritesEnabled && !isTerminating }
 
@@ -157,7 +162,7 @@ final class WindowManager {
             } catch {
                 // 壊れた原本を退避できないまま上書きすると、復旧材料まで失う。
                 stateWritesEnabled = false
-                saveFailure = "元の設定ファイルを退避できないため、自動保存を停止しています。\n\(error)\n保存先とアクセス権を確認し、元ファイルを保護してから再起動してください。"
+                saveError = String(describing: error)
                 logger.log("state backup failed: \(error); automatic writes disabled to preserve the original file")
             }
         }
@@ -246,11 +251,11 @@ final class WindowManager {
             try store.save(engine.state)
             stateIsDirty = false
             saveRetryAttempt = 0
-            saveFailure = nil
+            saveError = nil
             return true
         } catch {
             stateIsDirty = true
-            saveFailure = "タブ構成を保存できませんでした。変更はまだディスクへ保存されていません。\n\(error)"
+            saveError = String(describing: error)
             logger.log("save failed: \(error)")
             if scheduleRetry, !isTerminating, saveRetryAttempt < 3 {
                 saveRetryAttempt += 1
@@ -623,6 +628,7 @@ final class WindowManager {
             logger.log("register-focused: \(record.appName) — \(record.title)")
         } catch {
             logger.log("register-focused failed: \(error)")
+            onOperationError?(String(describing: error))
         }
     }
 
@@ -675,7 +681,7 @@ final class WindowManager {
     // MARK: - 登録 / 解除
 
     /// ウィンドウをタブに登録する。配置先は**タブの画面**のコンテンツ領域(v4: タブが正)。
-    func register(_ record: WindowRecord, into tabID: UUID) async throws {
+    func register(_ record: WindowRecord, into tabID: UUID, tileID: UUID? = nil) async throws {
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
         let window = record.window
         // メニュー表示中に状態が変わりうるので、frame と一緒にフルスクリーン/最小化も登録直前に読み直す。
@@ -708,8 +714,15 @@ final class WindowManager {
         driver.adopt(record.window)
         let identity = WindowIdentity(
             bundleID: record.bundleID, appName: record.appName, title: record.title, registeredSize: current.size)
-        let managed = try await engine.register(
-            windowID: windowID, pid: record.window.pid, identity: identity, frame: frame, into: tabID)
+        let managed: ManagedWindow
+        do {
+            managed = try await engine.register(
+                windowID: windowID, pid: record.window.pid, identity: identity, frame: frame, into: tabID, tileID: tileID)
+        } catch {
+            // 満杯のタイルなどで登録が拒否された窓の AX 要素を保持し続けない。
+            if engine.state.managedWindow(forWindowID: windowID) == nil { driver.forget(windowID) }
+            throw error
+        }
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
         guard engine.state.managedWindow(id: managed.id)?.window.windowID == windowID else {
             throw TabEngine.EngineError.unknownWindow(managed.id)
