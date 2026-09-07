@@ -25,6 +25,13 @@ public enum L10n {
 
     public enum Key: String, CaseIterable, Sendable {
         case layoutTiled
+        case undoTileEdit
+        case redoTileEdit
+        case tileIssueItem
+        case tileIssuesTitle
+        case tileIssuesHelp
+        case selectIssueTile
+        case tileIssuesSummary
         case editTiles
         case tileEditorTitle
         case tileEditorHelp

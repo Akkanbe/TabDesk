@@ -372,7 +372,9 @@ final class SidebarPanel: NSPanel {
         tileEditors.values.forEach { $0.refreshState() }
         // 操作失敗は永続 state の外で更新される。行の再利用中も警告だけは再評価する。
         let activeTabID = manager.engine.activeTabID(on: displayID)
-        tileWarning.isHidden = activeTabID.map { manager.engine.tilePlacementFailures(in: $0).isEmpty } ?? true
+        let failures = activeTabID.map { manager.engine.tilePlacementFailures(in: $0) } ?? []
+        tileWarning.isHidden = failures.isEmpty
+        tileWarning.stringValue = L10n.text(.tileIssuesSummary, String(failures.count))
         // エンジンの state は同じ値でも didSet が発火する。見た目が変わらないなら行を作り直さない
         // (ダブルクリックの 2 回目が作り直し直後の行に届き、レイアウト前で編集欄が出ない事故を防ぐ)。
         // v4: activeTabIDs は state に含まれるので、この差分キーで画面別アクティブの変化も拾える。

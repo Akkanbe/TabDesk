@@ -2,7 +2,7 @@ import AppKit
 import TabDeskCore
 
 @MainActor
-final class TileEditorController: NSWindowController {
+final class TileEditorController: NSWindowController, NSWindowDelegate {
     private let manager: WindowManager
     let tabID: UUID
     private var original: TilePartition?
@@ -12,6 +12,17 @@ final class TileEditorController: NSWindowController {
     private var selected: UUID?
     private var busy = false
     private var operationError: Error?
+    private struct Draft {
+        let partition: TilePartition
+        let assignments: [UUID: UUID]
+        let selected: UUID?
+    }
+    private var undoHistory: [Draft] = []
+    private var redoHistory: [Draft] = []
+    private var resizeStart: Draft?
+    private var draft: Draft { Draft(partition: partition, assignments: assignments, selected: selected) }
+    var canUndo: Bool { !undoHistory.isEmpty }
+    var canRedo: Bool { !redoHistory.isEmpty }
     private(set) var canvas = TileCanvas()
     private let help = NSTextField(wrappingLabelWithString: "")
     private let message = NSTextField(wrappingLabelWithString: "")
@@ -25,17 +36,21 @@ final class TileEditorController: NSWindowController {
     private let reloadButton = NSButton()
     private let addButton = NSButton()
     private let closeButton = NSButton()
+    private let undoButton = NSButton()
+    private let redoButton = NSButton()
+    private(set) var placementIssues = TilePlacementIssuesView()
 
     var hasChanges: Bool { partition != original || assignments != originalAssignments }
 
     init(manager: WindowManager, tabID: UUID) {
         self.manager = manager
         self.tabID = tabID
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: 660),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: 740),
                               styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        window.minSize = NSSize(width: 760, height: 570)
+        window.minSize = NSSize(width: 760, height: 660)
         window.isReleasedWhenClosed = false
         super.init(window: window)
+        window.delegate = self
         buildContent()
         reload()
         window.center()
@@ -45,7 +60,7 @@ final class TileEditorController: NSWindowController {
     required init?(coder: NSCoder) { fatalError() }
 
     func present() {
-        if window?.isVisible != true { reload() }
+        if window?.isVisible != true, !busy { reload() }
         showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
@@ -54,15 +69,50 @@ final class TileEditorController: NSWindowController {
     /// 外部の登録・解除は未適用の編集を上書きしない。確定時にもエンジンで競合を検証する。
     func refreshState() {
         guard !busy else { return }
-        if !hasChanges { loadState() } else { refreshPresentation() }
+        // 全操作を取り消した状態でも、通常の通知で「やり直す」を失わない。
+        if !hasChanges, !canUndo, !canRedo, resizeStart == nil { loadState() } else { refreshPresentation() }
     }
 
     func refreshLocalization() { refreshPresentation() }
 
     @objc private func reload() {
+        guard !busy, resizeStart == nil else { return }
         operationError = nil
+        undoHistory.removeAll()
+        redoHistory.removeAll()
         loadState()
     }
+
+    private func remember(_ previous: Draft) {
+        guard partition != previous.partition || assignments != previous.assignments else { return }
+        undoHistory.append(previous)
+        // 分割木のスナップショットを無制限に保持しない。直近 100 操作まで戻せる。
+        if undoHistory.count > 100 { undoHistory.removeFirst() }
+        redoHistory.removeAll()
+    }
+
+    private func restoreDraft(_ previous: Draft) {
+        partition = previous.partition
+        assignments = previous.assignments
+        selected = previous.selected
+        operationError = nil
+        refreshPresentation()
+    }
+
+    @objc func undoEdit() {
+        guard !busy, resizeStart == nil, let previous = undoHistory.popLast() else { return }
+        redoHistory.append(draft)
+        restoreDraft(previous)
+    }
+
+    @objc func redoEdit() {
+        guard !busy, resizeStart == nil, let next = redoHistory.popLast() else { return }
+        undoHistory.append(draft)
+        restoreDraft(next)
+    }
+
+    func windowDidResignKey(_ notification: Notification) { canvas.finishResize() }
+    func windowWillClose(_ notification: Notification) { canvas.finishResize() }
 
     private func loadState() {
         guard let tab = manager.engine.state.tab(withID: tabID), tab.layout == .tiled, let tiles = tab.tiles else {
@@ -89,6 +139,8 @@ final class TileEditorController: NSWindowController {
         reloadButton.title = L10n.text(.reloadTiles)
         addButton.title = L10n.text(.addToTile)
         closeButton.title = L10n.text(.close)
+        undoButton.title = L10n.text(.undoTileEdit)
+        redoButton.title = L10n.text(.redoTileEdit)
         assignmentLabel.stringValue = L10n.text(.tileAssignment)
         tilePicker.setAccessibilityLabel(L10n.text(.tileNumber, ""))
         windowPicker.setAccessibilityLabel(L10n.text(.tileAssignment))
@@ -102,14 +154,23 @@ final class TileEditorController: NSWindowController {
         windowPicker.addItem(withTitle: L10n.text(.emptyTile))
         windowPicker.item(at: 0)?.isEnabled = false
         for window in tab?.windows ?? [] {
-            windowPicker.addItem(withTitle: SidebarText.windowTitle(appName: window.identity.appName, title: window.identity.title))
-            windowPicker.lastItem?.representedObject = window.id
+            // addItem(withTitle:) は同名項目を置き換えるため、同名の窓は NSMenu に直接追加する。
+            let item = NSMenuItem(title: SidebarText.windowTitle(appName: window.identity.appName, title: window.identity.title),
+                                  action: nil, keyEquivalent: "")
+            item.representedObject = window.id
+            windowPicker.menu?.addItem(item)
             if assignments[window.id] == selected { windowPicker.selectItem(at: windowPicker.numberOfItems - 1) }
         }
-        for button in [splitLR, splitTB, merge, applyButton, reloadButton] { button.isEnabled = usable && !busy }
-        tilePicker.isEnabled = usable && !busy
-        windowPicker.isEnabled = usable && !busy && !assignments.isEmpty
-        addButton.isEnabled = usable && !busy && !hasChanges && !assignments.values.contains(where: { $0 == selected })
+        let canEdit = usable && !busy && resizeStart == nil
+        let failedWindows = manager.engine.tilePlacementFailures(in: tabID)
+        placementIssues.update(TilePlacementIssue.items(tab: tab, failedWindowIDs: failedWindows,
+                                                        partition: partition, assignments: assignments), canSelect: canEdit)
+        for button in [splitLR, splitTB, merge, applyButton, reloadButton] { button.isEnabled = canEdit }
+        undoButton.isEnabled = canEdit && canUndo
+        redoButton.isEnabled = canEdit && canRedo
+        tilePicker.isEnabled = canEdit
+        windowPicker.isEnabled = canEdit && !assignments.isEmpty
+        addButton.isEnabled = canEdit && !hasChanges && !assignments.values.contains(where: { $0 == selected })
         canvas.isEnabled = usable && !busy
         canvas.partition = partition
         canvas.selected = selected
@@ -126,15 +187,17 @@ final class TileEditorController: NSWindowController {
         if !usable { showMessage(L10n.text(.tileTabUnavailable), error: true) }
         else if let operationError { showMessage(String(describing: operationError), error: true) }
         else if hasChanges { showMessage(L10n.text(.tileDraft)) }
-        else if !manager.engine.tilePlacementFailures(in: tabID).isEmpty { showMessage(L10n.text(.tileFitWarning), error: true) }
+        else if !failedWindows.isEmpty { showMessage(L10n.text(.tileFitWarning), error: true) }
         else { showMessage("") }
     }
 
     func splitSelected(axis: TileAxis) {
-        guard let selected, !busy else { return }
+        guard let selected, !busy, resizeStart == nil else { return }
         do {
+            let previous = draft
             operationError = nil
             partition = try partition.splitting(selected, axis: axis)
+            remember(previous)
             refreshPresentation()
         } catch { showError(error) }
     }
@@ -143,12 +206,14 @@ final class TileEditorController: NSWindowController {
     @objc private func splitTopBottom() { splitSelected(axis: .vertical) }
 
     @objc private func mergeSelected() {
-        guard let selected, !busy else { return }
+        guard let selected, !busy, resizeStart == nil else { return }
         do {
+            let previous = draft
             operationError = nil
             let result = try partition.merging(selected, occupied: Set(assignments.values))
             partition = result.partition
             self.selected = result.selected
+            remember(previous)
             refreshPresentation()
         } catch { showError(error) }
     }
@@ -159,12 +224,14 @@ final class TileEditorController: NSWindowController {
     }
 
     @objc private func assignWindow() {
-        guard let selected, let id = windowPicker.selectedItem?.representedObject as? UUID,
+        guard !busy, resizeStart == nil, let selected, let id = windowPicker.selectedItem?.representedObject as? UUID,
               let previous = assignments[id] else { return }
+        let before = draft
         // 占有済みタイルへの割り当ては入れ替え。窓を未割り当てにして追跡不能にしない。
         if let other = assignments.first(where: { $0.value == selected })?.key { assignments[other] = previous }
         operationError = nil
         assignments[id] = selected
+        remember(before)
         refreshPresentation()
     }
 
@@ -174,7 +241,7 @@ final class TileEditorController: NSWindowController {
 
     @discardableResult
     func applyDraft() async -> Bool {
-        guard !busy else { return false }
+        guard !busy, resizeStart == nil else { return false }
         operationError = nil
         busy = true
         refreshPresentation()
@@ -253,19 +320,41 @@ final class TileEditorController: NSWindowController {
         for (button, action) in [(splitLR, #selector(splitLeftRight)), (splitTB, #selector(splitTopBottom)),
                                  (merge, #selector(mergeSelected)), (applyButton, #selector(applyChanges)),
                                  (reloadButton, #selector(reload)), (addButton, #selector(addWindow)),
-                                 (closeButton, #selector(dismiss))] {
+                                 (closeButton, #selector(dismiss)), (undoButton, #selector(undoEdit)),
+                                 (redoButton, #selector(redoEdit))] {
             button.target = self
             button.action = action
             button.bezelStyle = .rounded
         }
         closeButton.keyEquivalent = "\u{1b}"
         applyButton.keyEquivalent = "\r"
+        undoButton.keyEquivalent = "z"
+        undoButton.keyEquivalentModifierMask = .command
+        redoButton.keyEquivalent = "z"
+        redoButton.keyEquivalentModifierMask = [.command, .shift]
         tilePicker.target = self
         tilePicker.action = #selector(selectTile)
         windowPicker.target = self
         windowPicker.action = #selector(assignWindow)
         windowPicker.widthAnchor.constraint(equalToConstant: 380).isActive = true
+        placementIssues.onSelectWindow = { [weak self] id in
+            guard let self, !busy, resizeStart == nil, let tileID = assignments[id],
+                  partition.tileIDs.contains(tileID) else { return }
+            selected = tileID
+            refreshPresentation()
+        }
         canvas.onSelect = { [weak self] id in self?.selected = id; self?.refreshPresentation() }
+        canvas.onBeginResize = { [weak self] in
+            guard let self else { return }
+            resizeStart = draft
+            refreshPresentation()
+        }
+        canvas.onEndResize = { [weak self] in
+            guard let self, let previous = resizeStart else { return }
+            resizeStart = nil
+            remember(previous)
+            refreshPresentation()
+        }
         canvas.onResize = { [weak self] id, ratio in
             guard let self else { return }
             do {
@@ -278,8 +367,8 @@ final class TileEditorController: NSWindowController {
         message.font = .systemFont(ofSize: 12)
         let toolbar = NSStackView(views: [tilePicker, splitLR, splitTB, merge])
         let assignment = NSStackView(views: [assignmentLabel, windowPicker])
-        let buttons = NSStackView(views: [reloadButton, NSView(), closeButton, applyButton])
-        let stack = NSStackView(views: [help, toolbar, canvas, assignment, addButton, message, buttons])
+        let buttons = NSStackView(views: [undoButton, redoButton, reloadButton, NSView(), closeButton, applyButton])
+        let stack = NSStackView(views: [help, toolbar, canvas, assignment, addButton, placementIssues, message, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -293,7 +382,7 @@ final class TileEditorController: NSWindowController {
             canvas.heightAnchor.constraint(greaterThanOrEqualToConstant: 240),
             message.heightAnchor.constraint(equalToConstant: 44),
         ])
-        for view in [help, canvas, message, buttons] { view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
+        for view in [help, canvas, placementIssues, message, buttons] { view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
         canvas.setContentHuggingPriority(.defaultLow, for: .vertical)
     }
 }
@@ -314,6 +403,8 @@ final class TileCanvas: NSView {
     var isEnabled = true
     var onSelect: ((UUID) -> Void)?
     var onResize: ((UUID, Double) -> Void)?
+    var onBeginResize: (() -> Void)?
+    var onEndResize: (() -> Void)?
     private var dragging: TilePartition.Divider?
     override var isFlipped: Bool { true }
 
@@ -365,9 +456,11 @@ final class TileCanvas: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard isEnabled else { return }
+        finishResize()
         let point = convert(event.locationInWindow, from: nil)
         let geometry = partition.geometry(in: drawingArea)
         dragging = geometry.dividers.reversed().first { hitArea($0).contains(point) }
+        if dragging != nil { onBeginResize?() }
         if dragging == nil, let tile = geometry.tiles.first(where: { $0.value.contains(point) }) { onSelect?(tile.key) }
     }
 
@@ -381,7 +474,13 @@ final class TileCanvas: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        finishResize()
+    }
+
+    func finishResize() {
+        guard dragging != nil else { return }
         dragging = nil
+        onEndResize?()
         window?.invalidateCursorRects(for: self)
     }
 }

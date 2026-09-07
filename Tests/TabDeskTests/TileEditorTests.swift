@@ -127,7 +127,9 @@ struct TileEditorTests {
                                           windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
         }
         let ids = editor.partition.tileIDs
+        let beforeDrag = editor.partition
         canvas.mouseDown(with: try event(.leftMouseDown, start))
+        canvas.mouseDragged(with: try event(.leftMouseDragged, NSPoint(x: (start.x + end.x) / 2, y: end.y)))
         canvas.mouseDragged(with: try event(.leftMouseDragged, end))
         canvas.mouseUp(with: try event(.leftMouseUp, end))
         if case .split(_, _, let ratio, _, _) = editor.partition { #expect(abs(ratio - 0.7) < 0.01) }
@@ -137,5 +139,17 @@ struct TileEditorTests {
         #expect(editor.partition == draft)
         #expect(editor.partition.tileIDs == ids)
         #expect(manager.engine.state.tab(withID: tab.id)?.tiles == tab.tiles)
+        editor.undoEdit()
+        #expect(editor.partition == beforeDrag, "ドラッグ中の中間位置を 1 操作ずつ戻さない")
+        editor.refreshState()
+        editor.redoEdit()
+        #expect(editor.partition == draft)
+        // 動かさず離した場合は履歴を追加しない。
+        let noOpDivider = try #require(canvas.partition.geometry(in: canvas.drawingArea).dividers.first)
+        let noOpPoint = canvas.convert(NSPoint(x: noOpDivider.position, y: noOpDivider.area.midY), to: nil)
+        canvas.mouseDown(with: try event(.leftMouseDown, noOpPoint))
+        canvas.mouseUp(with: try event(.leftMouseUp, noOpPoint))
+        editor.undoEdit()
+        #expect(editor.partition == beforeDrag)
     }
 }

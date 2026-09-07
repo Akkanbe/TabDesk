@@ -101,6 +101,13 @@
 "defaultTabName" = "Tab %@";
 "editModeHelp" = "Remember window positions when you move them.";
 "layoutTiled" = "Layout: Tiles";
+"undoTileEdit" = "Undo";
+"redoTileEdit" = "Redo";
+"tileIssueItem" = "Tile %@ — %@";
+"tileIssuesTitle" = "Windows that could not be placed (%@)";
+"tileIssuesHelp" = "Enlarge the tile or change its assignment, then click Apply. Tile numbers follow your current edits.";
+"selectIssueTile" = "Select Tile";
+"tileIssuesSummary" = "%@ window(s) could not be placed. Open Edit Tiles… to see the affected windows.";
 "editTiles" = "Edit Tiles…";
 "tileEditorTitle" = "%@ — Tile Editor";
 "tileEditorHelp" = "Select a tile to split or merge. Drag a divider to adjust the ratio, then click Apply. Apply your changes before adding a window.";

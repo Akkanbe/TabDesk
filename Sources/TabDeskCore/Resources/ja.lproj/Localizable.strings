@@ -101,6 +101,13 @@
 "defaultTabName" = "タブ%@";
 "editModeHelp" = "動かしたウィンドウの位置を記憶します。";
 "layoutTiled" = "レイアウト: タイル";
+"undoTileEdit" = "元に戻す";
+"redoTileEdit" = "やり直す";
+"tileIssueItem" = "タイル %@ — %@";
+"tileIssuesTitle" = "配置できなかったウィンドウ（%@ 件）";
+"tileIssuesHelp" = "対象タイルを広げるか、割り当てを変更して「適用」を押してください。タイル番号は現在の編集内容に対応します。";
+"selectIssueTile" = "対象タイルを選択";
+"tileIssuesSummary" = "%@ 件のウィンドウを配置できませんでした。「タイルを編集…」で対象を確認できます。";
 "editTiles" = "タイルを編集…";
 "tileEditorTitle" = "%@ — タイル編集";
 "tileEditorHelp" = "タイルを選んで分割・結合します。境界をドラッグして比率を調整し、「適用」で確定してください。ウィンドウの追加は適用後に行えます。";
