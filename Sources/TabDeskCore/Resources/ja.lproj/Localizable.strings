@@ -101,6 +101,8 @@
 "defaultTabName" = "タブ%@";
 "editModeHelp" = "動かしたウィンドウの位置を記憶します。";
 "layoutTiled" = "レイアウト: タイル";
+"duplicateTileLayout" = "タイル構成を複製";
+"copiedTabName" = "%@ のコピー";
 "undoTileEdit" = "元に戻す";
 "redoTileEdit" = "やり直す";
 "tileIssueItem" = "タイル %@ — %@";

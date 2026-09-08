@@ -395,6 +395,7 @@ final class SidebarPanel: NSPanel {
             row.onDelete = { [weak self] in self?.delete(tab.id) }
             row.onMove = { [weak self] offset in self?.moveTab(tab.id, offset: offset) }
             row.onEditTiles = { [weak self] in self?.editTiles(tab.id) }
+            row.onDuplicateTiles = { [weak self] in self?.duplicateTiles(tab.id) }
             row.onSetLayout = { [weak self] layout in self?.setLayout(tab.id, layout) }
             tabsStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: tabsStack.widthAnchor).isActive = true
@@ -646,6 +647,15 @@ final class SidebarPanel: NSPanel {
                 logger.log("setTabLayout failed: \(error)")
                 manager.onOperationError?(String(describing: error))
             }
+        }
+    }
+
+    private func duplicateTiles(_ tabID: UUID) {
+        do {
+            try manager.engine.duplicateTileLayout(tabID)
+        } catch {
+            logger.log("duplicateTileLayout failed: \(error)")
+            manager.onOperationError?(String(describing: error))
         }
     }
 

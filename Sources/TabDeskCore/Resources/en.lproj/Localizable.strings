@@ -101,6 +101,8 @@
 "defaultTabName" = "Tab %@";
 "editModeHelp" = "Remember window positions when you move them.";
 "layoutTiled" = "Layout: Tiles";
+"duplicateTileLayout" = "Duplicate Tile Layout";
+"copiedTabName" = "%@ Copy";
 "undoTileEdit" = "Undo";
 "redoTileEdit" = "Redo";
 "tileIssueItem" = "Tile %@ — %@";

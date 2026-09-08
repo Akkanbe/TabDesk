@@ -16,6 +16,7 @@ final class TabRowView: NSView {
     /// 並べ替え(-1 = 上へ、+1 = 下へ)。
     var onMove: ((Int) -> Void)?
     var onEditTiles: (() -> Void)?
+    var onDuplicateTiles: (() -> Void)?
     var onSetLayout: ((TabLayout) -> Void)?
 
     private let tab: Tab
@@ -108,6 +109,9 @@ final class TabRowView: NSView {
         let edit = menu.addItem(withTitle: L10n.text(.editTiles), action: #selector(editTilesAction), keyEquivalent: "")
         edit.target = self
         edit.isEnabled = tab.layout == .tiled
+        let duplicate = menu.addItem(withTitle: L10n.text(.duplicateTileLayout), action: #selector(duplicateTilesAction), keyEquivalent: "")
+        duplicate.target = self
+        duplicate.isEnabled = tab.layout == .tiled
         // 保存済みの旧カラム配置は選択状態を示す。新規の選択肢はタイル／自由配置にする。
         if tab.layout == .columns {
         let columns = menu.addItem(withTitle: L10n.text(.layoutColumns), action: #selector(layoutColumnsAction), keyEquivalent: "")
@@ -126,6 +130,7 @@ final class TabRowView: NSView {
     @objc private func moveDownAction() { onMove?(1) }
     @objc private func layoutTiledAction() { onSetLayout?(.tiled) }
     @objc private func editTilesAction() { onEditTiles?() }
+    @objc private func duplicateTilesAction() { onDuplicateTiles?() }
     @objc private func layoutFreeAction() { onSetLayout?(.free) }
     @objc private func layoutColumnsAction() { onSetLayout?(.columns) }
 }

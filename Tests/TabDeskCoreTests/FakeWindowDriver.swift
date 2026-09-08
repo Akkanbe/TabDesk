@@ -20,6 +20,11 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         var fullscreen = false
         /// AXFullScreen の読み取りだけ失敗する(frame は読める)。忙しいアプリの属性タイムアウトを模す。
         var fullscreenReadFails = false
+        var releaseStatus: WindowReleaseStatus = .ready
+        var releasePreparationFails = false
+        var refreshRepairsWrites = false
+        var ignoreFramePosition = false
+        var ignorePosition = false
     }
 
     private let lock = NSLock()
@@ -62,8 +67,33 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
 
     struct SimulatedTimeout: Error {}
 
+    func configureRelease(_ id: CGWindowID, status: WindowReleaseStatus = .ready, fails: Bool = false, repairsWrites: Bool = false) {
+        lock.withLock {
+            windows[id]?.releaseStatus = status
+            windows[id]?.releasePreparationFails = fails
+            windows[id]?.refreshRepairsWrites = repairsWrites
+        }
+    }
+
+    func prepareForRelease(of windowID: CGWindowID) throws -> WindowReleaseStatus {
+        try lock.withLock {
+            calls.append("prepareForRelease:\(windowID)")
+            guard let window = windows[windowID] else { throw WindowDriverError.unknownWindow(windowID) }
+            if window.releasePreparationFails { throw SimulatedTimeout() }
+            if window.refreshRepairsWrites { windows[windowID]?.failWrites = false }
+            return window.releaseStatus
+        }
+    }
+
     func setMinSize(_ size: CGSize, of id: CGWindowID) {
         lock.withLock { windows[id]?.minSize = size }
+    }
+
+    func ignoreReleasePosition(_ id: CGWindowID, alsoPositionWrites: Bool) {
+        lock.withLock {
+            windows[id]?.ignoreFramePosition = true
+            windows[id]?.ignorePosition = alsoPositionWrites
+        }
     }
 
     /// 登録後に擬似 IPC 遅延を変える(登録は速く済ませ、特定の操作だけ遅くしたいテスト用)。
@@ -124,7 +154,7 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
             if w.fullscreen { return w.frame }
             // 実アプリの最小サイズ制約を模す。位置は要求どおり、サイズだけクランプされる。
             w.frame = CGRect(
-                origin: frame.origin,
+                origin: w.ignoreFramePosition ? w.frame.origin : frame.origin,
                 size: CGSize(width: max(frame.width, w.minSize.width), height: max(frame.height, w.minSize.height)))
             return w.frame
         }
@@ -132,7 +162,7 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
 
     func setPosition(_ point: CGPoint, of windowID: CGWindowID) throws {
         try withWindow(windowID, "setPosition") { w in
-            if w.fullscreen { return }
+            if w.fullscreen || w.ignorePosition { return }
             w.frame.origin = point
         }
     }

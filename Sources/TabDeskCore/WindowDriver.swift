@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ApplicationServices
 
 /// ウィンドウ操作の抽象。エンジンはこのプロトコル越しにだけ実ウィンドウに触る。
 ///
@@ -19,14 +20,24 @@ public protocol WindowDriver: Sendable {
     /// 扱うこと — false に潰すと、忙しいアプリの一時的な読み取り失敗でフルスクリーン集合から
     /// 誤って外れ、復元リトライがフルスクリーン寸法を採用する破壊が再発する(v3 レビュー指摘)。
     func isFullscreen(of windowID: CGWindowID) throws -> Bool?
+    /// 終了時だけ参照を更新する。closed は存在しないと確認できた場合に限る。
+    func prepareForRelease(of windowID: CGWindowID) throws -> WindowReleaseStatus
+}
+
+public enum WindowReleaseStatus: Sendable { case ready, closed }
+
+extension WindowDriver {
+    public func prepareForRelease(of windowID: CGWindowID) throws -> WindowReleaseStatus { .ready }
 }
 
 public enum WindowDriverError: Error, CustomStringConvertible, Sendable {
     case unknownWindow(CGWindowID)
+    case releaseReferenceUnavailable(CGWindowID)
 
     public var description: String {
         switch self {
         case .unknownWindow(let id): return "unknown window \(id)"
+        case .releaseReferenceUnavailable(let id): return "window \(id) has no usable AX reference; closure could not be confirmed"
         }
     }
 }
@@ -81,5 +92,38 @@ public final class AXWindowDriver: WindowDriver {
 
     public func isFullscreen(of windowID: CGWindowID) throws -> Bool? {
         try window(windowID).fullscreenRaw  // nil = 属性が読めない(呼び手が前回判定を維持する)
+    }
+
+    public func prepareForRelease(of windowID: CGWindowID) throws -> WindowReleaseStatus {
+        let previous = try window(windowID)
+        let app = AXUIElementCreateApplication(previous.pid)
+        AXUIElementSetMessagingTimeout(app, messagingTimeout)
+        // 登録候補の列挙は最小化・fullscreen を除くため使わない。ここでは ID の一致だけで探す。
+        let elements = try AXAttributes.elements(app, kAXWindowsAttribute)
+        for element in elements {
+            guard let fresh = try? AXWindow(element: element, pid: previous.pid), fresh.windowID == windowID else { continue }
+            fresh.setMessagingTimeout(messagingTimeout)
+            return try windows.withValue { cached in
+                guard let current = cached[windowID], current.pid == previous.pid,
+                      CFEqual(current.element, previous.element) else { throw WindowDriverError.unknownWindow(windowID) }
+                cached[windowID] = fresh
+                return .ready
+            }
+        }
+        let info = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        guard Self.confirmedClosed(windowID: windowID, pid: previous.pid, windowInfo: info) else {
+            throw WindowDriverError.releaseReferenceUnavailable(windowID)
+        }
+        return .closed
+    }
+
+    /// AX の一覧にないだけでは閉じたと判断しない。WindowServer の一覧取得失敗も「不明」。
+    static func confirmedClosed(windowID: CGWindowID, pid: pid_t, windowInfo: [[String: Any]]?) -> Bool {
+        guard let windowInfo else { return false }
+        return windowInfo.allSatisfy { info in
+            guard let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let owner = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value else { return false }
+            return id != windowID || owner != pid
+        }
     }
 }

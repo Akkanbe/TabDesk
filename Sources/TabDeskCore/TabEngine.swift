@@ -175,6 +175,27 @@ public final class TabEngine {
 
     // MARK: - ディスプレイ別アクティブ(v4)
 
+    /// 適用済みの構成だけを複製する。実窓・フォーカス・アクティブタブは変更しない。
+    @discardableResult
+    public func duplicateTileLayout(_ tabID: UUID) throws -> Tab {
+        try rejectIfShuttingDown()
+        let index = try tabIndex(tabID)
+        let source = state.tabs[index]
+        guard source.layout == .tiled, let tiles = source.tiles else { throw TileEditError.invalidPartition }
+        try tiles.validate()
+        let names = Set(state.tabs.filter { resolvedDisplayID(of: $0) == resolvedDisplayID(of: source) }.map(\.name))
+        let baseName = L10n.text(.copiedTabName, source.name)
+        var name = baseName
+        var number = 2
+        while names.contains(name) {
+            name = "\(baseName) (\(number))"
+            number += 1
+        }
+        let copy = Tab(name: name, layout: .tiled, displayID: source.displayID, tiles: tiles.copyWithNewIDs())
+        state.tabs.insert(copy, at: index + 1)
+        return copy
+    }
+
     /// タブの実効ディスプレイ ID(nil タブ = そのときの主ディスプレイ)。
     /// 戻り値 nil は接続ディスプレイが 1 枚も無い縮退時のみ。
     private func resolvedDisplayID(of tab: Tab) -> DisplayID? {
@@ -1481,6 +1502,28 @@ public final class TabEngine {
     private func performReleaseGroup(_ ops: [WindowOp]) async -> [ReleaseResult] {
         var results: [ReleaseResult] = []
         for op in ops {
+            if isReleasingForShutdown {
+                let driver = self.driver
+                do {
+                    let status = try await executor.run { try driver.prepareForRelease(of: op.windowID) }
+                    guard let current = state.managedWindow(id: op.managedID),
+                          current.window.windowID == op.windowID, current.window.pid == op.pid else {
+                        results.append(skippedReleaseResult(for: op))
+                        continue
+                    }
+                    if case .closed = status {
+                        // 登録自体は残し、次回起動時の再同定に使う。別の窓をタイトルだけで操作しない。
+                        clearRuntimeTracking(for: op.managedID)
+                        setBinding(op.managedID, windowID: nil, pid: nil)
+                        log("release: window \(op.windowID) confirmed closed; keeping registration unbound")
+                        results.append(skippedReleaseResult(for: op))
+                        continue
+                    }
+                } catch {
+                    // AX の一覧取得失敗は消滅を意味しない。保持済み参照による従来の復元を試す。
+                    log("release: reference refresh failed for \(op.windowID); trying cached reference: \(error)")
+                }
+            }
             let fullscreen = await probeFullscreen(windowID: op.windowID)
             guard let bound = state.managedWindow(id: op.managedID),
                 bound.window.windowID == op.windowID
@@ -1498,9 +1541,41 @@ public final class TabEngine {
             }
             let driver = self.driver
             let result = await executor.run { Self.perform(op, driver: driver) }
-            results.append(ReleaseResult(result: result, didPerform: true))
+            let settled = isReleasingForShutdown ? await settleShutdownRestore(result) : result
+            results.append(ReleaseResult(result: settled, didPerform: true))
         }
         return results
+    }
+
+    private func settleShutdownRestore(_ result: OpResult) async -> OpResult {
+        let op = result.op
+        guard result.error == nil, let actual = result.actual,
+              case .restore(let requested, _) = op.kind,
+              abs(actual.minX - requested.minX) > config.frameTolerance ||
+                abs(actual.minY - requested.minY) > config.frameTolerance else { return result }
+        // AppKit のアニメーション中は後続のサイズ変更が移動を打ち消すことがある。
+        // 終了時だけ位置を一度再適用し、途中の座標を保存しないよう短く待って読み戻す。
+        guard await refreshFullscreenMembership(managedID: op.managedID, windowID: op.windowID) != true,
+              let bound = state.managedWindow(id: op.managedID),
+              bound.window.windowID == op.windowID, bound.window.pid == op.pid,
+              !isDisplayDisconnected(bound.window) else { return result }
+        let driver = self.driver
+        do {
+            try await executor.run { try driver.setPosition(requested.origin, of: op.windowID) }
+            try await Task.sleep(for: .milliseconds(250))
+            let frame = try await executor.run { try driver.frame(of: op.windowID) }
+            guard let current = state.managedWindow(id: op.managedID),
+                  current.window.windowID == op.windowID, current.window.pid == op.pid,
+                  !isDisplayDisconnected(current.window) else { return result }
+            let area = display(for: current.window)?.contentArea ?? layout.contentArea
+            let visible = frame.intersection(area)
+            // 最小サイズ制約による差は許すが、ほぼ画面外に残った窓を解放成功にしない。
+            let isVisible = !visible.isNull && visible.width >= min(32, frame.width) && visible.height >= min(32, frame.height)
+            return OpResult(op: op, actual: isVisible ? frame : nil,
+                            error: isVisible ? nil : "window remained outside its content area after release", note: result.note)
+        } catch {
+            return OpResult(op: op, actual: nil, error: "release position retry failed: \(error)", note: result.note)
+        }
     }
 
     private func skippedReleaseResult(for op: WindowOp) -> ReleaseResult {

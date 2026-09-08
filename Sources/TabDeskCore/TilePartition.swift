@@ -38,6 +38,16 @@ public indirect enum TilePartition: Codable, Hashable, Sendable {
         }
     }
 
+    /// タブ間で区画の識別子を共有しない。分割軸・比率だけを引き継ぐ。
+    public func copyWithNewIDs() -> TilePartition {
+        switch self {
+        case .tile: return .tile(UUID())
+        case .split(_, let axis, let ratio, let first, let second):
+            return .split(id: UUID(), axis: axis, ratio: ratio,
+                          first: first.copyWithNewIDs(), second: second.copyWithNewIDs())
+        }
+    }
+
     public func validate() throws {
         var seen = Set<UUID>()
         func visit(_ node: TilePartition, depth: Int) throws {

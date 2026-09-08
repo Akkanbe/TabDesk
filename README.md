@@ -153,6 +153,14 @@ open -g 'tabdesk://quit'
 
 新しいタブはタイルモードで作成されます。タブを右クリックすると自由配置へ切り替えられます。既存のタブの配置は維持します。
 
+タブの右クリックから「タイル構成を複製」を選ぶと、同じ画面の元タブの直後にコピーを作ります。
+適用済みの分割・比率を引き継ぎ、すべて空タイルで開始します。窓は必要なものを新しく登録してください。
+元タブの窓や選択中のタブは変わらず、コピー側の編集も元タブへ影響しません。編集中の未適用の変更を
+複製したい場合は、先に「適用」を押してください。自由配置・旧カラム配置ではこの操作は無効です。
+
+Choose **Duplicate Tile Layout** from a tile tab's context menu to create an independent copy next to it on the same display.
+The copy contains the applied tile geometry and starts with empty tiles. Registered windows and unsaved edits are not copied.
+
 1. 「タイルを編集…」を開き、タイルを左右・上下に分割します。境界をドラッグして比率を調整し、「適用」を押します。
 2. 空タイルを選び、「このタイルにウィンドウを追加…」で窓を登録します。登録済みの窓はプルダウンで割り当てを変更できます。
 3. サイドバーを広げたり折りたたむと、全タイルが利用可能な領域に追従します。窓の登録を解除しても空タイルは残ります。
