@@ -42,6 +42,21 @@ CODESIGN_IDENTITY="WTC Dev" ./scripts/build_app.sh
 
 証明書を切り替えた直後の 1 回だけは、上記の「−」→「+」で再登録が必要です。
 
+## ウィンドウが見つからないとき
+
+メニューバーの「ウィンドウの復旧手順…」から案内を開けます。
+
+1. Mac のロックを解除し、TabDesk が終了していれば起動します。
+2. サイドバーを展開し、対象ウィンドウを登録したタブを選びます。
+3. 未復元のままなら、相手アプリの最小化・フルスクリーンを解除し、「未復元のウィンドウを再検索」を選びます。判別できない場合は未復元の登録行をクリックし、正しい窓を選びます。
+4. 管理を外すには、窓が戻ったことを確認して登録行の「×」を押します。書類そのものは閉じません。
+
+切断したモニターのタブは、元のモニターを再接続して確認してください。アクセシビリティ権限不足の場合はシステム設定で TabDesk を許可します。再検索後も、非選択タブの窓はそのタブを選ぶまで表示されません。
+
+強制終了やロック中の終了では窓が退避先に残る場合があります。復旧前に設定ファイルを削除しないでください。改善しなければ発生時刻とログを確認します。ログには窓のタイトルが含まれるため、共有前に内容を確認してください。原因別の整理と検証範囲は [復旧確認記録](docs/16_window_recovery.md) にあります。
+
+Use **Window Recovery Help…** in the menu bar for recovery instructions. Unlock your Mac, relaunch TabDesk if needed, and select the window's tab. For unrestored registrations, leave minimization/full screen and choose **Find Unrestored Windows Again**. Click an unrestored row to assign the correct window manually if matching remains ambiguous. Use the row's **×** to unregister a recovered window without closing its document. Reconnect disconnected displays, and keep your settings files until recovery is complete.
+
 ## テスト
 
 ```bash

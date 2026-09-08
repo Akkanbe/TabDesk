@@ -215,6 +215,9 @@ final class WindowManager {
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(layoutMayHaveChanged(_:)),
             name: Notification.Name("com.apple.screenIsUnlocked"), object: nil)
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(screenDidLock(_:)),
+            name: Notification.Name("com.apple.screenIsLocked"), object: nil)
         lastExistingIDs = WindowEnumerator.existingWindowIDs()
         lastOnScreenIDs = WindowEnumerator.onScreenWindowIDs()
         if isTrusted {
@@ -223,6 +226,11 @@ final class WindowManager {
     }
 
     // MARK: - 永続化
+
+    @objc private func screenDidLock(_ notification: Notification) {
+        // AX の一時的な参照失敗と突き合わせるための時刻記録。ロック中の窓を消滅と断定しない。
+        logger.log("session: screen locked; AX window access may be unavailable")
+    }
 
     /// 変更が連続しても 0.5 秒にまとめて書く。
     private func scheduleSave() {

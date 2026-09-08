@@ -71,6 +71,11 @@ public enum L10n {
         case reloadHotkeys
         case openAccessibility
         case openLog
+        case windowRecovery
+        case windowRecoveryHelp
+        case retryWindowSearch
+        case recoveryPermissionRequired
+        case recoverySearchResult
         case quit
         case loginApproval
         case loginUnavailable

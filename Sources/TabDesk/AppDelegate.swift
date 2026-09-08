@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotkeySettings: HotkeySettingsController?
     private var frameWindows: FrameWindowController?
     private var probeWindow: NSWindow?
+    private var recoverySearchTask: Task<Void, Never>?
+    private var recoverySearchMenuItem: NSMenuItem?
     private lazy var hotkeys = HotkeyCenter(logger: logger)
 
     /// tabdesk:// コマンドの受け付け(既定 OFF)。Accessibility 権限を持つ本アプリへの代理操作口になるため、
@@ -181,6 +183,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: L10n.text(.reloadHotkeys), action: #selector(reloadHotkeys), keyEquivalent: "")
         menu.addItem(withTitle: L10n.text(.openAccessibility), action: #selector(openAccessibilitySettings), keyEquivalent: "")
         menu.addItem(withTitle: L10n.text(.openLog), action: #selector(openLog), keyEquivalent: "")
+        menu.addItem(withTitle: L10n.text(.windowRecovery), action: #selector(showWindowRecovery), keyEquivalent: "")
+        let recoverySearch = menu.addItem(withTitle: L10n.text(.retryWindowSearch), action: #selector(retryWindowSearch), keyEquivalent: "")
+        recoverySearchMenuItem = recoverySearch
         menu.addItem(.separator())
         menu.addItem(withTitle: L10n.text(.quit), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         for menuItem in menu.items where menuItem.action != #selector(NSApplication.terminate(_:)) {
@@ -206,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         updateLaunchAtLoginMenuItem()
         sidebarCollapseMenuItem?.state = menuCollapseState()
+        recoverySearchMenuItem?.isEnabled = recoverySearchTask == nil && !manager.isTerminating
     }
 
     @objc private func toggleSidebarCollapsed(_ sender: NSMenuItem) {
@@ -385,6 +391,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openLog() {
         NSWorkspace.shared.open(logger.fileURL)
+    }
+
+    @objc private func showWindowRecovery() {
+        presentWindowRecovery()
+    }
+
+    private func presentWindowRecovery(status: String? = nil) {
+        guard !manager.isTerminating else { return }
+        let alert = WindowRecoveryGuide.alert(status: status)
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn { showSidebar() }
+    }
+
+    @objc private func retryWindowSearch() {
+        guard !manager.isTerminating, recoverySearchTask == nil else { return }
+        guard manager.isTrusted else {
+            presentWindowRecovery(status: L10n.text(.recoveryPermissionRequired))
+            return
+        }
+        recoverySearchTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.recoverySearchTask = nil }
+            // 手動でも稼働中の厳格照合を使い、曖昧な窓は利用者による割り当てに残す。
+            let remaining = await self.manager.restoreUnboundWindows(strictness: .strict)
+            self.presentWindowRecovery(status: L10n.text(.recoverySearchResult, remaining))
+        }
     }
 
     private func cgBounds(_ windowID: CGWindowID) -> CGRect? {

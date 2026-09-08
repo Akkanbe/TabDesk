@@ -102,6 +102,11 @@
 "editModeHelp" = "Remember window positions when you move them.";
 "layoutTiled" = "Layout: Tiles";
 "duplicateTileLayout" = "Duplicate Tile Layout";
+"windowRecovery" = "Window Recovery Help…";
+"retryWindowSearch" = "Find Unrestored Windows Again";
+"recoveryPermissionRequired" = "Accessibility permission is required. Use Open Accessibility Settings in the menu to allow TabDesk, then try again.";
+"recoverySearchResult" = "Search finished. %d registrations remain unrestored. Matched windows return to their registered tabs. Select a tab to show its windows.";
+"windowRecoveryHelp" = "1. Unlock your Mac. If TabDesk has quit, launch it again.\n\n2. Expand the sidebar with » and select the tab containing the missing window.\n\n3. If it is still unrestored, open the target app and leave minimization or full screen. Choose Find Unrestored Windows Again in the menu. If a window cannot be identified, click its unrestored registration row and choose the correct window.\n\n4. Once the window returns, use × on its row to unregister it. This does not close the document. To exit TabDesk, quit normally from its menu.\n\nFor tabs on a disconnected display, reconnect that display. Check Accessibility settings if permission is missing. If the problem persists, report the time and relevant logs. Logs contain window titles; review them before sharing.";
 "copiedTabName" = "%@ Copy";
 "undoTileEdit" = "Undo";
 "redoTileEdit" = "Redo";
