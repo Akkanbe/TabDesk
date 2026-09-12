@@ -565,6 +565,12 @@ final class WindowManager {
     private var executingDisplayID: DisplayID?
     private(set) var displayFocusUnavailable: DisplayID?
 
+    private enum NavigationOperation {
+        case focusDisplay
+        case activateTab(UUID)
+        case adjacentTab(Int)
+    }
+
     private func currentDisplayFocus() -> DisplayNavigation.Focus {
         if let displayFocusProvider { return displayFocusProvider() }
         let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -580,19 +586,25 @@ final class WindowManager {
         guard !isTerminating else { return }
         let current = selectedDisplayID()
         let displayID: DisplayID
+        let operation: NavigationOperation
         switch action {
         case .nextDisplay, .previousDisplay:
             guard let next = DisplayNavigation.adjacent(to: current,
                 offset: action == .nextDisplay ? 1 : -1, displays: layout.displays) else { return }
             displayID = next
-        case .activateTab, .nextTab, .previousTab:
+            operation = .focusDisplay
+        case .nextTab, .previousTab:
             guard let current else { return }
             displayID = current
-        default: return
-        }
-        if case .activateTab(let number) = action {
-            let tabs = engine.state.tabs(on: displayID, primaryID: layout.primaryDisplay?.id)
+            operation = .adjacentTab(action == .nextTab ? 1 : -1)
+        case .activateTab(let number):
+            guard let current, number > 0 else { return }
+            let tabs = engine.state.tabs(on: current, primaryID: layout.primaryDisplay?.id)
             guard tabs.indices.contains(number - 1) else { return }
+            displayID = current
+            // 実行待ちの間に並べ替えられても、押した時点のタブを開く。
+            operation = .activateTab(tabs[number - 1].id)
+        default: return
         }
         displayNavigation.select(displayID, focus: currentDisplayFocus())
         displayFocusUnavailable = nil
@@ -613,17 +625,16 @@ final class WindowManager {
                 onDisplaySelectionChanged?()
             }
             guard !isTerminating, layout.display(id: displayID) != nil else { return }
+            if case .activateTab(let tabID) = operation, engine.state.tab(withID: tabID) == nil { return }
             executingDisplayID = displayID
             do {
                 try await performFocusSwitch {
-                    switch action {
-                    case .nextTab, .previousTab:
-                        return try await engine.activateAdjacent(offset: action == .nextTab ? 1 : -1, on: displayID)
-                    case .activateTab(let number):
-                        let tabs = engine.state.tabs(on: displayID, primaryID: layout.primaryDisplay?.id)
-                        guard tabs.indices.contains(number - 1) else { return nil }
-                        return try await engine.activate(tabs[number - 1].id)
-                    default: return nil
+                    switch operation {
+                    case .adjacentTab(let offset):
+                        return try await engine.activateAdjacent(offset: offset, on: displayID)
+                    case .activateTab(let tabID):
+                        return try await engine.activate(tabID)
+                    case .focusDisplay: return nil
                     }
                 }
                 // 同じタブを指定した場合も入力先を戻す。空タブでは選択だけを維持する。
@@ -642,7 +653,7 @@ final class WindowManager {
 
     private var lastFocusedDisplay: (pid: pid_t, displayID: DisplayID)?
 
-    /// ホットキーが作用する画面。フォーカス窓の画面 → マウスカーソルの画面 → 主、の順で解決。
+    /// 明示選択を優先し、手動フォーカス変更後は前面窓 → マウス → 主画面へ戻す。
     func selectedDisplayID() -> DisplayID? {
         let observed = currentDisplayFocus()
         let frontmostPID = observed.pid
@@ -655,8 +666,12 @@ final class WindowManager {
             mousePointAX: ScreenGeometry.axRect(fromCocoa: CGRect(origin: NSEvent.mouseLocation, size: .zero)).origin,
             layout: layout)
         // TabDeskの設定画面への移動だけでは明示選択を解除しない。
-        return displayNavigation.resolve(fallback: fallback, focus: observed, displays: layout.displays,
+        let selected = displayNavigation.resolve(fallback: fallback, focus: observed, displays: layout.displays,
             busy: pendingNavigationCount > 0 || frontmostPID == getpid())
+        if displayNavigation.selectedID == nil || displayFocusUnavailable != selected {
+            displayFocusUnavailable = nil
+        }
+        return selected
     }
 
     /// タブが自分の画面のアクティブか(フォーカス連動の判定用)。

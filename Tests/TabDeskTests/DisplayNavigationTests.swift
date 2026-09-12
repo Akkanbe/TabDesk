@@ -6,6 +6,25 @@ import TabDeskCore
 
 @MainActor
 struct DisplayHotkeyIntegrationTests {
+    @Test(arguments: [false, true])
+    func queuedTabNumberKeepsItsIdentityAfterReordering(shutdownBeforeExecution: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let manager = WindowManager(logger: FileLogger(fileURL: directory.appendingPathComponent("test.log")),
+            store: StateStore(fileURL: directory.appendingPathComponent("state.json")), monitoringEnabled: false,
+            layout: FixedScreenLayout(displays: [DisplayLayout(id: "main", frame: frame, contentArea: frame, parkPoint: .zero)]),
+            displayFocusProvider: { .init(pid: 100, displayID: "main") })
+        let first = manager.engine.createTab(name: "First", on: "main")
+        let target = manager.engine.createTab(name: "Target", on: "main")
+        manager.navigate(.activateTab(2))
+        // キューが実行を始める前に、同期UI操作でタブ順が変わる状況。
+        try manager.engine.moveTab(fromIndex: 1, toIndex: 0)
+        if shutdownBeforeExecution { manager.beginTermination() }
+        await manager.waitForNavigation()
+        #expect(manager.engine.activeTabID(on: "main") == (shutdownBeforeExecution ? first.id : target.id))
+    }
+
     @Test func rapidDisplayAndTabKeysKeepTheirAcceptedTargets() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -38,5 +57,6 @@ struct DisplayHotkeyIntegrationTests {
         #expect(manager.engine.activeTabID(on: "right") == right[1].id)
         focus = .init(pid: 200, displayID: "left")
         #expect(manager.selectedDisplayID() == "left", "未登録アプリの手動フォーカスへ追従する")
+        #expect(manager.displayFocusUnavailable == nil, "手動フォーカス後に過去の警告を持ち越さない")
     }
 }

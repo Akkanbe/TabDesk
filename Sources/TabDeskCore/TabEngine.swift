@@ -899,10 +899,7 @@ public final class TabEngine {
             try rejectIfShuttingDown()
             guard layout.display(id: displayID) != nil,
                   let tabID = activeTabID(on: displayID), let tab = state.tab(withID: tabID) else { return false }
-            var candidates = tab.windows
-            if let last = tab.lastFocusedWindowID, let index = candidates.firstIndex(where: { $0.id == last }) {
-                candidates.insert(candidates.remove(at: index), at: 0)
-            }
+            let candidates = focusCandidates(in: tab)
             let driver = self.driver
             for candidate in candidates {
                 guard let wid = candidate.windowID, let pid = candidate.pid,
@@ -912,7 +909,10 @@ public final class TabEngine {
                         try !driver.isMinimized(of: wid) && driver.isFullscreen(of: wid) == false
                     }
                     guard available, layout.display(id: displayID) != nil,
-                          state.managedWindow(forWindowID: wid)?.window.id == candidate.id else { continue }
+                          let current = state.managedWindow(forWindowID: wid),
+                          current.tab.id == tabID, current.window.id == candidate.id, current.window.pid == pid,
+                          !parkedWindowIDs.contains(candidate.id), !fullscreenWindowIDs.contains(candidate.id)
+                    else { continue }
                     try rejectIfShuttingDown()
                     activateApplication?(pid, displayID)
                     try await executor.run { try driver.raise(wid) }
@@ -2034,7 +2034,18 @@ public final class TabEngine {
     // MARK: - 内部ヘルパー
 
     private func focusTargetPID(in tab: Tab) -> pid_t? {
-        tab.representativeWindow?.pid
+        focusCandidates(in: tab).first?.pid
+    }
+
+    /// 復元に失敗して退避先に残った窓を、入力先として前面化しない。
+    private func focusCandidates(in tab: Tab) -> [ManagedWindow] {
+        var candidates = tab.windows.filter {
+            $0.isBound && !parkedWindowIDs.contains($0.id) && !fullscreenWindowIDs.contains($0.id)
+        }
+        if let last = tab.lastFocusedWindowID, let index = candidates.firstIndex(where: { $0.id == last }) {
+            candidates.insert(candidates.remove(at: index), at: 0)
+        }
+        return candidates
     }
 
     private func removeFromState(_ id: UUID) {

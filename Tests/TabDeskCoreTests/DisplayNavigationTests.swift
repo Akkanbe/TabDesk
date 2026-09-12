@@ -54,6 +54,38 @@ struct DisplayNavigationTests {
 
 @MainActor
 struct DisplayWindowFocusTests {
+    @Test(arguments: [false, true])
+    func failedRestorationDoesNotFocusAParkedWindow(hasVisibleAlternative: Bool) async throws {
+        let driver = FakeWindowDriver()
+        let engine = TabEngine(driver: driver, layout: FixedScreenLayout(displays: [display("main", x: 0)]))
+        let target = engine.createTab(name: "Target", on: "main")
+        let other = engine.createTab(name: "Other", on: "main")
+        let frame = CGRect(x: 100, y: 100, width: 300, height: 200)
+        driver.add(1, frame: frame)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: WindowIdentity(
+            bundleID: "test", appName: "Test", title: "Test", registeredSize: frame.size), frame: frame, into: target.id)
+        if hasVisibleAlternative {
+            driver.add(2, frame: frame)
+            _ = try await engine.register(windowID: 2, pid: 200, identity: WindowIdentity(
+                bundleID: "test.other", appName: "Other", title: "Other", registeredSize: frame.size), frame: frame, into: target.id)
+        }
+        engine.noteWindowFocused(windowID: 1)
+        try await engine.activate(other.id)
+        driver.setFailWrites(1)
+        var activatedPIDs: [pid_t] = []
+        engine.activateApplication = { pid, _ in activatedPIDs.append(pid) }
+        let report = try await engine.activate(target.id)
+        #expect(!report.failures.isEmpty)
+        #expect(engine.parkedWindowIDs.contains(managed.id))
+        #expect(activatedPIDs == (hasVisibleAlternative ? [200] : []))
+        driver.setFailWrites(1, false)
+        activatedPIDs.removeAll()
+        let before = driver.callLog().count
+        #expect(try await engine.focusActiveWindow(on: "main") == hasVisibleAlternative)
+        #expect(activatedPIDs == (hasVisibleAlternative ? [200] : []))
+        #expect(!driver.callLog().dropFirst(before).contains("raise:1"))
+    }
+
     @Test func focusPreservesLayoutAndSkipsUnavailableWindows() async throws {
         let driver = FakeWindowDriver()
         let engine = TabEngine(driver: driver, layout: FixedScreenLayout(displays: [display("left", x: 0), display("right", x: 1000)]))
