@@ -15,7 +15,8 @@ final class WindowManager {
     /// v4: 各画面のコンテンツ領域は「共有幅 or その画面の折りたたみ 16px」を都度読む。
     /// SidebarMetrics の実体は UserDefaults(スレッドセーフ・register は冪等)なので、
     /// MainActor 外のプロバイダ呼び出しでも毎回生成してよい。
-    let layout = SystemScreenLayout(sidebarWidth: { SidebarMetrics(displayID: $0).effectiveWidth })
+    let layout: any ScreenLayout
+    private let displayFocusProvider: (() -> DisplayNavigation.Focus)?
     func sidebarMetrics(for displayID: DisplayID) -> SidebarMetrics {
         SidebarMetrics(displayID: displayID)
     }
@@ -129,8 +130,12 @@ final class WindowManager {
     init(
         logger: FileLogger,
         store: StateStore = StateStore(fileURL: StateStore.defaultURL(appName: "TabDesk")),
-        monitoringEnabled: Bool = true
+        monitoringEnabled: Bool = true,
+        layout: any ScreenLayout = SystemScreenLayout(sidebarWidth: { SidebarMetrics(displayID: $0).effectiveWidth }),
+        displayFocusProvider: (() -> DisplayNavigation.Focus)? = nil
     ) {
+        self.layout = layout
+        self.displayFocusProvider = displayFocusProvider
         self.logger = logger
         self.store = store
         var initial = WorkspaceState()
@@ -177,7 +182,7 @@ final class WindowManager {
             if self.suppressAppActivation?() == true { return }
             // v4: 切替した画面が「選択中の画面」のときだけ前面化する。別画面のサイドバークリックや
             // URL 起点の切替が、いま作業中の画面からキーボードフォーカスを奪わない。
-            guard displayID == nil || displayID == self.selectedDisplayID() else { return }
+            guard displayID == nil || displayID == (self.executingDisplayID ?? self.selectedDisplayID()) else { return }
             NSRunningApplication(processIdentifier: pid)?.activate()
         }
 
@@ -469,7 +474,7 @@ final class WindowManager {
     }
 
     private func schedulePendingFocusFollow() {
-        guard focusSwitchDepth == 0, let windowID = pendingFocusedWindowID, !isTerminating else { return }
+        guard pendingNavigationCount == 0, focusSwitchDepth == 0, let windowID = pendingFocusedWindowID, !isTerminating else { return }
         focusFollowTask?.cancel()
         let generation = focusGeneration
         focusFollowTask = Task { [weak self] in
@@ -495,7 +500,7 @@ final class WindowManager {
             let pid = found.window.pid,
             NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
         else { return }
-        guard focusSwitchDepth == 0 else {
+        guard pendingNavigationCount == 0, focusSwitchDepth == 0 else {
             deferToPostSwitch = true
             focusFollowTask = nil
             return
@@ -509,7 +514,7 @@ final class WindowManager {
             !isTabItsDisplaysActive(current.tab)
         else { return }
         // AX 再確認の await 中にユーザーの切替が始まっていたら、それを上書きせず保留に回す。
-        guard focusSwitchDepth == 0 else {
+        guard pendingNavigationCount == 0, focusSwitchDepth == 0 else {
             deferToPostSwitch = true
             focusFollowTask = nil
             return
@@ -553,22 +558,105 @@ final class WindowManager {
 
     // MARK: - 選択中のディスプレイ(v4 段階 4)
 
+    var onDisplaySelectionChanged: (() -> Void)?
+    private var displayNavigation = DisplayNavigation()
+    private var navigationTask: Task<Void, Never>?
+    private var pendingNavigationCount = 0
+    private var executingDisplayID: DisplayID?
+    private(set) var displayFocusUnavailable: DisplayID?
+
+    private func currentDisplayFocus() -> DisplayNavigation.Focus {
+        if let displayFocusProvider { return displayFocusProvider() }
+        let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let window = pid.flatMap { pid in
+            pid == getpid() ? nil : WindowEnumerator.frontmostWindow(of: pid)
+        }
+        return .init(pid: pid, displayID: window.flatMap { layout.display(containing: $0.frame)?.id },
+            windowID: window?.id)
+    }
+
+    /// 受付時に操作先を確定し、AX完了を待たず次のキーへ引き継ぐ。
+    func navigate(_ action: HotkeyAction) {
+        guard !isTerminating else { return }
+        let current = selectedDisplayID()
+        let displayID: DisplayID
+        switch action {
+        case .nextDisplay, .previousDisplay:
+            guard let next = DisplayNavigation.adjacent(to: current,
+                offset: action == .nextDisplay ? 1 : -1, displays: layout.displays) else { return }
+            displayID = next
+        case .activateTab, .nextTab, .previousTab:
+            guard let current else { return }
+            displayID = current
+        default: return
+        }
+        if case .activateTab(let number) = action {
+            let tabs = engine.state.tabs(on: displayID, primaryID: layout.primaryDisplay?.id)
+            guard tabs.indices.contains(number - 1) else { return }
+        }
+        displayNavigation.select(displayID, focus: currentDisplayFocus())
+        displayFocusUnavailable = nil
+        let previous = navigationTask
+        pendingNavigationCount += 1
+        onDisplaySelectionChanged?()
+        navigationTask = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            defer {
+                pendingNavigationCount -= 1
+                executingDisplayID = nil
+                if pendingNavigationCount == 0 {
+                    navigationTask = nil
+                    displayNavigation.completed(focus: currentDisplayFocus())
+                    schedulePendingFocusFollow()
+                }
+                onDisplaySelectionChanged?()
+            }
+            guard !isTerminating, layout.display(id: displayID) != nil else { return }
+            executingDisplayID = displayID
+            do {
+                try await performFocusSwitch {
+                    switch action {
+                    case .nextTab, .previousTab:
+                        return try await engine.activateAdjacent(offset: action == .nextTab ? 1 : -1, on: displayID)
+                    case .activateTab(let number):
+                        let tabs = engine.state.tabs(on: displayID, primaryID: layout.primaryDisplay?.id)
+                        guard tabs.indices.contains(number - 1) else { return nil }
+                        return try await engine.activate(tabs[number - 1].id)
+                    default: return nil
+                    }
+                }
+                // 同じタブを指定した場合も入力先を戻す。空タブでは選択だけを維持する。
+                let focused = try await engine.focusActiveWindow(on: displayID)
+                if displayNavigation.selectedID == displayID {
+                    displayFocusUnavailable = focused ? nil : displayID
+                }
+            } catch {
+                logger.log("hotkey navigation failed: \(error)")
+                if displayNavigation.selectedID == displayID { displayFocusUnavailable = displayID }
+            }
+        }
+    }
+
+    func waitForNavigation() async { await navigationTask?.value }
+
     private var lastFocusedDisplay: (pid: pid_t, displayID: DisplayID)?
 
     /// ホットキーが作用する画面。フォーカス窓の画面 → マウスカーソルの画面 → 主、の順で解決。
     func selectedDisplayID() -> DisplayID? {
-        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        let frontmostWindowDisplayID = frontmostPID.flatMap { pid -> DisplayID? in
-            guard pid != getpid(), let frame = WindowEnumerator.frontmostWindowFrame(of: pid) else { return nil }
-            return layout.display(containing: frame)?.id
-        }
-        return SelectedDisplayResolver.resolve(
+        let observed = currentDisplayFocus()
+        let frontmostPID = observed.pid
+        let frontmostWindowDisplayID = observed.displayID
+        let fallback = SelectedDisplayResolver.resolve(
             frontmostPID: frontmostPID,
             ownPID: getpid(),
             cached: lastFocusedDisplay,
             frontmostWindowDisplayID: frontmostWindowDisplayID,
             mousePointAX: ScreenGeometry.axRect(fromCocoa: CGRect(origin: NSEvent.mouseLocation, size: .zero)).origin,
             layout: layout)
+        // TabDeskの設定画面への移動だけでは明示選択を解除しない。
+        return displayNavigation.resolve(fallback: fallback, focus: observed, displays: layout.displays,
+            busy: pendingNavigationCount > 0 || frontmostPID == getpid())
     }
 
     /// タブが自分の画面のアクティブか(フォーカス連動の判定用)。

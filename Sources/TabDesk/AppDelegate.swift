@@ -92,33 +92,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return }
             guard self.hotkeySettings?.window?.isKeyWindow != true else { return }
             switch action {
-            case .activateTab(let number):
-                // v4: 「選択中のディスプレイ」の n 番目のタブ(フォーカス窓の画面 → マウスの画面)。
-                guard let displayID = self.manager.selectedDisplayID() else { return }
-                let tabs = self.manager.engine.state.tabs(
-                    on: displayID, primaryID: self.manager.layout.primaryDisplay?.id)
-                guard tabs.indices.contains(number - 1) else { return }
-                let tabID = tabs[number - 1].id
-                Task { [weak self] in
-                    guard let self else { return }
-                    do {
-                        try await self.manager.activate(tabID)
-                    } catch {
-                        self.logger.log("hotkey activate failed: \(error)")
-                    }
-                }
-            case .nextTab, .previousTab:
-                // ブラウザ風のタブ順送り(末尾/先頭で回る)。ターゲットの解決はエンジンの直列区間内で
-                // 行う(ここで先に計算すると、切替中の連打が古い activeTabID から同じタブを選んでしまう)。
-                let offset = action == .nextTab ? 1 : -1
-                Task { [weak self] in
-                    guard let self else { return }
-                    do {
-                        try await self.manager.activateAdjacent(offset: offset)
-                    } catch {
-                        self.logger.log("hotkey cycle failed: \(error)")
-                    }
-                }
+            case .activateTab, .nextTab, .previousTab, .nextDisplay, .previousDisplay:
+                self.manager.navigate(action)
             case .registerFocusedWindow:
                 Task { [manager = self.manager] in await manager.registerFocusedWindow() }
             case .toggleEditMode:

@@ -893,6 +893,39 @@ public final class TabEngine {
             operationCount: ops.count, durationMs: elapsed, failures: failures)
     }
 
+    /// 画面切替では配置を再適用せず、選択中タブの入力先だけを戻す。
+    public func focusActiveWindow(on displayID: DisplayID) async throws -> Bool {
+        try await serialized {
+            try rejectIfShuttingDown()
+            guard layout.display(id: displayID) != nil,
+                  let tabID = activeTabID(on: displayID), let tab = state.tab(withID: tabID) else { return false }
+            var candidates = tab.windows
+            if let last = tab.lastFocusedWindowID, let index = candidates.firstIndex(where: { $0.id == last }) {
+                candidates.insert(candidates.remove(at: index), at: 0)
+            }
+            let driver = self.driver
+            for candidate in candidates {
+                guard let wid = candidate.windowID, let pid = candidate.pid,
+                      !fullscreenWindowIDs.contains(candidate.id) else { continue }
+                do {
+                    let available = try await executor.run {
+                        try !driver.isMinimized(of: wid) && driver.isFullscreen(of: wid) == false
+                    }
+                    guard available, layout.display(id: displayID) != nil,
+                          state.managedWindow(forWindowID: wid)?.window.id == candidate.id else { continue }
+                    try rejectIfShuttingDown()
+                    activateApplication?(pid, displayID)
+                    try await executor.run { try driver.raise(wid) }
+                    return true
+                } catch {
+                    log("display focus failed for \(wid): \(error)")
+                    try rejectIfShuttingDown()
+                }
+            }
+            return false
+        }
+    }
+
     // MARK: - レイアウトの再適用
 
     /// ディスプレイ構成の変更・スリープ/ロック解除のあとに呼ぶ。

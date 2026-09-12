@@ -24,6 +24,10 @@ public enum L10n {
     public static var language: AppLanguage { languageOverride ?? LanguagePreference().value }
 
     public enum Key: String, CaseIterable, Sendable {
+        case nextDisplay
+        case previousDisplay
+        case selectedDisplay
+        case displayFocusUnavailable
         case layoutTiled
         case duplicateTileLayout
         case copiedTabName

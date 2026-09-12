@@ -363,6 +363,15 @@ final class SidebarPanel: NSPanel {
     /// 改名ダイアログを表示中か(この間は切替先アプリの前面化を抑止する)。
     private(set) var isRenaming = false
 
+    func refreshDisplaySelection(selected: Bool) {
+        contentView?.wantsLayer = true
+        contentView?.layer?.borderWidth = selected ? 2 : 0
+        contentView?.layer?.borderColor = (manager.displayFocusUnavailable == displayID
+            ? NSColor.systemOrange : NSColor.controlAccentColor).cgColor
+        contentView?.toolTip = selected ? L10n.text(manager.displayFocusUnavailable == displayID
+            ? .displayFocusUnavailable : .selectedDisplay) : nil
+    }
+
     func render() {
         let state = manager.engine.state
         for (id, editor) in tileEditors where state.tab(withID: id) == nil {

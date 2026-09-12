@@ -14,6 +14,7 @@ public protocol WindowDriver: Sendable {
     @discardableResult
     func setFrame(_ frame: CGRect, of windowID: CGWindowID) throws -> CGRect
     func setPosition(_ point: CGPoint, of windowID: CGWindowID) throws
+    func isMinimized(of windowID: CGWindowID) throws -> Bool
     func raise(_ windowID: CGWindowID) throws
     /// ネイティブフルスクリーン中か(v3 段階 2)。ウィンドウが消えていれば throw。
     /// **nil = 判定不能**(属性が読めない・タイムアウト)。呼び手は nil を「前回の判定を維持」と
@@ -27,6 +28,7 @@ public protocol WindowDriver: Sendable {
 public enum WindowReleaseStatus: Sendable { case ready, closed }
 
 extension WindowDriver {
+    public func isMinimized(of windowID: CGWindowID) throws -> Bool { false }
     public func prepareForRelease(of windowID: CGWindowID) throws -> WindowReleaseStatus { .ready }
 }
 
@@ -84,6 +86,10 @@ public final class AXWindowDriver: WindowDriver {
 
     public func setPosition(_ point: CGPoint, of windowID: CGWindowID) throws {
         try window(windowID).setPosition(point)
+    }
+
+    public func isMinimized(of windowID: CGWindowID) throws -> Bool {
+        try AXAttributes.bool(window(windowID).element, kAXMinimizedAttribute)
     }
 
     public func raise(_ windowID: CGWindowID) throws {

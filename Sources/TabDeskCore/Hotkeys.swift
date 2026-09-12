@@ -124,6 +124,8 @@ public enum HotkeyAction: Sendable, Hashable {
     case activateTab(Int)
     /// 次のタブへ(末尾なら先頭へ回る)。
     case nextTab
+    case nextDisplay
+    case previousDisplay
     /// 前のタブへ(先頭なら末尾へ回る)。
     case previousTab
     case registerFocusedWindow
@@ -135,9 +137,11 @@ public enum HotkeyAction: Sendable, Hashable {
 /// hotkeys.json の中身。ユーザーが手で編集できるよう、キーは "ctrl+alt+1" 形式の文字列で持つ。
 public struct HotkeyConfig: Codable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
-        case activateTab, nextTab, previousTab, registerFocusedWindow, toggleEditMode, toggleSidebar
+        case activateTab, nextTab, previousTab, registerFocusedWindow, toggleEditMode, toggleSidebar, nextDisplay, previousDisplay
     }
     public var activateTab: [String]
+    public var nextDisplay: String?
+    public var previousDisplay: String?
     public var nextTab: String?
     public var previousTab: String?
     public var registerFocusedWindow: String?
@@ -146,8 +150,11 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
 
     public init(
         activateTab: [String], nextTab: String?, previousTab: String?,
-        registerFocusedWindow: String?, toggleEditMode: String?, toggleSidebar: String?
+        registerFocusedWindow: String?, toggleEditMode: String?, toggleSidebar: String?,
+        nextDisplay: String? = nil, previousDisplay: String? = nil
     ) {
+        self.nextDisplay = nextDisplay
+        self.previousDisplay = previousDisplay
         self.activateTab = activateTab
         self.nextTab = nextTab
         self.previousTab = previousTab
@@ -162,12 +169,15 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
         previousTab: "ctrl+shift+tab",
         registerFocusedWindow: "ctrl+alt+r",
         toggleEditMode: "ctrl+alt+e",
-        toggleSidebar: "ctrl+alt+s")
+        toggleSidebar: "ctrl+alt+s",
+        nextDisplay: "ctrl+alt+right", previousDisplay: "ctrl+alt+left")
 
     /// 古い hotkeys.json(キーが無い)は既定値で補い、明示的に null が書かれていれば「割り当てなし」と解釈する。
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = HotkeyConfig.default
+        nextDisplay = c.contains(.nextDisplay) ? try c.decodeIfPresent(String.self, forKey: .nextDisplay) : d.nextDisplay
+        previousDisplay = c.contains(.previousDisplay) ? try c.decodeIfPresent(String.self, forKey: .previousDisplay) : d.previousDisplay
         activateTab = try c.decodeIfPresent([String].self, forKey: .activateTab) ?? d.activateTab
         nextTab = c.contains(.nextTab) ? try c.decodeIfPresent(String.self, forKey: .nextTab) : d.nextTab
         previousTab = c.contains(.previousTab) ? try c.decodeIfPresent(String.self, forKey: .previousTab) : d.previousTab
@@ -181,6 +191,8 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(nextDisplay, forKey: .nextDisplay)
+        try c.encode(previousDisplay, forKey: .previousDisplay)
         try c.encode(activateTab, forKey: .activateTab)
         // nil を省略すると、次回読み込みで「旧設定に存在しないキー」として既定値に戻ってしまう。
         try c.encode(nextTab, forKey: .nextTab)
@@ -220,6 +232,8 @@ public struct HotkeyConfig: Codable, Sendable, Equatable {
         if let spec = registerFocusedWindow { add(spec, .registerFocusedWindow, label: "registerFocusedWindow") }
         if let spec = toggleEditMode { add(spec, .toggleEditMode, label: "toggleEditMode") }
         if let spec = toggleSidebar { add(spec, .toggleSidebar, label: "toggleSidebar") }
+        if let spec = nextDisplay { add(spec, .nextDisplay, label: "nextDisplay") }
+        if let spec = previousDisplay { add(spec, .previousDisplay, label: "previousDisplay") }
         return (bindings, errors)
     }
 

@@ -58,7 +58,7 @@ struct HotkeyCycleConfigTests {
     @Test func defaultsIncludeTabCycling() {
         let (bindings, errors) = HotkeyConfig.default.resolve()
         #expect(errors.isEmpty)
-        #expect(bindings.count == 14)  // タブ 1..9 + next/prev + 登録 + 編集モード + サイドバー折りたたみ
+        #expect(bindings.count == 16)  // タブ 1..9 + next/prev + 登録 + 編集モード + サイドバー + 画面 next/prev
         #expect(bindings.contains { $0.1 == .nextTab })
         #expect(bindings.contains { $0.1 == .previousTab })
         #expect(bindings.contains { $0.1 == .toggleSidebar })
@@ -98,6 +98,6 @@ struct HotkeyCycleConfigTests {
         #expect(config.nextTab == nil, "explicit null means unassigned")
         #expect(config.previousTab == "ctrl+shift+tab")
         let (bindings, _) = config.resolve()
-        #expect(bindings.count == 3)  // activateTab 1 + previousTab + toggleSidebar(キー無し = 既定)
+        #expect(bindings.count == 5)  // activateTab 1 + previousTab + toggleSidebar + 画面 next/prev（キー無し = 既定）
     }
 }

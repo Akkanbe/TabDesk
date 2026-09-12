@@ -18,12 +18,14 @@ final class SidebarController: NSObject {
         self.manager = manager
         self.logger = logger
         super.init()
+        manager.onDisplaySelectionChanged = { [weak self] in self?.refreshDisplaySelection() }
         manager.onStateChanged = { [weak self] _ in self?.render() }
         manager.thumbnails.onUpdated = { [weak self] _ in self?.refreshThumbnailPresentation() }
         manager.addContentAreaObserver { [weak self] in self?.repositionAll() }
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.panels.values.forEach { $0.refreshPermissionBanners() }
+                self?.refreshDisplaySelection()
             }
         }
         NotificationCenter.default.addObserver(
@@ -73,7 +75,13 @@ final class SidebarController: NSObject {
         panels.values.forEach { $0.refreshLocalization() }
     }
 
+    private func refreshDisplaySelection() {
+        let selected = manager.selectedDisplayID()
+        for (id, panel) in panels { panel.refreshDisplaySelection(selected: id == selected) }
+    }
+
     func render() {
+        refreshDisplaySelection()
         panels.values.forEach { $0.render() }
     }
 

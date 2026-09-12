@@ -258,6 +258,11 @@ public enum WindowEnumerator {
     /// 前面から順に並ぶ CGWindowList から、指定アプリの最前面にある通常ウィンドウの frame を返す。
     /// AX IPC を伴わないため、ホットキーの同期経路でフォーカス画面を補完する用途に使える。
     public static func frontmostWindowFrame(of pid: pid_t) -> CGRect? {
+        frontmostWindow(of: pid)?.frame
+    }
+
+    /// 同一アプリ・同一画面内の窓切替も識別できるようIDを一緒に返す。
+    public static func frontmostWindow(of pid: pid_t) -> (id: CGWindowID, frame: CGRect)? {
         guard let list = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
         else { return nil }
@@ -265,10 +270,11 @@ public enum WindowEnumerator {
             guard (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
                 (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
                 let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
                 let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
                 !frame.isEmpty
             else { continue }
-            return frame
+            return (id, frame)
         }
         return nil
     }

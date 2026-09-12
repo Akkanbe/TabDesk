@@ -17,6 +17,7 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         /// 書き込み(setFrame / setPosition / raise)だけ失敗し、読み取りは通る(無応答アプリに近い)。
         var failWrites = false
         /// ネイティブフルスクリーン中。書き込みは黙って飲み込まれ、frame は変わらない(実機の挙動に最も近い)。
+        var minimized = false
         var fullscreen = false
         /// AXFullScreen の読み取りだけ失敗する(frame は読める)。忙しいアプリの属性タイムアウトを模す。
         var fullscreenReadFails = false
@@ -55,6 +56,10 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
 
     func setFailWrites(_ id: CGWindowID, _ value: Bool = true) {
         lock.withLock { windows[id]?.failWrites = value }
+    }
+
+    func setMinimized(_ id: CGWindowID, _ value: Bool = true) {
+        lock.withLock { windows[id]?.minimized = value }
     }
 
     func setFullscreen(_ id: CGWindowID, _ value: Bool = true) {
@@ -169,6 +174,10 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
 
     func isFullscreen(of windowID: CGWindowID) throws -> Bool? {
         try withWindow(windowID, "isFullscreen") { $0.fullscreenReadFails ? nil : $0.fullscreen }
+    }
+
+    func isMinimized(of windowID: CGWindowID) throws -> Bool {
+        try withWindow(windowID, "isMinimized") { $0.minimized }
     }
 
     func raise(_ windowID: CGWindowID) throws {

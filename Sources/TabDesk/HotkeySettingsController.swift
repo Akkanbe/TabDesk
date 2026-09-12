@@ -24,6 +24,7 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         (1...9).map { L10n.text(.activateTab, String($0)) } + [
             L10n.text(.nextTab), L10n.text(.previousTab), L10n.text(.registerFocused),
             L10n.text(.toggleEdit), L10n.text(.toggleSidebar),
+            L10n.text(.nextDisplay), L10n.text(.previousDisplay),
         ]
     }
 
@@ -97,6 +98,7 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         let values = tabs + Array(repeating: "", count: 9 - tabs.count) + [
             config.nextTab ?? "", config.previousTab ?? "", config.registerFocusedWindow ?? "",
             config.toggleEditMode ?? "", config.toggleSidebar ?? "",
+            config.nextDisplay ?? "", config.previousDisplay ?? "",
         ]
         for (field, value) in zip(fields, values) { field.specification = value }
     }
@@ -113,7 +115,8 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         let config = HotkeyConfig(
             activateTab: Array(values.prefix(9)) + extraTabBindings,
             nextTab: optional(9), previousTab: optional(10), registerFocusedWindow: optional(11),
-            toggleEditMode: optional(12), toggleSidebar: optional(13))
+            toggleEditMode: optional(12), toggleSidebar: optional(13),
+            nextDisplay: optional(14), previousDisplay: optional(15))
         guard config.resolve().errors.isEmpty else {
             showMessage(L10n.text(.hotkeyNotSaved) + config.resolve().errors.joined(separator: "\n"), error: true)
             return
@@ -276,7 +279,7 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
             return [label, controls]
         }
         let grid = NSGridView(views: rows)
-        grid.rowSpacing = 8
+        grid.rowSpacing = 4
         grid.columnSpacing = 18
         grid.column(at: 0).width = 190
         grid.rowAlignment = .firstBaseline
@@ -309,7 +312,7 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
         let stack = NSStackView(views: [help, grid, scroll, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 18
+        stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
         NSLayoutConstraint.activate([

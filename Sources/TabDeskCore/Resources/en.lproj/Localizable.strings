@@ -139,3 +139,8 @@
 "tileTabUnavailable" = "The tab was removed or switched out of Tiles layout.";
 "tileSuffix" = " — Tiles";
 "windowOperationFailed" = "Could Not Complete the Window Operation";
+
+"nextDisplay" = "Next Display";
+"previousDisplay" = "Previous Display";
+"selectedDisplay" = "Hotkey target";
+"displayFocusUnavailable" = "Cannot focus a window. Select another tab.";
