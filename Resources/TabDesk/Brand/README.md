@@ -4,6 +4,11 @@
 
 生成方法：Codexの組み込み image_gen ツール。
 
+アプリのビルド時に `scripts/build_icon.sh` がこのPNGから16〜1024pxの各サイズを作り、
+macOS標準の `sips` / `iconutil` で `TabDesk.icns` にまとめる。図案は変更しない。
+生成したICNSはアプリの `Contents/Resources/` に入り、`CFBundleIconFile` から参照する。
+生成物はビルド先に置き、元PNGと変換手順をリポジトリで管理する。
+
 メニューバーでは、縦タブとウィンドウの輪郭を18pt向けに描いた単色版を使う。
 描画は [StatusBarIcon.swift](../../../Sources/TabDesk/StatusBarIcon.swift) にあり、macOSのテンプレート画像として明暗に追従する。
 

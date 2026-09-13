@@ -6,7 +6,33 @@ macOS で他アプリのウィンドウを「タブ」として管理するユ�
 リポジトリ: https://github.com/Akkanbe/TabDesk
 仕様は [docs/01_spec.md](docs/01_spec.md) を参照。
 
-## 現在の状態: v4 実装済み(実機確認中)
+## はじめて使う方へ
+
+[利用ガイド](docs/user_guide.md)にインストール、権限、基本操作、更新・バックアップ、窓の復旧、アンインストールをまとめています。
+現在は初回公開に向けた準備中です。一般配布用の署名・公証と別のMacでの導入検証は未完了です。
+初回配布はApple Siliconを予定しています。宣言上の最低OSはmacOS 15ですが、正式な対応範囲は検証後に確定します。
+
+## 配布準備用ビルド（開発者向け）
+
+```bash
+./scripts/test.sh
+./scripts/prepare_release.sh
+```
+
+Apple SiliconのMac上でReleaseビルドを作り、毎回新しい `build/release-preparation/TabDesk.XXXXXX/` に
+アプリ、未公証と明記したZIP、SHA-256、ビルド情報、署名情報、利用ガイドを出力します。
+`build/TabDesk.app` やApplicationsの稼働版は入れ替えません。アプリの自動起動・公開・公証も行いません。
+ZIPの整合性は出力フォルダで `shasum -a 256 -c SHA256SUMS` により確認できます。
+署名は下記の開発用と同じ選択規則です。`CODESIGN_IDENTITY` で指定しても、このスクリプトでは公証しません。
+`build-info.txt` の `working_tree_dirty=true` は未コミット変更を含むことを示し、コミットIDだけでは再現できません。
+詳細な公開条件は [リリース計画](docs/19_release_plan.md)、今回の検証は [配布準備記録](docs/20_release_preparation.md) を参照してください。
+
+通常ビルドも、新しいアプリの組み立て・署名検証が成功してから配置します。
+置き換え前のアプリは出力先の `.assemble-*/previous-TabDesk.app`（PoCなら `previous-TabDeskPoC.app`）に残ります。
+これらの退避先と組み立て用アイコン素材は自動削除しません。不要になった時点でFinderの隠しファイル表示（Command + Shift + .）から整理できます。
+`APP_OUTPUT_DIR` を指定すると通常ビルドの出力先も変更できます。相対パスはリポジトリ基準です。
+
+## 開発用ビルド: v4 実装済み(実機確認中)
 
 フル Xcode は不要(Command Line Tools の Swift で足ります)。
 
