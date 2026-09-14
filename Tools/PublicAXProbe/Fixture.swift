@@ -6,13 +6,13 @@ import Foundation
 @MainActor
 struct PublicAXFixture {
     static func main() {
-        guard CommandLine.arguments.count == 2 else {
+        guard (2...3).contains(CommandLine.arguments.count) else {
             FileHandle.standardError.write(Data("Usage: PublicAXFixture <new or empty control directory>\n".utf8))
             exit(1)
         }
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
-        let delegate = Delegate(directory: URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true))
+        let delegate = Delegate(directory: URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true), navigation: CommandLine.arguments.last == "--navigation")
         app.delegate = delegate
         withExtendedLifetime(delegate) { app.run() }
     }
@@ -20,6 +20,8 @@ struct PublicAXFixture {
     @MainActor
     final class Delegate: NSObject, NSApplicationDelegate {
         let directory: URL
+        let navigation: Bool
+        var navigationWindows: [NSWindow] = []
         let previousApp = NSWorkspace.shared.frontmostApplication
         var first: NSWindow?
         var second: NSWindow?
@@ -27,13 +29,31 @@ struct PublicAXFixture {
         var lastCommand = ""
         var lastSnapshot = ""
 
-        init(directory: URL) { self.directory = directory }
+        init(directory: URL, navigation: Bool) { self.directory = directory; self.navigation = navigation }
 
         func applicationDidFinishLaunching(_ notification: Notification) {
             do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
             catch { fail(error) }
-            first = makeWindow()
-            second = makeWindow()
+            if navigation {
+                for (display, screen) in NSScreen.screens.enumerated() {
+                    for tab in 1...2 {
+                        let window = makeWindow()
+                        window.title = "TabDesk Navigation \(display + 1)-\(tab)"
+                        window.setFrameOrigin(CGPoint(x: screen.visibleFrame.minX + 280, y: screen.visibleFrame.minY + 180))
+                        let input = NSTextField(frame: CGRect(x: 30, y: 40, width: 430, height: 30))
+                        input.placeholderString = "ホットキー切替後の入力先確認"
+                        window.contentView?.addSubview(input)
+                        window.initialFirstResponder = input
+                        window.makeFirstResponder(input)
+                        navigationWindows.append(window)
+                    }
+                }
+                first = navigationWindows.first
+                second = navigationWindows.dropFirst().first
+            } else {
+                first = makeWindow()
+                second = makeWindow()
+            }
             first?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -66,9 +86,13 @@ struct PublicAXFixture {
                         execute(command.split(separator: ":", maxSplits: 1).last.map(String.init) ?? "")
                     }
                 }
-                let windows = [("a", first), ("b", second)].compactMap { label, window -> [String: Any]? in
+                let sources: [(String, NSWindow?)] = navigation
+                    ? navigationWindows.enumerated().map { ("n\($0.offset)", Optional($0.element)) }
+                    : [("a", first), ("b", second)]
+                let windows = sources.compactMap { label, window -> [String: Any]? in
                     guard let window else { return nil }
-                    return ["label": label, "number": window.windowNumber,
+                    return ["label": label, "title": window.title, "number": window.windowNumber,
+                            "input": (window.contentView?.subviews.compactMap { $0 as? NSTextField }.first { $0.isEditable })?.stringValue ?? "",
                             "frame": NSStringFromRect(window.frame), "fullscreen": window.styleMask.contains(.fullScreen),
                             "minimized": window.isMiniaturized, "key": window.isKeyWindow]
                 }
