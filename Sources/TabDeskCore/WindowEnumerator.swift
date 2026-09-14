@@ -9,12 +9,12 @@ public struct WindowRecord: Sendable {
     public let title: String
     public let frame: CGRect?
     public let isMinimized: Bool
-    /// 列挙時点の "AXFullScreen" 生値(nil = 属性なし)。判定には isFullscreen を使う。
-    public let fullscreenRaw: Bool?
+    /// 列挙時点の位置変更保留状態(nil = 判定不能)。登録にはfalseの確認が必要。
+    public let layoutSuspension: Bool?
 
     public init(
         window: AXWindow, appName: String, bundleID: String, title: String,
-        frame: CGRect?, isMinimized: Bool, fullscreenRaw: Bool? = nil
+        frame: CGRect?, isMinimized: Bool, layoutSuspension: Bool? = nil
     ) {
         self.window = window
         self.appName = appName
@@ -22,13 +22,13 @@ public struct WindowRecord: Sendable {
         self.title = title
         self.frame = frame
         self.isMinimized = isMinimized
-        self.fullscreenRaw = fullscreenRaw
+        self.layoutSuspension = layoutSuspension
     }
 
-    public var isFullscreen: Bool { fullscreenRaw ?? false }
+    public var isLayoutSuspended: Bool { layoutSuspension ?? true }
 }
 
-/// 列挙の内訳。「0 件」のときに権限なし・ウィンドウなし・私有関数の不調のどれかを切り分けるために残す。
+/// 列挙の内訳。「0 件」のときに権限なし・ウィンドウなし・AX参照の不調のどれかを切り分けるために残す。
 public struct EnumerationStats: Sendable, CustomStringConvertible {
     public var apps = 0
     /// kAXWindows が読めなかったアプリ(ウィンドウなし・無応答・権限なし)と AXError の内訳。
@@ -36,10 +36,10 @@ public struct EnumerationStats: Sendable, CustomStringConvertible {
     public var elements = 0
     public var nonStandard = 0
     /// ネイティブフルスクリーン中のため除外した標準ウィンドウ数(v2 段階 A)。
-    public var fullscreen = 0
+    public var layoutSuspended = 0
     /// 最小化中のため除外した標準ウィンドウ数(v2 段階 A)。
     public var minimized = 0
-    /// _AXUIElementGetWindow が失敗した要素数と AXError の内訳。
+    /// 公開AX参照を検証できなかった要素数とエラーの内訳。
     public var windowIDFailures: [String: Int] = [:]
     public var standard = 0
     /// 「どのアプリで」失敗したか(原因調査用)。
@@ -53,7 +53,7 @@ public struct EnumerationStats: Sendable, CustomStringConvertible {
             d.isEmpty ? "0" : d.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ",")
         }
         var s = "apps=\(apps) appFailures=[\(fmt(appFailures))] elements=\(elements) " +
-            "nonStandard=\(nonStandard) fullscreen=\(fullscreen) minimized=\(minimized) " +
+            "nonStandard=\(nonStandard) layoutSuspended=\(layoutSuspended) minimized=\(minimized) " +
             "windowIDFailures=[\(fmt(windowIDFailures))] standard=\(standard)"
         if !appFailureDetails.isEmpty { s += " appFailureDetails=\(appFailureDetails)" }
         if !windowIDFailureDetails.isEmpty { s += " windowIDFailureDetails=\(windowIDFailureDetails)" }
@@ -92,7 +92,7 @@ extension EnumerationStats {
         for (k, v) in other.appFailures { appFailures[k, default: 0] += v }
         elements += other.elements
         nonStandard += other.nonStandard
-        fullscreen += other.fullscreen
+        layoutSuspended += other.layoutSuspended
         minimized += other.minimized
         for (k, v) in other.windowIDFailures { windowIDFailures[k, default: 0] += v }
         standard += other.standard
@@ -162,14 +162,14 @@ public enum WindowEnumerator {
                 stats.nonStandard += 1
                 continue
             }
-            // フルスクリーン中は登録対象外(仕様 §3.3)。最小化中も除外する:
+            // 位置変更が可能と確認できた窓だけを登録対象にする。最小化中も除外する:
             // frame は書けても raise で復帰せず、登録しても切替時に現れない死にエントリになるため。
             // eligibility は 1 回のスナップショットで判定し、record にも同じ値を残す。
             // 二重に AX 読み取りすると、その間の状態遷移で「除外判定と record が矛盾」し得る。
-            let fullscreenRaw = window.fullscreenRaw
-            guard fullscreenRaw != true else {
-                stats.fullscreen += 1
-                stats.exclusionDetails.append("\(appName) [fullscreen]: \(window.title)")
+            let layoutSuspension = window.layoutSuspension
+            guard layoutSuspension == false else {
+                stats.layoutSuspended += 1
+                stats.exclusionDetails.append("\(appName) [layout suspended or unknown]: \(window.title)")
                 continue
             }
             let minimized = window.isMinimized
@@ -187,7 +187,7 @@ public enum WindowEnumerator {
                     title: window.title,
                     frame: try? window.frame(),
                     isMinimized: minimized,
-                    fullscreenRaw: fullscreenRaw
+                    layoutSuspension: layoutSuspension
                 )
             )
         }
@@ -242,15 +242,15 @@ public enum WindowEnumerator {
         return (records, stats)
     }
 
-    /// CGWindowList 側から見た画面上のウィンドウ ID(_AXUIElementGetWindow の答え合わせ用)。
+    /// CGWindowList側から見た画面上の窓番号。画面変化の検出用。
     /// 最小化・別 Space の窓は含まない。アクティブなネイティブフルスクリーン窓は含まれ得るため、
     /// eligibility や fullscreen 解除検知には使わない。`TabEngine.reconcile` にも渡さないこと。
     public static func onScreenWindowIDs() -> Set<CGWindowID> {
         windowIDs(options: [.optionOnScreenOnly, .excludeDesktopElements])
     }
 
-    /// 存在する全ウィンドウの ID(最小化・別 Space・フルスクリーン中も含む)。`TabEngine.reconcile` に渡す用。
-    /// 列挙に失敗したときは空集合(reconcile 側は空集合なら削除しない)。
+    /// 存在する全ウィンドウのOS窓番号。新しい窓の出現検知だけに使い、AX参照の生存判定には使わない。
+    /// 列挙に失敗したときは空集合。登録の削除には使わない。
     public static func existingWindowIDs() -> Set<CGWindowID> {
         windowIDs(options: [.optionAll, .excludeDesktopElements])
     }

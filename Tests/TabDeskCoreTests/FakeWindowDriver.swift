@@ -29,50 +29,50 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var windows: [CGWindowID: Window] = [:]
+    private var windows: [WindowReferenceID: Window] = [:]
     private(set) var calls: [String] = []
     private var active = 0
     private(set) var maxConcurrent = 0
 
-    func add(_ id: CGWindowID, frame: CGRect, minSize: CGSize = .zero, delay: TimeInterval = 0) {
+    func add(_ id: WindowReferenceID, frame: CGRect, minSize: CGSize = .zero, delay: TimeInterval = 0) {
         lock.withLock { windows[id] = Window(frame: frame, minSize: minSize, delay: delay) }
     }
 
-    func kill(_ id: CGWindowID) {
+    func kill(_ id: WindowReferenceID) {
         lock.withLock { windows[id]?.alive = false }
     }
 
-    func revive(_ id: CGWindowID) {
+    func revive(_ id: WindowReferenceID) {
         lock.withLock { windows[id]?.alive = true }
     }
 
-    func setRaiseFails(_ id: CGWindowID, _ value: Bool = true) {
+    func setRaiseFails(_ id: WindowReferenceID, _ value: Bool = true) {
         lock.withLock { windows[id]?.raiseFails = value }
     }
 
-    func setThrowAfterApply(_ id: CGWindowID, _ value: Bool = true) {
+    func setThrowAfterApply(_ id: WindowReferenceID, _ value: Bool = true) {
         lock.withLock { windows[id]?.throwAfterApply = value }
     }
 
-    func setFailWrites(_ id: CGWindowID, _ value: Bool = true) {
+    func setFailWrites(_ id: WindowReferenceID, _ value: Bool = true) {
         lock.withLock { windows[id]?.failWrites = value }
     }
 
-    func setMinimized(_ id: CGWindowID, _ value: Bool = true) {
+    func setMinimized(_ id: WindowReferenceID, _ value: Bool = true) {
         lock.withLock { windows[id]?.minimized = value }
     }
 
-    func setFullscreen(_ id: CGWindowID, _ value: Bool = true) {
+    func setFullscreen(_ id: WindowReferenceID, _ value: Bool = true) {
         lock.withLock { windows[id]?.fullscreen = value }
     }
 
-    func setFullscreenReadFails(_ id: CGWindowID, _ value: Bool = true) {
+    func setFullscreenReadFails(_ id: WindowReferenceID, _ value: Bool = true) {
         lock.withLock { windows[id]?.fullscreenReadFails = value }
     }
 
     struct SimulatedTimeout: Error {}
 
-    func configureRelease(_ id: CGWindowID, status: WindowReleaseStatus = .ready, fails: Bool = false, repairsWrites: Bool = false) {
+    func configureRelease(_ id: WindowReferenceID, status: WindowReleaseStatus = .ready, fails: Bool = false, repairsWrites: Bool = false) {
         lock.withLock {
             windows[id]?.releaseStatus = status
             windows[id]?.releasePreparationFails = fails
@@ -80,9 +80,9 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         }
     }
 
-    func prepareForRelease(of windowID: CGWindowID) throws -> WindowReleaseStatus {
+    func prepareForRelease(of windowID: WindowReferenceID) throws -> WindowReleaseStatus {
         try lock.withLock {
-            calls.append("prepareForRelease:\(windowID)")
+            calls.append("prepareForRelease:\(windowID.fixtureLabel)")
             guard let window = windows[windowID] else { throw WindowDriverError.unknownWindow(windowID) }
             if window.releasePreparationFails { throw SimulatedTimeout() }
             if window.refreshRepairsWrites { windows[windowID]?.failWrites = false }
@@ -90,11 +90,11 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         }
     }
 
-    func setMinSize(_ size: CGSize, of id: CGWindowID) {
+    func setMinSize(_ size: CGSize, of id: WindowReferenceID) {
         lock.withLock { windows[id]?.minSize = size }
     }
 
-    func ignoreReleasePosition(_ id: CGWindowID, alsoPositionWrites: Bool) {
+    func ignoreReleasePosition(_ id: WindowReferenceID, alsoPositionWrites: Bool) {
         lock.withLock {
             windows[id]?.ignoreFramePosition = true
             windows[id]?.ignorePosition = alsoPositionWrites
@@ -102,16 +102,16 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
     }
 
     /// 登録後に擬似 IPC 遅延を変える(登録は速く済ませ、特定の操作だけ遅くしたいテスト用)。
-    func setDelay(_ id: CGWindowID, _ value: TimeInterval) {
+    func setDelay(_ id: WindowReferenceID, _ value: TimeInterval) {
         lock.withLock { windows[id]?.delay = value }
     }
 
     /// ユーザー操作やアプリ自身の移動を模す(エンジンを経由しない frame 変更)。
-    func moveExternally(_ id: CGWindowID, to frame: CGRect) {
+    func moveExternally(_ id: WindowReferenceID, to frame: CGRect) {
         lock.withLock { windows[id]?.frame = frame }
     }
 
-    func currentFrame(_ id: CGWindowID) -> CGRect? {
+    func currentFrame(_ id: WindowReferenceID) -> CGRect? {
         lock.withLock { windows[id]?.frame }
     }
 
@@ -127,9 +127,9 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         lock.withLock { calls }
     }
 
-    private func withWindow<T>(_ id: CGWindowID, _ name: String, _ body: (inout Window) throws -> T) throws -> T {
+    private func withWindow<T>(_ id: WindowReferenceID, _ name: String, _ body: (inout Window) throws -> T) throws -> T {
         let delay: TimeInterval = lock.withLock {
-            calls.append("\(name):\(id)")
+            calls.append("\(name):\(id.fixtureLabel)")
             active += 1
             maxConcurrent = max(maxConcurrent, active)
             return windows[id]?.delay ?? 0
@@ -147,12 +147,12 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         }
     }
 
-    func frame(of windowID: CGWindowID) throws -> CGRect {
+    func frame(of windowID: WindowReferenceID) throws -> CGRect {
         try withWindow(windowID, "frame") { $0.frame }
     }
 
     @discardableResult
-    func setFrame(_ frame: CGRect, of windowID: CGWindowID) throws -> CGRect {
+    func setFrame(_ frame: CGRect, of windowID: WindowReferenceID) throws -> CGRect {
         try withWindow(windowID, "setFrame") { w in
             // フルスクリーン中は書き込みが黙って飲み込まれる(throw せず frame も変わらない)。
             // 修正前のエンジンはこれで「3 回試行 → フルスクリーン寸法を採用」に陥っていた。
@@ -165,22 +165,22 @@ final class FakeWindowDriver: WindowDriver, @unchecked Sendable {
         }
     }
 
-    func setPosition(_ point: CGPoint, of windowID: CGWindowID) throws {
+    func setPosition(_ point: CGPoint, of windowID: WindowReferenceID) throws {
         try withWindow(windowID, "setPosition") { w in
             if w.fullscreen || w.ignorePosition { return }
             w.frame.origin = point
         }
     }
 
-    func isFullscreen(of windowID: CGWindowID) throws -> Bool? {
-        try withWindow(windowID, "isFullscreen") { $0.fullscreenReadFails ? nil : $0.fullscreen }
+    func isLayoutSuspended(of windowID: WindowReferenceID) throws -> Bool? {
+        try withWindow(windowID, "isLayoutSuspended") { $0.fullscreenReadFails ? nil : $0.fullscreen }
     }
 
-    func isMinimized(of windowID: CGWindowID) throws -> Bool {
+    func isMinimized(of windowID: WindowReferenceID) throws -> Bool {
         try withWindow(windowID, "isMinimized") { $0.minimized }
     }
 
-    func raise(_ windowID: CGWindowID) throws {
+    func raise(_ windowID: WindowReferenceID) throws {
         try withWindow(windowID, "raise") { w in
             if w.raiseFails { throw SimulatedTimeout() }
         }

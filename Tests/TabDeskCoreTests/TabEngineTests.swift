@@ -194,12 +194,12 @@ struct SwitchingTests {
         let a = engine.createTab(name: "A")
         let b = engine.createTab(name: "B")
         // 3 つの別アプリがそれぞれ 150ms かかる。直列なら 450ms 以上、並列なら 300ms 未満で終わる。
-        for id: CGWindowID in [1, 2, 3] {
+        for id: WindowReferenceID in [1, 2, 3] {
             driver.add(id, frame: content, delay: 0.15)
         }
         driver.add(9, frame: content)
-        for id: CGWindowID in [1, 2, 3] {
-            try await engine.register(windowID: id, pid: pid_t(id * 100), identity: identity("app\(id)"), frame: content, into: a.id)
+        for id: WindowReferenceID in [1, 2, 3] {
+            try await engine.register(windowID: id, pid: pid_t(id.fixtureNumber * 100), identity: identity("app\(id)"), frame: content, into: a.id)
         }
         try await engine.register(windowID: 9, pid: 900, identity: identity("b"), frame: content, into: b.id)
 
@@ -325,7 +325,7 @@ struct ConcurrencyTests {
         let a = engine.createTab(name: "A")
         let b = engine.createTab(name: "B")
         let c = engine.createTab(name: "C")
-        for id: CGWindowID in [1, 2, 3] {
+        for id: WindowReferenceID in [1, 2, 3] {
             driver.add(id, frame: content, delay: 0.03)
         }
         try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: content, into: a.id)
@@ -805,8 +805,8 @@ struct WindowMatcherTests {
             windowID: nil, pid: nil)
     }
 
-    private func cand(_ id: CGWindowID, _ app: String, title: String, size: CGSize = CGSize(width: 800, height: 600)) -> WindowMatcher.Candidate {
-        WindowMatcher.Candidate(windowID: id, pid: pid_t(id), bundleID: "test.\(app)", title: title, size: size)
+    private func cand(_ id: WindowReferenceID, _ app: String, title: String, size: CGSize = CGSize(width: 800, height: 600)) -> WindowMatcher.Candidate {
+        WindowMatcher.Candidate(windowID: id, pid: pid_t(id.fixtureNumber), bundleID: "test.\(app)", title: title, size: size)
     }
 
     @Test func exactTitleWins() {

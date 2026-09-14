@@ -1,3 +1,4 @@
+import ApplicationServices
 import CoreGraphics
 import Foundation
 import Testing
@@ -55,7 +56,7 @@ struct ReleaseReferenceTests {
         let window = try await engine.register(windowID: 1, pid: 100,
                                                identity: WindowIdentity(bundleID: "test", appName: "Test", title: "Test", registeredSize: frame.size),
                                                frame: frame, into: tab.id)
-        driver.configureRelease(1, status: closed ? .closed : .ready, fails: !closed)
+        driver.configureRelease(1, status: closed ? .invalidated : .ready, fails: !closed)
         driver.setFailWrites(1)
         let writes = driver.callCount("setFrame")
         await engine.releaseAllParkedWindows()
@@ -66,13 +67,14 @@ struct ReleaseReferenceTests {
         if closed { #expect(driver.callCount("setFrame") == writes) }
     }
 
-    @Test func missingAXReferenceRequiresWindowServerConfirmation() {
-        #expect(!AXWindowDriver.confirmedClosed(windowID: 1, pid: 100, windowInfo: nil))
-        #expect(!AXWindowDriver.confirmedClosed(windowID: 1, pid: 100, windowInfo: [[kCGWindowNumber as String: NSNumber(value: 1)]]))
-        #expect(!AXWindowDriver.confirmedClosed(windowID: 1, pid: 100, windowInfo: [
-            [kCGWindowNumber as String: NSNumber(value: 1), kCGWindowOwnerPID as String: NSNumber(value: 100)]]))
-        #expect(AXWindowDriver.confirmedClosed(windowID: 1, pid: 100, windowInfo: []))
-        #expect(AXWindowDriver.confirmedClosed(windowID: 1, pid: 100, windowInfo: [
-            [kCGWindowNumber as String: NSNumber(value: 1), kCGWindowOwnerPID as String: NSNumber(value: 200)]]))
+    @Test(arguments: [AXError.cannotComplete, .failure, .apiDisabled, .invalidUIElement])
+    func missingAXListNeverConfirmsInvalidation(error: AXError) {
+        #expect(WindowReferenceStatus.evaluate(roleError: error, presentInCompleteList: nil) == .unknown)
+    }
+
+    @Test func invalidReferenceRequiresIndependentSuccessfulList() {
+        #expect(WindowReferenceStatus.evaluate(roleError: .invalidUIElement, presentInCompleteList: true) == .unknown)
+        #expect(WindowReferenceStatus.evaluate(roleError: .cannotComplete, presentInCompleteList: false) == .unknown)
+        #expect(WindowReferenceStatus.evaluate(roleError: .invalidUIElement, presentInCompleteList: false) == .invalidated)
     }
 }

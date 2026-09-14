@@ -431,7 +431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 .sorted()
             logger.log("status: trusted=\(manager.isTrusted) tabs=\(s.tabs.map { "\($0.name)(\($0.windows.count))" }) " +
                 "actives=\(actives) parked=\(engine.parkedWindowIDs.count) unbound=\(unbound.count) " +
-                "fullscreen=\(engine.fullscreenWindowIDs.count) edit=\(engine.editMode) state=\(manager.store.fileURL.path)")
+                "layoutSuspended=\(engine.layoutSuspendedWindowIDs.count) edit=\(engine.editMode) state=\(manager.store.fileURL.path)")
             for w in unbound {
                 logger.log("  unbound: \(w.identity.appName) | \(w.identity.title) id=\(w.id)")
             }
@@ -439,8 +439,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // fs / min は除外実装の実測用に生値を出す(fs=nil は属性なし。docs/04_v2_design.md)。
             Task { [manager, logger] in
                 for record in await manager.availableWindows() {
-                    logger.log("  wid=\(record.window.windowID) pid=\(record.window.pid) " +
-                        "fs=\(record.fullscreenRaw.map(String.init) ?? "nil") min=\(record.isMinimized) " +
+                    logger.log("  ref=\(record.window.windowID) pid=\(record.window.pid) " +
+                        "layoutSuspended=\(record.layoutSuspension.map(String.init) ?? "nil") min=\(record.isMinimized) " +
                         "\(record.appName) | \(record.title)")
                 }
             }
@@ -462,13 +462,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 engine.createTab(on: displayID)
             }
         case "add":
-            guard let wid = CGWindowID(q["wid"] ?? ""), let target = tab(named: q["tab"]) else {
-                logger.log("url: add needs wid=<available window id> [&tab=name]")
+            let reference = WindowReferenceID(uuidString: q["ref"] ?? "")
+            let number = CGWindowID(q["wid"] ?? "")
+            guard (reference != nil || number != nil), let target = tab(named: q["tab"]) else {
+                logger.log("url: add needs ref=<runtime UUID> or wid=<OS window number> [&tab=name]")
                 return
             }
             Task { [manager, logger] in
-                guard let record = await manager.availableWindows().first(where: { $0.window.windowID == wid }) else {
-                    logger.log("url: add: wid \(wid) is not an available window")
+                let records = await manager.availableWindows()
+                let matches = await BlockingExecutor().run {
+                    records.filter { record in
+                        if let reference { return record.window.windowID == reference }
+                        return WindowServerMatch.windowNumber(for: record.window) == number
+                    }
+                }
+                guard matches.count == 1, let record = matches.first else {
+                    logger.log("url: add: target unavailable or ambiguous; use ref from windows")
                     return
                 }
                 do { try await manager.register(record, into: target.id) } catch { logger.log("add failed: \(error)") }
@@ -482,11 +491,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 do { try await manager.activate(target.id) } catch { logger.log("activate failed: \(error)") }
             }
         case "remove":
-            guard let wid = CGWindowID(q["wid"] ?? ""), let found = engine.state.managedWindow(forWindowID: wid) else {
-                logger.log("url: remove needs wid=<registered window id>")
+            let reference = WindowReferenceID(uuidString: q["ref"] ?? "")
+            let number = CGWindowID(q["wid"] ?? "")
+            guard reference != nil || number != nil else {
+                logger.log("url: remove needs ref=<runtime UUID> or wid=<OS window number>")
                 return
             }
             Task { [manager, logger] in
+                var matches: [WindowReferenceID] = []
+                if let reference { matches = [reference] }
+                else {
+                    for id in manager.engine.state.allWindows.compactMap(\.windowID) {
+                        if await manager.cgWindowID(for: id) == number { matches.append(id) }
+                    }
+                }
+                guard matches.count == 1, let id = matches.first,
+                      let found = manager.engine.state.managedWindow(forWindowID: id) else {
+                    logger.log("url: remove: target unavailable or ambiguous; use ref from dump")
+                    return
+                }
                 do { try await manager.unregister(found.window.id) } catch { logger.log("remove failed: \(error)") }
             }
         case "edit":
@@ -539,8 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for window in engine.state.allWindows {
                 guard let wid = window.windowID else { continue }
                 let ax = (try? manager.currentFrame(of: wid)).map { "\($0)" } ?? "?"
-                let cg = cgBounds(wid).map { "\($0)" } ?? "?"
-                logger.log("window \(window.identity.appName) wid=\(wid): recorded=\(window.frame) ax=\(ax) cg=\(cg) " +
+                logger.log("window \(window.identity.appName) ref=\(wid): recorded=\(window.frame) ax=\(ax) " +
                     "display=\(window.displayID ?? "primary")")
             }
         default:

@@ -1,5 +1,4 @@
 import AppKit
-import AXShim
 import TabDeskCore
 
 /// PoC の操作画面。ボタンはすべて PoCController のメソッドに 1 対 1 で対応する。
@@ -163,7 +162,7 @@ final class MainWindowController: NSObject, NSTableViewDataSource, NSTableViewDe
     private func updateStatus() {
         let trusted = controller.isTrusted
         statusLabel.stringValue = "Accessibility: \(trusted ? "許可済 ✅" : "未許可 ❌")   " +
-            "_AXUIElementGetWindow: \(AXShimIsAvailable() ? "利用可 ✅" : "なし ❌")"
+            "ウィンドウ識別: 公開Accessibility API"
         parallelCheck.state = controller.parallel ? .on : .off
         watchCheck.state = controller.watching ? .on : .off
         editCheck.state = controller.editMode ? .on : .off
@@ -183,7 +182,7 @@ final class MainWindowController: NSObject, NSTableViewDataSource, NSTableViewDe
         logView.scrollToEndOfDocument(nil)
     }
 
-    private var selectedWIDs: [CGWindowID] {
+    private var selectedWIDs: [WindowReferenceID] {
         table.selectedRowIndexes.compactMap { idx in
             idx < controller.records.count ? controller.records[idx].window.windowID : nil
         }

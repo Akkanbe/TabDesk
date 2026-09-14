@@ -35,13 +35,13 @@ final class ThumbnailStore {
     }
 
     /// タブの代表窓を非同期で撮影する(同じタブの前回の撮影が残っていれば置き換える)。
-    func capture(tabID: UUID, windowID: CGWindowID) {
+    func capture(tabID: UUID, pid: pid_t, resolve: @escaping @Sendable () async -> CGWindowID?) {
         guard Self.enabledSetting.value, Self.hasPermission else { return }
         captureTasks[tabID]?.task.cancel()
         let generation = UUID()
         let task = Task { [weak self] in
             guard let self else { return }
-            await self.performCapture(tabID: tabID, windowID: windowID)
+            await self.performCapture(tabID: tabID, pid: pid, resolve: resolve)
             self.finishCapture(tabID: tabID, generation: generation)
         }
         captureTasks[tabID] = CaptureJob(generation: generation, task: task)
@@ -66,14 +66,16 @@ final class ThumbnailStore {
         captureTasks[tabID] = nil
     }
 
-    private func performCapture(tabID: UUID, windowID: CGWindowID) async {
+    private func performCapture(tabID: UUID, pid: pid_t, resolve: @Sendable () async -> CGWindowID?) async {
         guard Self.enabledSetting.value, !Task.isCancelled else { return }
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
             // Task.cancel は ScreenCaptureKit の await を即中断するとは限らない。撮影開始前にも
             // opt-in 状態を見直し、OFF/削除/終了後に新しい撮影を始めない。
             guard Self.enabledSetting.value, !Task.isCancelled else { return }
-            guard let scWindow = content.windows.first(where: { $0.windowID == windowID }) else { return }
+            // 照合のIPCは撮影ジョブ側だけで行い、ホットキー処理を待たせない。
+            guard let windowID = await resolve(), Self.enabledSetting.value, !Task.isCancelled,
+                  let scWindow = content.windows.first(where: { $0.windowID == windowID && $0.owningApplication?.processID == pid }) else { return }
             let size = scWindow.frame.size
             guard size.width > 0, size.height > 0 else { return }
             let filter = SCContentFilter(desktopIndependentWindow: scWindow)

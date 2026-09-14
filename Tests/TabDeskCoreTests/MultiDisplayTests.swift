@@ -339,12 +339,12 @@ struct MultiDisplayTests {
         driver.add(1, frame: externalFrame, delay: 0.08)
         let managed = try await engine.register(
             windowID: 1, pid: 100, identity: identity("ext"), frame: externalFrame, into: inactive.id)
-        let probesBefore = driver.callCount("isFullscreen:1")
+        let probesBefore = driver.callCount("isLayoutSuspended:1")
         let writesBefore = driver.callCount("setFrame:1")
 
         let release = Task { await engine.releaseAllParkedWindows() }
         try await withDeadline {
-            while driver.callCount("isFullscreen:1") == probesBefore {
+            while driver.callCount("isLayoutSuspended:1") == probesBefore {
                 try Task.checkCancellation()
                 await Task.yield()
             }

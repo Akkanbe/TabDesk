@@ -3,17 +3,17 @@ import Foundation
 
 /// 再起動後に「保存されたエントリ」と「今ある窓」を突き合わせる。
 ///
-/// CGWindowID は再起動をまたいで安定しないので、bundle ID・タイトル・サイズのヒューリスティックで推定する。
+/// WindowReferenceID は再起動をまたいで安定しないので、bundle ID・タイトル・サイズのヒューリスティックで推定する。
 /// 完全復元は原理的に不可能なので、確度の低い候補は紐付けず「未復元」として残す。
 public enum WindowMatcher {
     public struct Candidate: Sendable, Hashable {
-        public let windowID: CGWindowID
+        public let windowID: WindowReferenceID
         public let pid: pid_t
         public let bundleID: String
         public let title: String
         public let size: CGSize
 
-        public init(windowID: CGWindowID, pid: pid_t, bundleID: String, title: String, size: CGSize) {
+        public init(windowID: WindowReferenceID, pid: pid_t, bundleID: String, title: String, size: CGSize) {
             self.windowID = windowID
             self.pid = pid
             self.bundleID = bundleID

@@ -40,7 +40,7 @@ public final class TabEngine {
     public enum EngineError: Error, CustomStringConvertible, Sendable {
         case unknownTab(UUID)
         case unknownWindow(UUID)
-        case windowAlreadyRegistered(windowID: CGWindowID, managedID: UUID)
+        case windowAlreadyRegistered(windowID: WindowReferenceID, managedID: UUID)
         case invalidTabOrder
         case invalidWindowOrder
         /// columns では列計算が frame の唯一の正なので、個別 frame は直接変更できない。
@@ -48,7 +48,7 @@ public final class TabEngine {
         /// 退避中の窓を固定 frame に戻せなかった(登録は保持される。相手アプリが応答したら再試行できる)。
         case releaseFailed(managedIDs: Set<UUID>)
         /// エントリは既に別の実ウィンドウに紐付いている(上書きすると前の窓が追跡不能になる)。
-        case entryAlreadyBound(managedID: UUID, boundWindowID: CGWindowID)
+        case entryAlreadyBound(managedID: UUID, boundWindowID: WindowReferenceID)
         /// 終了時の全窓解放が始まっている。これ以降に実窓を動かす操作は受け付けない。
         case shuttingDown
         /// タブの所属ディスプレイが切断中(v4: タブごと凍結。再接続まで切替できない)。
@@ -95,13 +95,13 @@ public final class TabEngine {
     /// 操作が失敗したウィンドウはフラグが進まないため実位置とずれうる。ずれは `reconcile` が収束させる。
     public private(set) var parkedWindowIDs: Set<UUID> = []
 
-    /// ネイティブフルスクリーン中の窓(v3 段階 2。実行時のみ、tabdesk://status の診断にも使う)。
+    /// 位置変更が不許可と確認された窓(実行時のみ、tabdesk://status の診断にも使う)。
     /// reconcile の一括読み取りで毎 tick 更新し、スナップバック経路では通知時に読み直す。
     /// メンバーの窓には op を発行しない(setFrame/setPosition が黙って無視され、復元リトライが
     /// 最終的にフルスクリーン寸法を「到達 frame」として採用してしまうため)。
     /// 切断退避(D3)との意図的な差: ディスプレイは接続中なので、記録 frame の更新(clamp / 列計算)は
     /// 続ける — 論理配置は正しく保ち、解除後にそこへ戻す。op だけを止める。
-    public private(set) var fullscreenWindowIDs: Set<UUID> = []
+    public private(set) var layoutSuspendedWindowIDs: Set<UUID> = []
 
     private let driver: any WindowDriver
     private let layout: any ScreenLayout
@@ -371,7 +371,7 @@ public final class TabEngine {
     /// タブを削除する。退避中だったウィンドウは固定 frame に戻してから解放する(画面隅に取り残さない)。
     /// アクティブタブを削除した場合は残りの先頭タブをアクティブにする。
     @discardableResult
-    public func deleteTab(_ id: UUID) async throws -> [CGWindowID] {
+    public func deleteTab(_ id: UUID) async throws -> [WindowReferenceID] {
         try await serialized {
             try rejectIfShuttingDown()
             let tab = try self.tab(id)
@@ -408,7 +408,7 @@ public final class TabEngine {
     /// - 非アクティブタブへの登録: `frame` を記録だけして即座に退避する(次の切替時に適用・正規化される)
     @discardableResult
     public func register(
-        windowID: CGWindowID,
+        windowID: WindowReferenceID,
         pid: pid_t,
         identity: WindowIdentity,
         frame initialFrame: CGRect,
@@ -452,7 +452,7 @@ public final class TabEngine {
                 parkPoint: display?.parkPoint ?? layout.parkPoint)
             // 登録直前のUI判定後、place の IPC 中にも fullscreen へ入り得る。binding がまだ
             // state に無いので、windowID を直接読み直してから保存値とruntime状態を確定する。
-            let fullscreenAfterPlacement = await probeFullscreen(windowID: windowID)
+            let fullscreenAfterPlacement = await probeLayoutSuspension(windowID: windowID)
             // place の IPC 中に所属ディスプレイが切断された場合、OS が生きている画面へ
             // 丸めた実位置を保存しない。登録開始時の座標を再接続用に残す。
             let disconnectedAfterPlacement = isDisplayDisconnected(managed)
@@ -472,8 +472,8 @@ public final class TabEngine {
             let index = try tabIndex(tabID)
             state.tabs[index].windows.append(managed)
             if fullscreenAfterPlacement == true {
-                fullscreenWindowIDs.insert(managed.id)
-                log("fullscreen: \(identity.appName) entered during registration; suspending ops")
+                layoutSuspendedWindowIDs.insert(managed.id)
+                log("layout suspension: \(identity.appName) entered during registration; suspending ops")
             } else if case .parked = outcome, !disconnectedAfterPlacement {
                 parkedWindowIDs.insert(managed.id)
             }
@@ -490,7 +490,7 @@ public final class TabEngine {
 
     /// 登録を解除する。退避中なら固定 frame に戻してから手放す。
     @discardableResult
-    public func unregister(_ id: UUID) async throws -> CGWindowID? {
+    public func unregister(_ id: UUID) async throws -> WindowReferenceID? {
         try await serialized {
             try rejectIfShuttingDown()
             guard let found = state.managedWindow(id: id) else { throw EngineError.unknownWindow(id) }
@@ -507,7 +507,7 @@ public final class TabEngine {
     /// アクティブタブなら固定 frame を適用して到達 frame を採用、非アクティブタブなら即座に退避する。
     public func bind(
         _ id: UUID,
-        windowID: CGWindowID,
+        windowID: WindowReferenceID,
         pid: pid_t,
         title: String? = nil,
         identity: WindowIdentity? = nil
@@ -562,7 +562,7 @@ public final class TabEngine {
                 }
                 // place 中のfullscreen進入を、保存frameを確定する前に拾う。bind完了前なので
                 // managed ID 用のmembership helperではなく実windowIDを直接読む。
-                fullscreenAfterPlacement = await probeFullscreen(windowID: windowID)
+                fullscreenAfterPlacement = await probeLayoutSuspension(windowID: windowID)
             }
             // await をまたいだので引き直す(解除されていれば unknownWindow)。
             guard let location = windowLocation(of: id) else { throw EngineError.unknownWindow(id) }
@@ -595,9 +595,9 @@ public final class TabEngine {
                 state.tabs[location.tabIndex].windows[location.windowIndex].identity.title = title
             }
             if fullscreenAfterPlacement == true {
-                fullscreenWindowIDs.insert(id)
+                layoutSuspendedWindowIDs.insert(id)
                 parkedWindowIDs.remove(id)
-                log("fullscreen: \(previousIdentity.appName) entered during binding; suspending ops")
+                log("layout suspension: \(previousIdentity.appName) entered during binding; suspending ops")
             } else if intoActive || disconnectedAfterPlacement {
                 // 切断退避中は park していない(op を出していない)ので、非アクティブでもフラグは立てない。
                 parkedWindowIDs.remove(id)
@@ -674,13 +674,22 @@ public final class TabEngine {
     /// AX の destroyed 通知から呼ぶ。窓だけが閉じられたなら登録を外し、
     /// アプリごと終了したなら「未復元」として保持する(`appTerminated`)。
     /// どちらか確定できない場合は紐付けだけ外して保留し、判定は reconcile が行う。
-    public func noteWindowDestroyed(windowID: CGWindowID, appTerminated: Bool = false) {
+    public func noteWindowDestroyed(windowID: WindowReferenceID, appTerminated: Bool = false) {
         guard let found = state.managedWindow(forWindowID: windowID) else { return }
         if appTerminated, let pid = found.window.pid {
             unbindWindows(pid: pid)
             return
         }
         markVanished(found)
+    }
+
+    /// AX参照の失効だけでは窓のcloseと断定できないため、保存済み登録を残す。
+    public func noteWindowReferenceLost(windowID: WindowReferenceID) {
+        guard !isReleasingForShutdown, let found = state.managedWindow(forWindowID: windowID) else { return }
+        clearRuntimeTracking(for: found.window.id)
+        setBinding(found.window.id, windowID: nil, pid: nil)
+        if found.tab.layout != .free { pendingRetileTabIDs.insert(found.tab.id) }
+        log("AX reference lost: \(found.window.identity.appName); kept as unbound")
     }
 
     /// 通知・ポーリング共通の「窓は消えたが、アプリ終了か単独closeか未確定」状態へ移す。
@@ -730,7 +739,7 @@ public final class TabEngine {
         }
     }
 
-    private func setBinding(_ id: UUID, windowID: CGWindowID?, pid: pid_t?) {
+    private func setBinding(_ id: UUID, windowID: WindowReferenceID?, pid: pid_t?) {
         updateManagedWindow(id) { window in
             window.windowID = windowID
             window.pid = pid
@@ -738,7 +747,7 @@ public final class TabEngine {
     }
 
     /// フォーカスが移ったウィンドウを記録する(切替時に最前面へ戻すため)。
-    public func noteWindowFocused(windowID: CGWindowID) {
+    public func noteWindowFocused(windowID: WindowReferenceID) {
         guard let found = state.managedWindow(forWindowID: windowID),
             let index = state.tabs.firstIndex(where: { $0.id == found.tab.id })
         else { return }
@@ -779,7 +788,7 @@ public final class TabEngine {
                 return rebound.window.frame
             }
             if !approximatelyEqual(actual, frame),
-                await refreshFullscreenMembership(managedID: id, windowID: windowID) == true
+                await refreshLayoutSuspensionMembership(managedID: id, windowID: windowID) == true
             {
                 updateFrame(id, frame)
                 return frame
@@ -856,10 +865,10 @@ public final class TabEngine {
                         let targetFrame = desired[window.id] ?? clamped(window.frame, for: window)
                         if targetFrame != window.frame { updateFrame(window.id, targetFrame) }
                         // フルスクリーン中は論理 frame だけ更新して op は出さない(解除後にここへ戻す)。
-                        guard !fullscreenWindowIDs.contains(window.id) else { continue }
+                        guard !layoutSuspendedWindowIDs.contains(window.id) else { continue }
                         restores.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(targetFrame, raise: true)))
                     }
-                } else if !parkedWindowIDs.contains(window.id), !fullscreenWindowIDs.contains(window.id) {
+                } else if !parkedWindowIDs.contains(window.id), !layoutSuspendedWindowIDs.contains(window.id) {
                     // 原則は同じ画面の隅。内側の画面では露出を防ぐため配置外縁へ fallback する。
                     parks.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .park(parkPoint(for: window))))
                 }
@@ -874,8 +883,8 @@ public final class TabEngine {
 
         let stopwatch = Stopwatch()
         let results = await run(ops)
-        let elapsed = stopwatch.elapsedMs
         let failures = await apply(results)
+        let elapsed = stopwatch.elapsedMs
         if let displayKey {
             setActiveTab(tabID, on: displayKey)
         } else {
@@ -903,15 +912,15 @@ public final class TabEngine {
             let driver = self.driver
             for candidate in candidates {
                 guard let wid = candidate.windowID, let pid = candidate.pid,
-                      !fullscreenWindowIDs.contains(candidate.id) else { continue }
+                      !layoutSuspendedWindowIDs.contains(candidate.id) else { continue }
                 do {
                     let available = try await executor.run {
-                        try !driver.isMinimized(of: wid) && driver.isFullscreen(of: wid) == false
+                        try !driver.isMinimized(of: wid) && driver.isLayoutSuspended(of: wid) == false
                     }
                     guard available, layout.display(id: displayID) != nil,
                           let current = state.managedWindow(forWindowID: wid),
                           current.tab.id == tabID, current.window.id == candidate.id, current.window.pid == pid,
-                          !parkedWindowIDs.contains(candidate.id), !fullscreenWindowIDs.contains(candidate.id)
+                          !parkedWindowIDs.contains(candidate.id), !layoutSuspendedWindowIDs.contains(candidate.id)
                     else { continue }
                     try rejectIfShuttingDown()
                     activateApplication?(pid, displayID)
@@ -957,7 +966,7 @@ public final class TabEngine {
                     if target != window.frame { updateFrame(window.id, target) }
                     guard let windowID = window.windowID, let pid = window.pid else { continue }
                     // フルスクリーン中は論理 frame の更新だけ行い、op は出さない(段階 2)。
-                    guard !fullscreenWindowIDs.contains(window.id) else { continue }
+                    guard !layoutSuspendedWindowIDs.contains(window.id) else { continue }
                     if isActive {
                         cancelPendingRestore(window.id)
                         ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(target, raise: false)))
@@ -1015,7 +1024,7 @@ public final class TabEngine {
     ///
     /// ドラッグ中は通知が ~100ms 間隔で来続けるため、静止するまで待ってから復元する(デバウンス)。
     /// 掴まれている最中に復元すると一時状態を「制約」と誤認して基準を壊すので、即時復元はしない。
-    public func windowFrameDidChange(windowID: CGWindowID) {
+    public func windowFrameDidChange(windowID: WindowReferenceID) {
         guard !isReleasingForShutdown, !isLayoutTransitioning else { return }
         guard let found = state.managedWindow(forWindowID: windowID) else { return }
         let managed = found.window
@@ -1027,7 +1036,7 @@ public final class TabEngine {
         guard !isDisplayDisconnected(managed) else { return }
         // フルスクリーン既知の窓も予約しない(進入直後で集合が未更新の場合は performRestore が
         // 同じバッチの読み直しで検出する。段階 2)。
-        guard !fullscreenWindowIDs.contains(managed.id) else { return }
+        guard !layoutSuspendedWindowIDs.contains(managed.id) else { return }
         // 通常モードは静止後に復元、編集モードは静止後に記録(どちらもデバウンス。ドラッグ中は触らない)。
         scheduleRestore(managed.id, attempt: 1)
     }
@@ -1085,7 +1094,7 @@ public final class TabEngine {
         // ここで検出しないと「3 回試行 → フルスクリーン寸法を採用」の破壊が起きる(段階 2)。
         guard let probed = try? await executor.run({
             (frame: try driver.frame(of: windowID),
-                fullscreen: (try? driver.isFullscreen(of: windowID)) ?? nil)  // nil = 判定不能
+                fullscreen: (try? driver.isLayoutSuspended(of: windowID)) ?? nil)  // nil = 判定不能
         }) else { return }
         let current = probed.frame
         guard isLatest(id, generation) else { return }  // IPC 中に新しい通知や setFrame が入った
@@ -1098,13 +1107,14 @@ public final class TabEngine {
                 isActiveTab(found.tab)
             else { return }
             if probed.fullscreen == true {
-                if fullscreenWindowIDs.insert(id).inserted {
-                    log("fullscreen: \(found.window.identity.appName) entered; suspending ops")
+                if layoutSuspendedWindowIDs.insert(id).inserted {
+                    log("layout suspension: \(found.window.identity.appName) entered; suspending ops")
                 }
                 return  // 復元しない・採用しない(解除は reconcile が検出して自動復帰)
             }
-            // 判定不能(nil)でメンバー中なら手を出さない(誤復元 → フルスクリーン寸法採用の破壊を防ぐ)。
-            if probed.fullscreen == nil, fullscreenWindowIDs.contains(id) { return }
+            // まだ保留を検知していなくても、操作可能と確認できない窓の寸法は採用しない。
+            // 通常→全画面の遷移中の読取り失敗をfalse扱いすると保存位置が壊れる。
+            if probed.fullscreen == nil { return }
             let recorded = found.window.frame
             // 自分の reapply 等で既に記録値へ到達した通知は、編集モードでも所属変更として扱わない。
             if approximatelyEqual(current, recorded) {
@@ -1135,7 +1145,7 @@ public final class TabEngine {
                 } else {
                     // 最終試行の IPC 中に fullscreen 化・画面切断・rebind が起きても、そこで
                     // 読み戻した座標を固定 frame として採用しない。
-                    if await refreshFullscreenMembership(managedID: id, windowID: windowID) == true {
+                    if await refreshLayoutSuspensionMembership(managedID: id, windowID: windowID) == true {
                         return
                     }
                     guard isLatest(id, generation), !isReleasingForShutdown, !isLayoutTransitioning,
@@ -1158,7 +1168,7 @@ public final class TabEngine {
     /// 寄せる操作が失敗したら以前の固定 frame を維持し、再試行に回す。
     /// 別ディスプレイに置かれた場合は所属もそのディスプレイへ更新する(段階 D)。
     private func recordEditedFrame(
-        id: UUID, windowID: CGWindowID, current: CGRect, attempt: Int, generation: UInt64, appName: String
+        id: UUID, windowID: WindowReferenceID, current: CGRect, attempt: Int, generation: UInt64, appName: String
     ) async {
         guard let found = state.managedWindow(id: id) else { return }
         let display = layout.display(containing: current) ?? layout.primaryDisplay
@@ -1181,7 +1191,7 @@ public final class TabEngine {
             let actual = try await executor.run { try driver.setFrame(target, of: windowID) }
             // clamp IPC 中に fullscreen 化・画面切断・rebind が起きた場合、その到達値と
             // 所属ディスプレイをユーザー編集として記録しない。
-            if await refreshFullscreenMembership(managedID: id, windowID: windowID) == true {
+            if await refreshLayoutSuspensionMembership(managedID: id, windowID: windowID) == true {
                 return
             }
             guard isLatest(id, generation), !isReleasingForShutdown, !isLayoutTransitioning,
@@ -1259,16 +1269,21 @@ public final class TabEngine {
     /// 低頻度ポーリング(2 秒間隔を想定)から呼び、実態を「あるべき状態」へ収束させる。
     ///
     /// - `liveWindowIDs` には **存在する全ウィンドウ**(最小化・別 Space・フルスクリーンを含む)を渡すこと
-    ///   (`WindowEnumerator.existingWindowIDs()`)。画面上の窓だけを渡すと最小化中の窓が登録解除されてしまう。
+    ///   (公開AX参照のID。確認不能な参照も含める)。画面上のCG窓番号を渡してはいけない。
     ///   空集合は列挙失敗とみなし、削除は行わない
     /// - 過去の操作が失敗して実位置とフラグがずれた窓(アクティブタブなのに退避フラグ、非アクティブなのに未退避)を
     ///   復元/退避し直す。退避中の窓が隅から外れていれば戻す
     /// - frame の読み取り(IPC)はロックの外で pid 並列に行い、状態変更だけロック内で再検証して行う
     /// - Parameter livePIDs: 実行中のアプリの pid。消えた窓の pid がここに無ければアプリごと終了したとみなし、
     ///   除去ではなく「未復元」に戻す。nil なら常に除去する。
-    public func reconcile(liveWindowIDs: Set<CGWindowID>, livePIDs: Set<pid_t>? = nil) async {
+    public func reconcile(liveWindowIDs: Set<WindowReferenceID>, livePIDs: Set<pid_t>? = nil) async {
         guard !isReleasingForShutdown, !isLayoutTransitioning else { return }
         resolveVanished(livePIDs: livePIDs)
+        if let livePIDs {
+            for pid in Set(state.allWindows.compactMap(\.pid)).subtracting(livePIDs) {
+                unbindWindows(pid: pid)
+            }
+        }
         if !liveWindowIDs.isEmpty {
             for window in state.allWindows {
                 guard let windowID = window.windowID, !liveWindowIDs.contains(windowID) else { continue }
@@ -1302,14 +1317,14 @@ public final class TabEngine {
                 // IPC 中に entry が unbind / rebind されていたら、旧実窓の結果を新しい binding へ
                 // 適用しない。managed UUID だけでは実窓の世代を識別できない。
                 guard state.managedWindow(id: id)?.window.windowID == obs.windowID else { continue }
-                switch obs.isFullscreen {
+                switch obs.isLayoutSuspended {
                 case true?:
-                    if fullscreenWindowIDs.insert(id).inserted {
-                        log("fullscreen: \(id) entered; suspending ops")
+                    if layoutSuspendedWindowIDs.insert(id).inserted {
+                        log("layout suspension: \(id) entered; suspending ops")
                     }
                 case false?:
-                    if fullscreenWindowIDs.remove(id) != nil {
-                        log("fullscreen: \(id) exited; resuming management")
+                    if layoutSuspendedWindowIDs.remove(id) != nil {
+                        log("layout suspension: \(id) exited; resuming management")
                     }
                 case nil:
                     break  // 判定不能: 前回のメンバーシップを維持(誤って外すと復元リトライが破壊する)
@@ -1370,11 +1385,11 @@ public final class TabEngine {
 
     struct ObservedWindowState: Sendable {
         /// 観測した実ウィンドウ。managed ID が同じでも rebind 後なら結果を破棄するために保持する。
-        let windowID: CGWindowID
+        let windowID: WindowReferenceID
         /// frame だけ読めない場合も fullscreen=true は利用し、危険な op を止める。
         let frame: CGRect?
         /// nil = 判定不能(前回のフルスクリーン判定を維持する)。
-        let isFullscreen: Bool?
+        let isLayoutSuspended: Bool?
     }
 
     /// 紐付いている全窓の現在 frame とフルスクリーン状態を読む。読み取りは pid ごとに並列(ロックの外で呼ぶこと)。
@@ -1394,11 +1409,11 @@ public final class TabEngine {
                             guard let wid = window.windowID else { return nil }
                             let current = try? driver.frame(of: wid)
                             // nil(読めない)は nil のまま運ぶ(false に潰さない — 呼び手が前回判定を維持する)。
-                            let fullscreen = (try? driver.isFullscreen(of: wid)) ?? nil
+                            let fullscreen = (try? driver.isLayoutSuspended(of: wid)) ?? nil
                             // 両方とも読めない窓は判断材料が無いので含めない。
                             guard current != nil || fullscreen != nil else { return nil }
                             return (window.id, ObservedWindowState(
-                                windowID: wid, frame: current, isFullscreen: fullscreen))
+                                windowID: wid, frame: current, isLayoutSuspended: fullscreen))
                         }
                     }
                 }
@@ -1414,34 +1429,34 @@ public final class TabEngine {
     /// 観測結果が現在の binding のものなら集合へ反映し、反映後の既知状態を返す。
     /// nil は観測中に rebind されて結果を捨てた場合だけ。属性の読取り不能は前回状態を返す。
     @discardableResult
-    private func applyFullscreenObservation(
-        _ value: Bool?, managedID id: UUID, windowID: CGWindowID
+    private func applyLayoutSuspensionObservation(
+        _ value: Bool?, managedID id: UUID, windowID: WindowReferenceID
     ) -> Bool? {
         guard let found = state.managedWindow(id: id), found.window.windowID == windowID else { return nil }
         switch value {
         case true?:
-            if fullscreenWindowIDs.insert(id).inserted {
-                log("fullscreen: \(found.window.identity.appName) entered; suspending ops")
+            if layoutSuspendedWindowIDs.insert(id).inserted {
+                log("layout suspension: \(found.window.identity.appName) entered; suspending ops")
             }
         case false?:
-            if fullscreenWindowIDs.remove(id) != nil {
-                log("fullscreen: \(found.window.identity.appName) exited; resuming management")
+            if layoutSuspendedWindowIDs.remove(id) != nil {
+                log("layout suspension: \(found.window.identity.appName) exited; resuming management")
             }
         case nil:
             break
         }
-        return fullscreenWindowIDs.contains(id)
+        return layoutSuspendedWindowIDs.contains(id)
     }
 
-    private func refreshFullscreenMembership(managedID id: UUID, windowID: CGWindowID) async -> Bool? {
-        let value = await probeFullscreen(windowID: windowID)
-        return applyFullscreenObservation(value, managedID: id, windowID: windowID)
+    private func refreshLayoutSuspensionMembership(managedID id: UUID, windowID: WindowReferenceID) async -> Bool? {
+        let value = await probeLayoutSuspension(windowID: windowID)
+        return applyLayoutSuspensionObservation(value, managedID: id, windowID: windowID)
     }
 
-    private func probeFullscreen(windowID: CGWindowID) async -> Bool? {
+    private func probeLayoutSuspension(windowID: WindowReferenceID) async -> Bool? {
         let driver = self.driver
         do {
-            return try await executor.run { try driver.isFullscreen(of: windowID) }
+            return try await executor.run { try driver.isLayoutSuspended(of: windowID) }
         } catch {
             return nil
         }
@@ -1477,7 +1492,7 @@ public final class TabEngine {
             case restore(CGRect, raise: Bool)
         }
         let managedID: UUID
-        let windowID: CGWindowID
+        let windowID: WindowReferenceID
         let pid: pid_t
         let kind: Kind
     }
@@ -1544,11 +1559,11 @@ public final class TabEngine {
                         results.append(skippedReleaseResult(for: op))
                         continue
                     }
-                    if case .closed = status {
+                    if case .invalidated = status {
                         // 登録自体は残し、次回起動時の再同定に使う。別の窓をタイトルだけで操作しない。
                         clearRuntimeTracking(for: op.managedID)
                         setBinding(op.managedID, windowID: nil, pid: nil)
-                        log("release: window \(op.windowID) confirmed closed; keeping registration unbound")
+                        log("release: window \(op.windowID) reference invalidated; keeping registration unbound")
                         results.append(skippedReleaseResult(for: op))
                         continue
                     }
@@ -1557,38 +1572,39 @@ public final class TabEngine {
                     log("release: reference refresh failed for \(op.windowID); trying cached reference: \(error)")
                 }
             }
-            let fullscreen = await probeFullscreen(windowID: op.windowID)
+            let fullscreen = await probeLayoutSuspension(windowID: op.windowID)
             guard let bound = state.managedWindow(id: op.managedID),
                 bound.window.windowID == op.windowID
             else {
                 results.append(skippedReleaseResult(for: op))
                 continue
             }
-            let isFullscreen = applyFullscreenObservation(
+            let isLayoutSuspended = applyLayoutSuspensionObservation(
                 fullscreen, managedID: op.managedID, windowID: op.windowID)
             // probeの待機中に切断された窓へ、新しいrestoreを発行しない(D3)。nil観測時は
-            // applyFullscreenObservationが前回membershipを維持するため、既知fullscreenも触らない。
-            guard !isDisplayDisconnected(bound.window), isFullscreen != true else {
+            // applyLayoutSuspensionObservationが前回membershipを維持するため、既知fullscreenも触らない。
+            guard !isDisplayDisconnected(bound.window), isLayoutSuspended != true else {
                 results.append(skippedReleaseResult(for: op))
                 continue
             }
             let driver = self.driver
             let result = await executor.run { Self.perform(op, driver: driver) }
-            let settled = isReleasingForShutdown ? await settleShutdownRestore(result) : result
+            let settled = isReleasingForShutdown ? await settleRestore(result) : result
             results.append(ReleaseResult(result: settled, didPerform: true))
         }
         return results
     }
 
-    private func settleShutdownRestore(_ result: OpResult) async -> OpResult {
+    private func settleRestore(_ result: OpResult) async -> OpResult {
         let op = result.op
         guard result.error == nil, let actual = result.actual,
               case .restore(let requested, _) = op.kind,
               abs(actual.minX - requested.minX) > config.frameTolerance ||
                 abs(actual.minY - requested.minY) > config.frameTolerance else { return result }
         // AppKit のアニメーション中は後続のサイズ変更が移動を打ち消すことがある。
-        // 終了時だけ位置を一度再適用し、途中の座標を保存しないよう短く待って読み戻す。
-        guard await refreshFullscreenMembership(managedID: op.managedID, windowID: op.windowID) != true,
+        // 画面間移動中の後続操作が無視される場合があるため、少し待って位置だけを一度再適用する。
+        do { try await Task.sleep(for: .milliseconds(100)) } catch { return result }
+        guard await refreshLayoutSuspensionMembership(managedID: op.managedID, windowID: op.windowID) != true,
               let bound = state.managedWindow(id: op.managedID),
               bound.window.windowID == op.windowID, bound.window.pid == op.pid,
               !isDisplayDisconnected(bound.window) else { return result }
@@ -1647,6 +1663,14 @@ public final class TabEngine {
             // 実行中に閉じられた・紐付けが外れた/変わったウィンドウの結果は捨てる
             // (unbound になったエントリに退避フラグを立てない)。
             guard state.managedWindow(id: result.op.managedID)?.window.windowID == result.op.windowID else { continue }
+            if result.error == nil, let actual = result.actual, case .restore = result.op.kind,
+               let bound = state.managedWindow(id: result.op.managedID) {
+                let area = display(for: bound.window)?.contentArea ?? layout.contentArea
+                let visible = actual.intersection(area)
+                if visible.isNull || visible.width < min(32, actual.width) || visible.height < min(32, actual.height) {
+                    result = await settleRestore(result)
+                }
+            }
             if let note = result.note {
                 log("\(result.op.managedID): \(note)")
             }
@@ -1664,10 +1688,10 @@ public final class TabEngine {
                     parkedWindowIDs.remove(result.op.managedID)
                     continue
                 }
-                if await refreshFullscreenMembership(
+                if await refreshLayoutSuspensionMembership(
                     managedID: result.op.managedID, windowID: windowID) == true
                 {
-                    log("apply: op failed but window is fullscreen; suspending \(result.op.managedID): \(error)")
+                    log("apply: op failed but window layout is suspended; suspending \(result.op.managedID): \(error)")
                     parkedWindowIDs.remove(result.op.managedID)
                     continue
                 }
@@ -1700,7 +1724,7 @@ public final class TabEngine {
                 continue
             }
             // 既知の fullscreen へは結果を反映しない。restore の actual 差分は下で再確認する。
-            if fullscreenWindowIDs.contains(result.op.managedID) {
+            if layoutSuspendedWindowIDs.contains(result.op.managedID) {
                 parkedWindowIDs.remove(result.op.managedID)
                 continue
             }
@@ -1709,6 +1733,16 @@ public final class TabEngine {
                 parkedWindowIDs.insert(result.op.managedID)
                 cancelPendingRestore(result.op.managedID)
             case .restore(let requested, _):
+                if let actual = result.actual {
+                    let area = display(for: currentBinding.window)?.contentArea ?? layout.contentArea
+                    let visible = actual.intersection(area)
+                    if visible.isNull || visible.width < min(32, actual.width) || visible.height < min(32, actual.height) {
+                        // 書き込みが成功を返しても、退避位置に残った結果は正常な配置として保存しない。
+                        failures.append(OperationFailure(managedID: result.op.managedID,
+                            message: "window remained outside its content area after restore"))
+                        continue
+                    }
+                }
                 parkedWindowIDs.remove(result.op.managedID)
                 if let actual = result.actual, !approximatelyEqual(actual, requested),
                     let found = state.managedWindow(id: result.op.managedID),
@@ -1716,7 +1750,7 @@ public final class TabEngine {
                 {
                     // reconcile の次回 tick 前に fullscreen へ入ると、setFrame は成功扱いのまま
                     // 飲み込まれて fullscreen 寸法を返す。差分採用の直前だけ再確認して保存値を守る。
-                    if await refreshFullscreenMembership(
+                    if await refreshLayoutSuspensionMembership(
                         managedID: result.op.managedID, windowID: result.op.windowID) == true
                     {
                         continue
@@ -1809,7 +1843,7 @@ public final class TabEngine {
                 parkedWindowIDs.remove(result.op.managedID)
                 continue
             }
-            if !releaseResult.didPerform || fullscreenWindowIDs.contains(result.op.managedID) {
+            if !releaseResult.didPerform || layoutSuspendedWindowIDs.contains(result.op.managedID) {
                 parkedWindowIDs.remove(result.op.managedID)
                 continue
             }
@@ -1826,7 +1860,7 @@ public final class TabEngine {
                     continue
                 }
                 // 書込み失敗が実は fullscreen 進入だった場合も、解除失敗にはせず記録を維持する。
-                if await refreshFullscreenMembership(
+                if await refreshLayoutSuspensionMembership(
                     managedID: result.op.managedID, windowID: windowID) == true
                 {
                     parkedWindowIDs.remove(result.op.managedID)
@@ -1852,7 +1886,7 @@ public final class TabEngine {
             if let actual = result.actual, case .restore(let requested, _) = result.op.kind,
                 !approximatelyEqual(actual, requested)
             {
-                if await refreshFullscreenMembership(
+                if await refreshLayoutSuspensionMembership(
                     managedID: result.op.managedID, windowID: result.op.windowID) == true
                 {
                     parkedWindowIDs.remove(result.op.managedID)
@@ -1893,7 +1927,7 @@ public final class TabEngine {
     /// AX は操作を適用したあとでタイムアウト等を返すことがある。そのとき未登録のまま捨てると
     /// 隅へ動かした窓を誰も追跡できなくなるので、「動いていれば commit、動いていなければ throw」にする。
     /// - Parameter parkPoint: 非アクティブタブへの登録時の退避先(その窓のディスプレイの隅)。
-    private func place(windowID: CGWindowID, frame: CGRect, intoActive: Bool, parkPoint point: CGPoint) async throws -> PlacementOutcome {
+    private func place(windowID: WindowReferenceID, frame: CGRect, intoActive: Bool, parkPoint point: CGPoint) async throws -> PlacementOutcome {
         let driver = self.driver
         if intoActive {
             do {
@@ -1925,7 +1959,7 @@ public final class TabEngine {
 
     /// 退避の IPC が失敗したあと、実際に隅へ動いたかを読み戻して判定する。
     /// 読めない場合は「動いたかもしれない」として true(見失うより管理下に置く方が安全。消えた窓は reconcile が外す)。
-    private func isProbablyParked(_ windowID: CGWindowID, parkPoint: CGPoint) async -> Bool {
+    private func isProbablyParked(_ windowID: WindowReferenceID, parkPoint: CGPoint) async -> Bool {
         let driver = self.driver
         guard let current = try? await executor.run({ try driver.frame(of: windowID) }) else { return true }
         return abs(current.minX - parkPoint.x) <= 1
@@ -1960,7 +1994,7 @@ public final class TabEngine {
     /// 切断退避(D3)とフルスクリーン(段階 2)の共通ゲート。記録 frame の凍結有無は別
     /// (切断中は凍結、フルスクリーン中は更新を続ける)なので、呼び手が使い分ける。
     private func opsSuppressed(for window: ManagedWindow) -> Bool {
-        isDisplayDisconnected(window) || fullscreenWindowIDs.contains(window.id)
+        isDisplayDisconnected(window) || layoutSuspendedWindowIDs.contains(window.id)
     }
 
     /// 窓の所属ディスプレイ用に計算済みの安全な退避先。通常は同じ画面の右下隅だが、
@@ -2020,7 +2054,7 @@ public final class TabEngine {
             if target != window.frame { updateFrame(window.id, target) }
             guard isActive, let windowID = window.windowID, let pid = window.pid,
                 !parkedWindowIDs.contains(window.id),
-                !fullscreenWindowIDs.contains(window.id)  // 列 slot は保持、op だけ出さない(段階 2)
+                !layoutSuspendedWindowIDs.contains(window.id)  // 列 slot は保持、op だけ出さない(段階 2)
             else { continue }
             cancelPendingRestore(window.id)
             ops.append(WindowOp(managedID: window.id, windowID: windowID, pid: pid, kind: .restore(target, raise: false)))
@@ -2040,7 +2074,7 @@ public final class TabEngine {
     /// 復元に失敗して退避先に残った窓を、入力先として前面化しない。
     private func focusCandidates(in tab: Tab) -> [ManagedWindow] {
         var candidates = tab.windows.filter {
-            $0.isBound && !parkedWindowIDs.contains($0.id) && !fullscreenWindowIDs.contains($0.id)
+            $0.isBound && !parkedWindowIDs.contains($0.id) && !layoutSuspendedWindowIDs.contains($0.id)
         }
         if let last = tab.lastFocusedWindowID, let index = candidates.firstIndex(where: { $0.id == last }) {
             candidates.insert(candidates.remove(at: index), at: 0)
@@ -2071,7 +2105,7 @@ public final class TabEngine {
         cancelPendingRestore(id)
         restoreGeneration.removeValue(forKey: id)  // キー欠損なら飛行中 Task の isLatest は false
         parkedWindowIDs.remove(id)
-        fullscreenWindowIDs.remove(id)
+        layoutSuspendedWindowIDs.remove(id)
         vanished.removeValue(forKey: id)
     }
 

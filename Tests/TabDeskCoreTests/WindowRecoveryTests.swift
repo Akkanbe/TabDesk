@@ -61,7 +61,7 @@ struct WindowRecoveryTests {
         let identity = WindowIdentity(bundleID: "test.app", appName: "Test", title: "Document", registeredSize: area.size)
         let window = ManagedWindow(frame: area, identity: identity, windowID: nil, pid: nil)
         let candidates = [1, 2].map {
-            WindowMatcher.Candidate(windowID: CGWindowID($0), pid: 100, bundleID: identity.bundleID,
+            WindowMatcher.Candidate(windowID: WindowReferenceID(integerLiteral: UInt32($0)), pid: 100, bundleID: identity.bundleID,
                                     title: identity.title, size: area.size)
         }
         #expect(WindowMatcher.match(unbound: [window], candidates: candidates, strictness: .strict).isEmpty)

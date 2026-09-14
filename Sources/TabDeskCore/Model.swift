@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 
 /// 再起動をまたいでウィンドウを再同定するための情報。
-/// CGWindowID はセッション内でしか安定しないので、これをヒューリスティックの材料にする(復元は段階 4)。
+/// WindowReferenceID はセッション内でしか安定しないので、これをヒューリスティックの材料にする(復元は段階 4)。
 public struct WindowIdentity: Codable, Sendable, Hashable {
     public var bundleID: String
     public var appName: String
@@ -28,7 +28,7 @@ public struct ManagedWindow: Codable, Sendable, Hashable, Identifiable {
     public var displayID: DisplayID?
     public var tileID: UUID?
     /// 実行時にだけ意味を持つ実ウィンドウへの紐付け。永続化しない(nil = 未復元)。
-    public var windowID: CGWindowID?
+    public var windowID: WindowReferenceID?
     public var pid: pid_t?
 
     // windowID / pid は CodingKeys から外すことで JSON に出さない。
@@ -38,7 +38,7 @@ public struct ManagedWindow: Codable, Sendable, Hashable, Identifiable {
 
     public init(
         id: UUID = UUID(), frame: CGRect, identity: WindowIdentity,
-        windowID: CGWindowID?, pid: pid_t?, displayID: DisplayID? = nil, tileID: UUID? = nil
+        windowID: WindowReferenceID?, pid: pid_t?, displayID: DisplayID? = nil, tileID: UUID? = nil
     ) {
         self.id = id
         self.frame = frame
@@ -204,7 +204,7 @@ public struct WorkspaceState: Codable, Sendable, Hashable {
     }
 
     /// 実ウィンドウ ID から登録情報を引く。
-    public func managedWindow(forWindowID windowID: CGWindowID) -> (tab: Tab, window: ManagedWindow)? {
+    public func managedWindow(forWindowID windowID: WindowReferenceID) -> (tab: Tab, window: ManagedWindow)? {
         for tab in tabs {
             if let w = tab.windows.first(where: { $0.windowID == windowID }) {
                 return (tab, w)

@@ -90,7 +90,7 @@ struct DisplayWindowFocusTests {
         let driver = FakeWindowDriver()
         let engine = TabEngine(driver: driver, layout: FixedScreenLayout(displays: [display("left", x: 0), display("right", x: 1000)]))
         let tab = engine.createTab(name: "Work", on: "right")
-        for id: UInt32 in [1, 2] {
+        for id: WindowReferenceID in [1, 2] {
             let frame = CGRect(x: 1100, y: 100, width: 300, height: 200)
             driver.add(id, frame: frame)
             _ = try await engine.register(windowID: id, pid: 100, identity: WindowIdentity(
