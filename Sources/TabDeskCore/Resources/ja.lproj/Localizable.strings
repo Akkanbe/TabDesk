@@ -144,3 +144,5 @@
 "previousDisplay" = "前のディスプレイ";
 "selectedDisplay" = "ホットキー操作対象";
 "displayFocusUnavailable" = "入力先の窓へフォーカスできません。タブを切り替えてください。";
+
+"unregisteredWindowsOnTop" = "未登録のウィンドウを最前面に保つ";

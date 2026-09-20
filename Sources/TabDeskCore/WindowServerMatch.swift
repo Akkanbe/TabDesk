@@ -1,7 +1,7 @@
 import AppKit
 import ApplicationServices
 
-/// 撮影・診断用の補助照合。結果をAX操作や消滅判定には使わない。
+/// 撮影・診断・表示順序の補助照合。CG番号からAX参照を作ったり、消滅判定に使ったりしない。
 public enum WindowServerMatch {
     struct Candidate: Equatable {
         let number: CGWindowID
@@ -16,14 +16,14 @@ public enum WindowServerMatch {
         let title: String?
     }
 
-    static func match(_ id: WindowReferenceID, references: [Reference], candidates: [Candidate]) -> CGWindowID? {
+    static func match(_ id: WindowReferenceID, references: [Reference], candidates: [Candidate], requireTitleMatch: Bool = true) -> CGWindowID? {
         func agrees(_ reference: Reference, _ candidate: Candidate) -> Bool {
             guard reference.pid == candidate.pid,
                   abs(reference.frame.minX - candidate.frame.minX) <= 1,
                   abs(reference.frame.minY - candidate.frame.minY) <= 1,
                   abs(reference.frame.width - candidate.frame.width) <= 1,
                   abs(reference.frame.height - candidate.frame.height) <= 1 else { return false }
-            if let a = reference.title, let b = candidate.title, !a.isEmpty, !b.isEmpty { return a == b }
+            if requireTitleMatch, let a = reference.title, let b = candidate.title, !a.isEmpty, !b.isEmpty { return a == b }
             return true
         }
         guard let target = references.first(where: { $0.id == id }) else { return nil }
@@ -34,7 +34,9 @@ public enum WindowServerMatch {
     }
 
     /// 両側の一覧を毎回読み直す。同名・同位置や読み取り不足なら撮影を省略する。
-    public static func windowNumber(for window: AXWindow) -> CGWindowID? {
+    /// 表示順序の判定ではタイトル更新の遅延を許容できるが、両方向の一意性は必須。
+    /// 撮影・既存URL操作は既定の厳格照合を維持する。
+    public static func windowNumber(for window: AXWindow, requireTitleMatch: Bool = true) -> CGWindowID? {
         let root = AXUIElementCreateApplication(window.pid)
         AXUIElementSetMessagingTimeout(root, 0.5)
         guard let elements = try? AXAttributes.elements(root, kAXWindowsAttribute) else { return nil }
@@ -57,7 +59,7 @@ public enum WindowServerMatch {
                   let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return nil }
             candidates.append(Candidate(number: number, pid: pid, frame: frame, title: entry[kCGWindowName as String] as? String))
         }
-        guard let number = match(window.windowID, references: references, candidates: candidates),
+        guard let number = match(window.windowID, references: references, candidates: candidates, requireTitleMatch: requireTitleMatch),
               let sampled = references.first(where: { $0.id == window.windowID }),
               (try? window.frame()) == sampled.frame else { return nil }
         return number

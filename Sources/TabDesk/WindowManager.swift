@@ -29,6 +29,26 @@ final class WindowManager {
     let store: StateStore
     /// Cmd-Tab 等で非アクティブタブの窓にフォーカスが移ったら、そのタブへ自動で切り替える(§3.6)。
     let focusFollows = PersistedToggle(key: "FocusFollowsWindow", defaultValue: true)
+    let unregisteredWindowsOnTop = PersistedToggle(key: "UnregisteredWindowsOnTop", defaultValue: false)
+    private var sessionActive = true
+    private lazy var unregisteredWindowController = UnregisteredWindowController(
+        context: { [weak self] in
+            guard let self, self.unregisteredWindowsOnTop.value, self.isTrusted, !self.isTerminating,
+                  self.sessionActive, self.initialRestoreDone,
+                  self.inFlight.isEmpty, self.pendingNavigationCount == 0, self.focusSwitchDepth == 0,
+                  !self.isReapplyingLayout, self.suppressAppActivation?() != true,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier != getpid(),
+                  NSEvent.pressedMouseButtons == 0 else { return nil }
+            return Set(self.engine.state.allWindows.compactMap(\.windowID))
+        }, onFronting: { [logger] count in logger.log("unregistered windows: bringing \(count) window(s) forward") },
+        onError: { [logger] error in logger.log("unregistered window fronting failed: \(error)") })
+
+    func setUnregisteredWindowsOnTop(_ enabled: Bool) {
+        unregisteredWindowsOnTop.value = enabled
+        unregisteredWindowController.invalidate()
+        if enabled { unregisteredWindowController.request() }
+    }
+
     /// true を返す間は切替後のアプリ前面化を行わない(サイドバーで改名中など)。
     var suppressAppActivation: (@MainActor () -> Bool)?
     /// UI 向けの状態変更通知(エンジンの onStateChanged はここが占有し、保存とあわせて配る)。
@@ -63,6 +83,8 @@ final class WindowManager {
     private var lastOnScreenIDs: Set<CGWindowID> = []
     private var reconcileTask: Task<Void, Never>?
     private var layoutReapplyTask: Task<Void, Never>?
+    var isReapplyingLayout: Bool { layoutReapplyTask != nil }
+    func waitForLayoutReapply() async { await layoutReapplyTask?.value }
     /// 連続する画面変更通知で、古い reapply Task が新しい通知抑止を解除しないための世代。
     private var layoutChangeGeneration: UInt64 = 0
     private(set) var isTerminating = false
@@ -92,6 +114,7 @@ final class WindowManager {
     /// 同じ実ウィンドウに対する register / bind の競合を防ぐ予約。
     private func reserveRegistration(of window: AXWindow) -> Bool {
         guard inFlight[window.windowID] == nil else { return false }
+        unregisteredWindowController.invalidate()
         inFlight[window.windowID] = window.pid
         return true
     }
@@ -173,6 +196,7 @@ final class WindowManager {
         engine = TabEngine(driver: driver, layout: layout, initialState: initial)
         engine.log = { logger.log($0) }
         engine.onStateChanged = { [weak self] state in
+            self?.unregisteredWindowController.invalidate()
             self?.scheduleSave()
             self?.onStateChanged?(state)
         }
@@ -196,6 +220,10 @@ final class WindowManager {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(appDidActivate(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        for name in [NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(
+                self, selector: #selector(sessionActivityChanged(_:)), name: name, object: nil)
+        }
         // ネイティブフルスクリーンの開始・解除は Space 切替として届く。on-screen ID は開始前後で
         // 変化しない場合があるため、未復元エントリがあるときだけ明示的に再照合する。
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -447,10 +475,14 @@ final class WindowManager {
     /// 切替中に届いたフォーカス通知を、最も外側の切替が完了するまで保留する。
     private func performFocusSwitch(_ operation: () async throws -> TabEngine.SwitchReport?) async throws {
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        unregisteredWindowController.invalidate()
         focusSwitchDepth += 1
         defer {
             focusSwitchDepth -= 1
-            if focusSwitchDepth == 0 { schedulePendingFocusFollow() }
+            if focusSwitchDepth == 0 {
+                schedulePendingFocusFollow()
+                unregisteredWindowController.request()
+            }
         }
         let report = try await operation()
         // 終了開始前に入った切替は AX IPC 待ちから後で戻り得る。beginTermination() が
@@ -589,6 +621,7 @@ final class WindowManager {
     /// 受付時に操作先を確定し、AX完了を待たず次のキーへ引き継ぐ。
     func navigate(_ action: HotkeyAction) {
         guard !isTerminating else { return }
+        unregisteredWindowController.invalidate()
         let current = selectedDisplayID()
         let displayID: DisplayID
         let operation: NavigationOperation
@@ -626,6 +659,7 @@ final class WindowManager {
                     navigationTask = nil
                     displayNavigation.completed(focus: currentDisplayFocus())
                     schedulePendingFocusFollow()
+                    unregisteredWindowController.request()
                 }
                 onDisplaySelectionChanged?()
             }
@@ -857,6 +891,7 @@ final class WindowManager {
     func beginTermination() {
         guard !isTerminating else { return }
         isTerminating = true
+        unregisteredWindowController.invalidate()
         engine.beginShutdown()
         reconcileTimer?.invalidate()
         reconcileTimer = nil
@@ -969,8 +1004,14 @@ final class WindowManager {
 
     // MARK: - ポーリングと NSWorkspace
 
+    @objc private func sessionActivityChanged(_ notification: Notification) {
+        sessionActive = notification.name == NSWorkspace.sessionDidBecomeActiveNotification
+        unregisteredWindowController.invalidate()
+    }
+
     private func reconcileTick() {
         guard isTrusted, !isTerminating, reconcileTask == nil else { return }  // 前回が終わるまで重ねない
+        unregisteredWindowController.request()
         let live = WindowEnumerator.existingWindowIDs()
         let livePIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
         let appeared = live.subtracting(lastExistingIDs)
@@ -1032,6 +1073,7 @@ final class WindowManager {
         layoutReapplyTask?.cancel()
         layoutReapplyTask = Task { [weak self] in
             guard let self, generation == self.layoutChangeGeneration, !self.isTerminating else { return }
+            defer { self.finishLayoutReapply(generation: generation) }
             if self.isTrusted {
                 await self.engine.reapplyLayout()
                 guard generation == self.layoutChangeGeneration, !self.isTerminating else { return }
@@ -1044,15 +1086,17 @@ final class WindowManager {
     }
 
     /// 画面変更・復帰は短時間に連発するので 1 秒でまとめてから再適用する。
-    @objc private func layoutMayHaveChanged(_ notification: Notification) {
+    @objc func layoutMayHaveChanged(_ notification: Notification) {
         guard !isTerminating else { return }
         layoutChangeGeneration &+= 1
         let generation = layoutChangeGeneration
         engine.beginLayoutTransition()
         layoutReapplyTask?.cancel()
         layoutReapplyTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.finishLayoutReapply(generation: generation) }
             try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled, let self, generation == self.layoutChangeGeneration, !self.isTerminating else { return }
+            guard !Task.isCancelled, generation == self.layoutChangeGeneration, !self.isTerminating else { return }
             guard self.isTrusted else {
                 self.engine.endLayoutTransition()
                 return
@@ -1062,6 +1106,13 @@ final class WindowManager {
             guard generation == self.layoutChangeGeneration, !self.isTerminating else { return }
             self.engine.endLayoutTransition()
         }
+    }
+
+    private func finishLayoutReapply(generation: UInt64) {
+        // 古いTaskのキャンセル完了が、後から始まったレイアウト変更のバリアを解除しない。
+        guard generation == layoutChangeGeneration else { return }
+        layoutReapplyTask = nil
+        unregisteredWindowController.request()
     }
 
     @objc private func appDidTerminate(_ notification: Notification) {

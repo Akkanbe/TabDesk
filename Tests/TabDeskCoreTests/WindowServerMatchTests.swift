@@ -36,4 +36,24 @@ struct WindowServerMatchTests {
         #expect(WindowServerMatch.match(1, references: [ref], candidates: [
             .init(number: 10, pid: 100, frame: frame.offsetBy(dx: 10, dy: 0), title: "Same")]) == nil)
     }
+
+    @Test func stackingMatchAllowsDelayedTitleOnlyForUniqueGeometry() {
+        let ref = WindowServerMatch.Reference(id: 1, pid: 100, frame: frame, title: "New page")
+        let candidate = WindowServerMatch.Candidate(number: 10, pid: 100, frame: frame, title: "Old page")
+        #expect(WindowServerMatch.match(1, references: [ref], candidates: [candidate]) == nil)
+        #expect(WindowServerMatch.match(1, references: [ref], candidates: [candidate], requireTitleMatch: false) == 10)
+        let duplicate = WindowServerMatch.Candidate(number: 20, pid: 100, frame: frame, title: "New page")
+        #expect(WindowServerMatch.match(1, references: [ref], candidates: [candidate, duplicate], requireTitleMatch: false) == nil)
+        let other = WindowServerMatch.Reference(id: 2, pid: 100, frame: frame, title: "Other page")
+        #expect(WindowServerMatch.match(1, references: [ref, other], candidates: [candidate], requireTitleMatch: false) == nil)
+    }
+
+    @Test func stackingMatchStillRejectsWrongProcessAndGeometry() {
+        let ref = WindowServerMatch.Reference(id: 1, pid: 100, frame: frame, title: "New page")
+        #expect(WindowServerMatch.match(1, references: [ref], candidates: [
+            .init(number: 10, pid: 200, frame: frame, title: "Old page")], requireTitleMatch: false) == nil)
+        #expect(WindowServerMatch.match(1, references: [ref], candidates: [
+            .init(number: 10, pid: 100, frame: frame.offsetBy(dx: 5, dy: 0), title: "Old page")], requireTitleMatch: false) == nil)
+    }
+
 }

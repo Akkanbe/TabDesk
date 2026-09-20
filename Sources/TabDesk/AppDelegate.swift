@@ -122,6 +122,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let onTop = NSMenuItem(title: L10n.text(.alwaysOnTop), action: #selector(toggleAlwaysOnTop(_:)), keyEquivalent: "")
         onTop.state = alwaysOnTop ? .on : .off
         menu.addItem(onTop)
+        let unregistered = NSMenuItem(title: L10n.text(.unregisteredWindowsOnTop),
+            action: #selector(toggleUnregisteredWindowsOnTop(_:)), keyEquivalent: "")
+        unregistered.state = manager.unregisteredWindowsOnTop.value ? .on : .off
+        menu.addItem(unregistered)
         let follow = NSMenuItem(title: L10n.text(.followFocus), action: #selector(toggleFocusFollows(_:)), keyEquivalent: "")
         follow.state = manager.focusFollows.value ? .on : .off
         menu.addItem(follow)
@@ -206,6 +210,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sidebars.alwaysOnTop.toggle()
         sender.state = sidebars.alwaysOnTop ? .on : .off
         logger.log("alwaysOnTop=\(sidebars.alwaysOnTop)")
+    }
+
+    @objc private func toggleUnregisteredWindowsOnTop(_ sender: NSMenuItem) {
+        manager.setUnregisteredWindowsOnTop(!manager.unregisteredWindowsOnTop.value)
+        sender.state = manager.unregisteredWindowsOnTop.value ? .on : .off
+        logger.log("unregisteredWindowsOnTop=\(manager.unregisteredWindowsOnTop.value)")
     }
 
     @objc private func toggleFocusFollows(_ sender: NSMenuItem) {

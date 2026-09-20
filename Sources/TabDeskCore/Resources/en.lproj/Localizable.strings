@@ -144,3 +144,5 @@
 "previousDisplay" = "Previous Display";
 "selectedDisplay" = "Hotkey target";
 "displayFocusUnavailable" = "Cannot focus a window. Select another tab.";
+
+"unregisteredWindowsOnTop" = "Keep Unregistered Windows on Top";

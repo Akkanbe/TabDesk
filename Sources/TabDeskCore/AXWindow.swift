@@ -82,9 +82,12 @@ public struct AXWindow: @unchecked Sendable, Hashable {
         subrole == kAXStandardWindowSubrole
     }
 
-    public var isMinimized: Bool {
-        (try? AXAttributes.bool(element, kAXMinimizedAttribute)) ?? false
+    /// 読み取り失敗を「最小化されていない」と扱いたくない操作で使う。
+    public var minimizationState: Bool? {
+        try? AXAttributes.bool(element, kAXMinimizedAttribute)
     }
+
+    public var isMinimized: Bool { minimizationState ?? false }
 
     /// 公開APIの位置変更可否。全画面という状態そのものの推測には使わない。
     /// true = 操作保留、false = 位置変更可能、nil = 取得失敗。
