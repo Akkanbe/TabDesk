@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Foundation
+import Darwin
 
 /// 保存用の登録UUIDやCGWindowIDとは独立した、その実行中だけの参照ID。
 public struct WindowReferenceID: Hashable, Sendable, CustomStringConvertible {
@@ -46,14 +47,34 @@ public final class AXWindowReferenceStore: @unchecked Sendable {
 
     private var processes: [pid_t: Process] = [:]
 
-    public init() {}
+    private let processStartDate: @Sendable (pid_t) -> Date?
+
+    public init() { processStartDate = Self.readProcessStartDate }
+
+    init(processStartDate: @escaping @Sendable (pid_t) -> Date?) {
+        self.processStartDate = processStartDate
+    }
+
+    static func readProcessStartDate(_ pid: pid_t) -> Date? {
+        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return nil }
+        if let date = app.launchDate { return date }
+        // Dockerなど、LaunchServicesに起動日時がないアプリもPID再利用を検出する。
+        return readKernelStartDate(pid)
+    }
+
+    static func readKernelStartDate(_ pid: pid_t) -> Date? {
+        guard pid > 0 else { return nil }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout.size(ofValue: info))
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size,
+              info.pbi_start_tvsec > 0 else { return nil }
+        return Date(timeIntervalSince1970: Double(info.pbi_start_tvsec) + Double(info.pbi_start_tvusec) / 1_000_000)
+    }
 
     /// 起動日時を世代に含め、同じPIDで再起動したアプリの参照を再利用しない。
     public func session(for pid: pid_t) throws -> AXProcessSession {
-        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
-              let date = app.launchDate else { throw StoreError.processUnavailable }
         lock.lock(); defer { lock.unlock() }
-        guard !app.isTerminated, NSRunningApplication(processIdentifier: pid)?.launchDate == date else {
+        guard let date = processStartDate(pid), processStartDate(pid) == date else {
             throw StoreError.processUnavailable
         }
         if let process = processes[pid], process.launchDate == date { return process.session }
@@ -78,12 +99,11 @@ public final class AXWindowReferenceStore: @unchecked Sendable {
         let current = processes[session.pid]
         lock.unlock()
         if let current, current.session != session { return true }
+        if let date = current?.launchDate, let actual = processStartDate(session.pid) { return date != actual }
         guard let app = NSRunningApplication(processIdentifier: session.pid) else {
             return kill(session.pid, 0) != 0 && errno == ESRCH
         }
-        if app.isTerminated { return true }
-        if let date = current?.launchDate, let actual = app.launchDate { return date != actual }
-        return false
+        return app.isTerminated
     }
 
     /// 呼び手が新しいプロセスの開始を確認したときだけ呼ぶ。毎回の列挙では呼ばない。

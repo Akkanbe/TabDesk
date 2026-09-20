@@ -85,4 +85,55 @@ struct AXWindowReferenceStoreTests {
         }
         #expect(ids.count == 1)
     }
+    @Test func kernelStartDateIsStableWithoutLaunchServicesMetadata() throws {
+        let date = try #require(AXWindowReferenceStore.readKernelStartDate(getpid()))
+        #expect(date <= Date())
+        #expect(AXWindowReferenceStore.readKernelStartDate(getpid()) == date)
+        #expect(AXWindowReferenceStore.readKernelStartDate(-1) == nil)
+        let store = AXWindowReferenceStore(processStartDate: AXWindowReferenceStore.readKernelStartDate)
+        let session = try store.session(for: getpid())
+        #expect(store.isCurrent(session))
+    }
+
+    @Test func processRestartInvalidatesReferencesAndIgnoresDelayedTermination() throws {
+        let clock = ProcessDate(Date(timeIntervalSince1970: 100))
+        let store = AXWindowReferenceStore(processStartDate: { _ in clock.read() })
+        let old = try store.session(for: getpid())
+        let id = try store.referenceID(for: AXUIElementCreateApplication(getpid()), in: old)
+        #expect(try store.session(for: getpid()) == old)
+        clock.set(Date(timeIntervalSince1970: 200))
+        #expect(store.hasEnded(old))
+        let current = try store.session(for: getpid())
+        #expect(current != old)
+        #expect(!store.isCurrent(old))
+        #expect(store.element(for: id, in: old) == nil)
+        store.endProcess(pid: getpid(), launchDate: Date(timeIntervalSince1970: 100))
+        store.endProcess(pid: getpid(), launchDate: nil)
+        #expect(store.isCurrent(current))
+    }
+
+    @Test func missingStartDateRefusesAccessWithoutDiscardingReferences() throws {
+        let clock = ProcessDate(Date(timeIntervalSince1970: 100))
+        let store = AXWindowReferenceStore(processStartDate: { _ in clock.read() })
+        let session = try store.session(for: getpid())
+        let id = try store.referenceID(for: AXUIElementCreateApplication(getpid()), in: session)
+        clock.set(nil)
+        #expect(throws: AXWindowReferenceStore.StoreError.processUnavailable) {
+            try store.session(for: getpid())
+        }
+        #expect(!store.isCurrent(session))
+        #expect(store.element(for: id, in: session) != nil)
+        clock.set(Date(timeIntervalSince1970: 100))
+        #expect(store.isCurrent(session))
+    }
+
+}
+
+
+private final class ProcessDate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var date: Date?
+    init(_ date: Date?) { self.date = date }
+    func read() -> Date? { lock.lock(); defer { lock.unlock() }; return date }
+    func set(_ date: Date?) { lock.lock(); defer { lock.unlock() }; self.date = date }
 }
