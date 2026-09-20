@@ -100,8 +100,8 @@ struct ManualTileEngineTests {
     }
     private func register(_ number: UInt32, engine: TabEngine, driver: FakeWindowDriver, tab: UUID, tile: UUID? = nil) async throws -> ManagedWindow {
         let frame = CGRect(x: 400, y: 100, width: 500, height: 400)
-        driver.add(number, frame: frame)
-        return try await engine.register(windowID: number, pid: 100, identity: identity(Int(number)), frame: frame, into: tab, tileID: tile)
+        driver.add(WindowReferenceID(integerLiteral: number), frame: frame)
+        return try await engine.register(windowID: WindowReferenceID(integerLiteral: number), pid: 100, identity: identity(Int(number)), frame: frame, into: tab, tileID: tile)
     }
 
     @Test func newTabIsTiledAndFullTileRejectsAdditionalWindowBeforeMovingIt() async throws {

@@ -24,6 +24,27 @@ private let fullscreenRect = CGRect(x: 0, y: 0, width: 1920, height: 1200)
 /// 登録後にネイティブフルスクリーンへ入った窓の扱い(v3 段階 2)。
 @MainActor
 struct FullscreenTests {
+    @Test func unknownPermissionDoesNotAdoptUnverifiedEditedFrame() async throws {
+        let (engine, driver) = makeEngine()
+        let tab = engine.createTab(name: "A")
+        let recorded = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: recorded)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: recorded, into: tab.id)
+        engine.editMode = true
+        // 保留状態をまだ観測していない段階でも、読取り失敗時に画面全体の寸法を記録しない。
+        driver.setFullscreenReadFails(1)
+        driver.moveExternally(1, to: fullscreenRect)
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == recorded)
+        #expect(!engine.layoutSuspendedWindowIDs.contains(managed.id))
+
+        driver.setFullscreenReadFails(1, false)
+        driver.moveExternally(1, to: CGRect(x: 350, y: 120, width: 500, height: 400))
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(engine.state.managedWindow(id: managed.id)?.window.frame == driver.currentFrame(1))
+    }
     /// 非アクティブタブのフルスクリーン窓に、reconcile が退避を打ち続けない(修正前は 2 秒ごとに永久リトライ)。
     @Test func fullscreenInactiveWindowIsNotParkedRepeatedly() async throws {
         let (engine, driver) = makeEngine()
@@ -40,7 +61,7 @@ struct FullscreenTests {
             await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
         }
         #expect(driver.callCount("setPosition") == before, "フルスクリーン検出後は退避を試みない")
-        #expect(engine.fullscreenWindowIDs.count == 1)
+        #expect(engine.layoutSuspendedWindowIDs.count == 1)
     }
 
     /// スナップバックがフルスクリーン寸法を「到達 frame」として採用しない(破壊の回帰)。
@@ -58,7 +79,7 @@ struct FullscreenTests {
         try await Task.sleep(for: .milliseconds(300))  // デバウンス×最大試行を跨いでも採用しないこと
 
         #expect(engine.state.managedWindow(id: managed.id)?.window.frame == recorded, "記録 frame を破壊しない")
-        #expect(engine.fullscreenWindowIDs.contains(managed.id), "スナップバック経路の読み直しで検出される")
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id), "スナップバック経路の読み直しで検出される")
     }
 
     /// 解除すると次の reconcile で集合から外れ、ずれ検知経路が記録 frame へ復元する。
@@ -71,13 +92,13 @@ struct FullscreenTests {
         driver.setFullscreen(1)
         driver.moveExternally(1, to: fullscreenRect)
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
-        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id))
 
         driver.setFullscreen(1, false)
         driver.moveExternally(1, to: CGRect(x: 700, y: 300, width: 500, height: 400))  // 解除後のずれ
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])  // 集合から外れ、ずれ検知が復元を予約
         try await Task.sleep(for: .milliseconds(150))
-        #expect(engine.fullscreenWindowIDs.isEmpty)
+        #expect(engine.layoutSuspendedWindowIDs.isEmpty)
         #expect(driver.currentFrame(1) == recorded, "解除後は記録 frame へ戻る")
     }
 
@@ -121,7 +142,7 @@ struct FullscreenTests {
         #expect(engine.state.allWindows.isEmpty)
         #expect(driver.currentFrame(1) == fullscreenRect)
         #expect(driver.callCount("setFrame") + driver.callCount("setPosition") == writesBefore)
-        #expect(engine.fullscreenWindowIDs.isEmpty, "集合からも掃除される")
+        #expect(engine.layoutSuspendedWindowIDs.isEmpty, "集合からも掃除される")
     }
 
     /// レイアウト再適用は論理 frame(clamp / 列)を更新しつつ、フルスクリーン窓には op を出さない。
@@ -162,7 +183,7 @@ struct FullscreenTests {
         driver.setFullscreen(1)
         driver.moveExternally(1, to: fullscreenRect)
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
-        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id))
         // タブを表示(fullscreen 窓は復元 op を出さないので退避フラグは残る = 危険な組み合わせ)。
         try await engine.activate(b.id)
         #expect(engine.parkedWindowIDs.contains(managed.id))
@@ -172,7 +193,7 @@ struct FullscreenTests {
         for _ in 0..<3 {
             await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
         }
-        #expect(engine.fullscreenWindowIDs.contains(managed.id), "読めない間は前回判定を維持")
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id), "読めない間は前回判定を維持")
         #expect(driver.callCount("setFrame") + driver.callCount("setPosition") == writesBefore, "op を出さない")
         #expect(engine.state.managedWindow(id: managed.id)?.window.frame == recorded, "記録 frame を破壊しない")
     }
@@ -186,7 +207,7 @@ struct FullscreenTests {
         driver.setFullscreen(1)
         driver.moveExternally(1, to: fullscreenRect)
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
-        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id))
 
         let requested = CGRect(x: 400, y: 200, width: 600, height: 500)
         let writesBefore = driver.callCount("setFrame")
@@ -220,7 +241,7 @@ struct FullscreenTests {
 
         #expect(managed.frame == recorded)
         #expect(engine.state.managedWindow(id: managed.id)?.window.frame == recorded)
-        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id))
         #expect(driver.currentFrame(1) == fullscreenRect)
     }
 
@@ -250,7 +271,7 @@ struct FullscreenTests {
 
         let expected = CGRect(x: 1_120, y: 520, width: 800, height: 600)
         #expect(engine.state.managedWindow(id: managed.id)?.window.frame == expected)
-        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id))
         #expect(driver.currentFrame(11) == fullscreenRect)
     }
 
@@ -260,15 +281,15 @@ struct FullscreenTests {
         let tab = engine.createTab(name: "A")
         driver.add(1, frame: CGRect(x: 300, y: 100, width: 500, height: 400))
         let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("a"), frame: CGRect(x: 300, y: 100, width: 500, height: 400), into: tab.id)
-        #expect(engine.fullscreenWindowIDs.isEmpty)
+        #expect(engine.layoutSuspendedWindowIDs.isEmpty)
 
         driver.setFullscreen(1)
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
-        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id))
 
         driver.setFullscreen(1, false)
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
-        #expect(engine.fullscreenWindowIDs.isEmpty)
+        #expect(engine.layoutSuspendedWindowIDs.isEmpty)
     }
 
     /// reconcile の次回 tick より先に終了しても、フルスクリーン寸法を保存値へ採用しない。
@@ -325,11 +346,11 @@ struct FullscreenTests {
         driver.add(1, frame: recorded)
         try await engine.register(
             windowID: 1, pid: 100, identity: identity("a"), frame: recorded, into: tab.id)
-        let probesBefore = driver.callCount("isFullscreen:1")
+        let probesBefore = driver.callCount("isLayoutSuspended:1")
 
         await engine.releaseAllParkedWindows()
 
-        #expect(driver.callCount("isFullscreen:1") == probesBefore)
+        #expect(driver.callCount("isLayoutSuspended:1") == probesBefore)
         #expect(driver.currentFrame(1) == recorded)
     }
 
@@ -352,7 +373,7 @@ struct FullscreenTests {
 
         let releaseCalls = Array(driver.callLog().dropFirst(callsBefore))
         let firstRestore = try #require(releaseCalls.firstIndex(of: "setFrame:1"))
-        let secondProbe = try #require(releaseCalls.firstIndex(of: "isFullscreen:2"))
+        let secondProbe = try #require(releaseCalls.firstIndex(of: "isLayoutSuspended:2"))
         #expect(firstRestore < secondProbe, "probe→restoreを窓ごとに進める")
         #expect(driver.currentFrame(1) == first)
         #expect(driver.currentFrame(2) == second)
@@ -389,7 +410,7 @@ struct FullscreenTests {
         await reconciliation.value
 
         #expect(engine.state.managedWindow(id: managed.id)?.window.windowID == 2)
-        #expect(!engine.fullscreenWindowIDs.contains(managed.id),
+        #expect(!engine.layoutSuspendedWindowIDs.contains(managed.id),
             "旧窓の fullscreen=true を新しい binding へ持ち越さない")
         #expect(driver.callCount("setPosition:2") == parksAfterBind,
             "旧窓の frame を新しい binding の退避ずれ判定に使わない")
@@ -407,13 +428,13 @@ struct FullscreenTests {
         driver.setFullscreen(1)
         driver.moveExternally(1, to: fullscreenRect)
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
-        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id))
         #expect(engine.restoreGenerationCountForTesting > 0)
 
         engine.noteWindowDestroyed(windowID: 1)
 
         #expect(engine.state.managedWindow(id: managed.id)?.window.isBound == false)
-        #expect(!engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(!engine.layoutSuspendedWindowIDs.contains(managed.id))
         #expect(engine.restoreGenerationCountForTesting == 0)
     }
 
@@ -429,12 +450,12 @@ struct FullscreenTests {
         driver.setFullscreen(1)
         driver.moveExternally(1, to: fullscreenRect)
         await engine.reconcile(liveWindowIDs: [1], livePIDs: [100])
-        #expect(engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(engine.layoutSuspendedWindowIDs.contains(managed.id))
 
         _ = try await engine.deleteTab(doomed.id)
 
         #expect(engine.state.managedWindow(id: managed.id) == nil)
-        #expect(!engine.fullscreenWindowIDs.contains(managed.id))
+        #expect(!engine.layoutSuspendedWindowIDs.contains(managed.id))
         #expect(engine.restoreGenerationCountForTesting == 0)
     }
 }

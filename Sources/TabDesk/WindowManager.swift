@@ -1,6 +1,5 @@
 import AppKit
 import ApplicationServices
-import AXShim
 import TabDeskCore
 
 
@@ -30,6 +29,26 @@ final class WindowManager {
     let store: StateStore
     /// Cmd-Tab 等で非アクティブタブの窓にフォーカスが移ったら、そのタブへ自動で切り替える(§3.6)。
     let focusFollows = PersistedToggle(key: "FocusFollowsWindow", defaultValue: true)
+    let unregisteredWindowsOnTop = PersistedToggle(key: "UnregisteredWindowsOnTop", defaultValue: false)
+    private var sessionActive = true
+    private lazy var unregisteredWindowController = UnregisteredWindowController(
+        context: { [weak self] in
+            guard let self, self.unregisteredWindowsOnTop.value, self.isTrusted, !self.isTerminating,
+                  self.sessionActive, self.initialRestoreDone,
+                  self.inFlight.isEmpty, self.pendingNavigationCount == 0, self.focusSwitchDepth == 0,
+                  !self.isReapplyingLayout, self.suppressAppActivation?() != true,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier != getpid(),
+                  NSEvent.pressedMouseButtons == 0 else { return nil }
+            return Set(self.engine.state.allWindows.compactMap(\.windowID))
+        }, onFronting: { [logger] count in logger.log("unregistered windows: bringing \(count) window(s) forward") },
+        onError: { [logger] error in logger.log("unregistered window fronting failed: \(error)") })
+
+    func setUnregisteredWindowsOnTop(_ enabled: Bool) {
+        unregisteredWindowsOnTop.value = enabled
+        unregisteredWindowController.invalidate()
+        if enabled { unregisteredWindowController.request() }
+    }
+
     /// true を返す間は切替後のアプリ前面化を行わない(サイドバーで改名中など)。
     var suppressAppActivation: (@MainActor () -> Bool)?
     /// UI 向けの状態変更通知(エンジンの onStateChanged はここが占有し、保存とあわせて配る)。
@@ -64,6 +83,8 @@ final class WindowManager {
     private var lastOnScreenIDs: Set<CGWindowID> = []
     private var reconcileTask: Task<Void, Never>?
     private var layoutReapplyTask: Task<Void, Never>?
+    var isReapplyingLayout: Bool { layoutReapplyTask != nil }
+    func waitForLayoutReapply() async { await layoutReapplyTask?.value }
     /// 連続する画面変更通知で、古い reapply Task が新しい通知抑止を解除しないための世代。
     private var layoutChangeGeneration: UInt64 = 0
     private(set) var isTerminating = false
@@ -71,20 +92,20 @@ final class WindowManager {
     private var lastExistingIDs: Set<CGWindowID> = []
     private var observers: [pid_t: AppWindowObserver] = [:]
     /// destroyed 通知は壊れた要素で届くので ID を引けない。登録時の要素を覚えておき CFEqual で突き合わせる。
-    private var elements: [CGWindowID: (pid: pid_t, element: AXUIElement)] = [:]
+    private var elements: [WindowReferenceID: (pid: pid_t, element: AXUIElement)] = [:]
     private var reconcileTimer: Timer?
     private var mouseUpMonitor: Any?
     private let executor = BlockingExecutor()
     /// フォーカス通知は最後に届いたものだけを処理する。切替中の通知も捨てず、完了後に再検証する。
     private var focusFollowTask: Task<Void, Never>?
-    private var pendingFocusedWindowID: CGWindowID?
+    private var pendingFocusedWindowID: WindowReferenceID?
     private var focusGeneration: UInt64 = 0
     private var focusSwitchDepth = 0
     /// focused-window 通知を購読できないアプリは、前面にいる間だけ reconcile で補完する。
     private var focusPollingPIDs: Set<pid_t> = []
     /// engine.register / engine.bind の await 中の窓(windowID → pid)。二重登録を入口で弾くのに加え、
     /// elements は commit 後にしか入らないため、その pid の observer を途中で捨てないための印でもある。
-    private var inFlight: [CGWindowID: pid_t] = [:]
+    private var inFlight: [WindowReferenceID: pid_t] = [:]
 
     private func observerIsUnused(pid: pid_t) -> Bool {
         !elements.values.contains(where: { $0.pid == pid }) && !inFlight.values.contains(pid)
@@ -93,6 +114,7 @@ final class WindowManager {
     /// 同じ実ウィンドウに対する register / bind の競合を防ぐ予約。
     private func reserveRegistration(of window: AXWindow) -> Bool {
         guard inFlight[window.windowID] == nil else { return false }
+        unregisteredWindowController.invalidate()
         inFlight[window.windowID] = window.pid
         return true
     }
@@ -112,7 +134,7 @@ final class WindowManager {
     }
 
     enum RegistrationError: Error, CustomStringConvertible {
-        case alreadyInProgress(CGWindowID)
+        case alreadyInProgress(WindowReferenceID)
         /// 移動・リサイズ通知(位置固定の要)を購読できないアプリ。登録は行わない(半端な登録を残さない)。
         case observerUnavailable(pid: pid_t, underlying: String)
         /// フルスクリーン/最小化中の窓(列挙後にメニューが古くなっていた場合の直前再チェック)。
@@ -174,6 +196,7 @@ final class WindowManager {
         engine = TabEngine(driver: driver, layout: layout, initialState: initial)
         engine.log = { logger.log($0) }
         engine.onStateChanged = { [weak self] state in
+            self?.unregisteredWindowController.invalidate()
             self?.scheduleSave()
             self?.onStateChanged?(state)
         }
@@ -197,6 +220,10 @@ final class WindowManager {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(appDidActivate(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        for name in [NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(
+                self, selector: #selector(sessionActivityChanged(_:)), name: name, object: nil)
+        }
         // ネイティブフルスクリーンの開始・解除は Space 切替として届く。on-screen ID は開始前後で
         // 変化しない場合があるため、未復元エントリがあるときだけ明示的に再照合する。
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -374,10 +401,10 @@ final class WindowManager {
         // 列挙後にフルスクリーン化/最小化されていることがあるので直前に読み直す(register と同じ)。
         // false を返せば未復元のまま残り、解除後の自動復元で再試行される。
         let window = record.window
-        let (fullscreen, minimized) = await executor.run { (window.isFullscreen, window.isMinimized) }
+        let (fullscreen, minimized) = await executor.run { (window.isLayoutSuspended, window.isMinimized) }
         guard !isTerminating else { return false }
         guard !fullscreen, !minimized else {
-            logger.log("bind skipped: \(record.appName) is \(fullscreen ? "fullscreen" : "minimized")")
+            logger.log("bind skipped: \(record.appName) is \(fullscreen ? "layout suspended or unknown" : "minimized")")
             return false
         }
         do {
@@ -419,7 +446,11 @@ final class WindowManager {
     }
 
     /// 診断用: 実ウィンドウの現在 frame(AX 座標)。
-    func currentFrame(of windowID: CGWindowID) throws -> CGRect {
+    func cgWindowID(for id: WindowReferenceID) async -> CGWindowID? {
+        await executor.run { [driver] in driver.cgWindowID(for: id) }
+    }
+
+    func currentFrame(of windowID: WindowReferenceID) throws -> CGRect {
         try driver.frame(of: windowID)
     }
 
@@ -444,10 +475,14 @@ final class WindowManager {
     /// 切替中に届いたフォーカス通知を、最も外側の切替が完了するまで保留する。
     private func performFocusSwitch(_ operation: () async throws -> TabEngine.SwitchReport?) async throws {
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
+        unregisteredWindowController.invalidate()
         focusSwitchDepth += 1
         defer {
             focusSwitchDepth -= 1
-            if focusSwitchDepth == 0 { schedulePendingFocusFollow() }
+            if focusSwitchDepth == 0 {
+                schedulePendingFocusFollow()
+                unregisteredWindowController.request()
+            }
         }
         let report = try await operation()
         // 終了開始前に入った切替は AX IPC 待ちから後で戻り得る。beginTermination() が
@@ -461,12 +496,15 @@ final class WindowManager {
             let tab = engine.state.tab(withID: outgoing),
             let window = tab.representativeWindow, let windowID = window.windowID
         {
-            thumbnails.capture(tabID: outgoing, windowID: windowID)
+            guard let pid = window.pid else { return }
+            thumbnails.capture(tabID: outgoing, pid: pid) { [driver, executor] in
+                await executor.run { driver.cgWindowID(for: windowID) }
+            }
         }
     }
 
     /// 非アクティブタブの窓にフォーカスが移ったら、そのタブへ切り替える。
-    private func maybeFollowFocus(windowID: CGWindowID) {
+    private func maybeFollowFocus(windowID: WindowReferenceID) {
         guard !isTerminating else { return }
         focusGeneration &+= 1
         pendingFocusedWindowID = windowID
@@ -484,7 +522,7 @@ final class WindowManager {
         }
     }
 
-    private func performFocusFollow(windowID: CGWindowID, generation: UInt64) async {
+    private func performFocusFollow(windowID: WindowReferenceID, generation: UInt64) async {
         // ユーザー起点の切替が進行中に割り込まれた場合は、通知を捨てずに保留へ残し、
         // activate() 完了後の schedulePendingFocusFollow に再検証を委ねる。
         var deferToPostSwitch = false
@@ -528,7 +566,7 @@ final class WindowManager {
     }
 
     /// 相手アプリへの同期 AX IPC は MainActor 外で行う。
-    private func focusedWindowID(pid: pid_t) async -> CGWindowID? {
+    private func focusedWindowID(pid: pid_t) async -> WindowReferenceID? {
         await executor.run {
             let appElement = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(appElement, 0.5)
@@ -538,13 +576,12 @@ final class WindowManager {
                 let value, CFGetTypeID(value) == AXUIElementGetTypeID()
             else { return nil }
             let element = unsafeDowncast(value, to: AXUIElement.self)
-            var windowID: CGWindowID = 0
-            guard AXShimGetWindowID(element, &windowID) == .success else { return nil }
-            return windowID
+            guard let session = try? AXWindowReferenceStore.shared.session(for: pid) else { return nil }
+            return AXWindowReferenceStore.shared.existingID(for: element, in: session)
         }
     }
 
-    private func recordFocusedWindow(_ windowID: CGWindowID) {
+    private func recordFocusedWindow(_ windowID: WindowReferenceID) {
         engine.noteWindowFocused(windowID: windowID)
         // v4: 「選択中のディスプレイ」のキャッシュをフォーカス通知で無料更新する
         // (管理対象の窓なら AX なしでタブから画面が引ける)。
@@ -584,6 +621,7 @@ final class WindowManager {
     /// 受付時に操作先を確定し、AX完了を待たず次のキーへ引き継ぐ。
     func navigate(_ action: HotkeyAction) {
         guard !isTerminating else { return }
+        unregisteredWindowController.invalidate()
         let current = selectedDisplayID()
         let displayID: DisplayID
         let operation: NavigationOperation
@@ -621,6 +659,7 @@ final class WindowManager {
                     navigationTask = nil
                     displayNavigation.completed(focus: currentDisplayFocus())
                     schedulePendingFocusFollow()
+                    unregisteredWindowController.request()
                 }
                 onDisplaySelectionChanged?()
             }
@@ -702,7 +741,7 @@ final class WindowManager {
             let element = unsafeDowncast(value, to: AXUIElement.self)
             AXUIElementSetMessagingTimeout(element, 1.0)
             guard let window = try? AXWindow(element: element, pid: pid), window.isStandard,
-                !window.isFullscreen, !window.isMinimized
+                !window.isLayoutSuspended, !window.isMinimized
             else { return nil }
             return WindowRecord(
                 window: window,
@@ -711,7 +750,7 @@ final class WindowManager {
                 title: window.title,
                 frame: try? window.frame(),
                 isMinimized: window.isMinimized,
-                fullscreenRaw: window.fullscreenRaw)
+                layoutSuspension: window.layoutSuspension)
         }
         guard !isTerminating, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
         guard let record else {
@@ -752,7 +791,7 @@ final class WindowManager {
         if !stats.appFailureDetails.isEmpty {
             logger.log("enumerate: unavailable apps: \(stats.appFailureDetails)")
         }
-        // 除外は必ずログに残す(AXFullScreen の実測と、誤検知で普通の窓が消えた場合の発見手段)。
+        // 除外は必ずログに残す(位置変更可否の実測と、誤検知で普通の窓が消えた場合の発見手段)。
         if !stats.exclusionDetails.isEmpty {
             logger.log("enumerate: excluded: \(stats.exclusionDetails)")
         }
@@ -797,11 +836,11 @@ final class WindowManager {
         let window = record.window
         // メニュー表示中に状態が変わりうるので、frame と一緒にフルスクリーン/最小化も登録直前に読み直す。
         let (current, fullscreen, minimized) = try await executor.run {
-            (try window.frame(), window.isFullscreen, window.isMinimized)
+            (try window.frame(), window.isLayoutSuspended, window.isMinimized)
         }
         guard !isTerminating else { throw TabEngine.EngineError.shuttingDown }
         guard !fullscreen, !minimized else {
-            throw RegistrationError.notRegistrable(reason: fullscreen ? "fullscreen" : "minimized")
+            throw RegistrationError.notRegistrable(reason: fullscreen ? "layout suspended or unknown" : "minimized")
         }
         // v4: 配置先はタブの画面(エンジン側の判定と揃える。別画面の窓はタブの画面へ引き込まれる)。
         let tabDisplay = engine.state.tab(withID: tabID).flatMap { tab in
@@ -852,6 +891,7 @@ final class WindowManager {
     func beginTermination() {
         guard !isTerminating else { return }
         isTerminating = true
+        unregisteredWindowController.invalidate()
         engine.beginShutdown()
         reconcileTimer?.invalidate()
         reconcileTimer = nil
@@ -930,18 +970,19 @@ final class WindowManager {
         guard !isTerminating else { return }
         switch notification {
         case kAXWindowMovedNotification, kAXWindowResizedNotification:
-            var wid: CGWindowID = 0
-            guard AXShimGetWindowID(element, &wid) == .success else { return }
+            guard let entry = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) }) else { return }
+            let wid = entry.key
             engine.windowFrameDidChange(windowID: wid)
         case kAXFocusedWindowChangedNotification:
-            var wid: CGWindowID = 0
-            guard AXShimGetWindowID(element, &wid) == .success else { return }
+            guard let entry = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) }) else { return }
+            let wid = entry.key
             recordFocusedWindow(wid)
         case kAXUIElementDestroyedNotification:
             // 壊れた要素からは ID が取れないので、登録時の要素と比較する。
             guard let entry = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) }) else { return }
             // アプリごと終了した場合は除去せず「未復元」として保持する(再起動後に自動で戻す)。
             let appTerminated = NSRunningApplication(processIdentifier: pid)?.isTerminated ?? true
+            driver.retireReference(entry.key)
             engine.noteWindowDestroyed(windowID: entry.key, appTerminated: appTerminated)
             forgetWindow(entry.key)
         default:
@@ -949,7 +990,7 @@ final class WindowManager {
         }
     }
 
-    private func forgetWindow(_ windowID: CGWindowID) {
+    private func forgetWindow(_ windowID: WindowReferenceID) {
         driver.forget(windowID)
         guard let entry = elements.removeValue(forKey: windowID) else { return }
         observers[entry.pid]?.removeNotification(kAXUIElementDestroyedNotification, element: entry.element)
@@ -963,8 +1004,14 @@ final class WindowManager {
 
     // MARK: - ポーリングと NSWorkspace
 
+    @objc private func sessionActivityChanged(_ notification: Notification) {
+        sessionActive = notification.name == NSWorkspace.sessionDidBecomeActiveNotification
+        unregisteredWindowController.invalidate()
+    }
+
     private func reconcileTick() {
         guard isTrusted, !isTerminating, reconcileTask == nil else { return }  // 前回が終わるまで重ねない
+        unregisteredWindowController.request()
         let live = WindowEnumerator.existingWindowIDs()
         let livePIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
         let appeared = live.subtracting(lastExistingIDs)
@@ -980,7 +1027,13 @@ final class WindowManager {
         reconcileTask = Task { [weak self] in
             guard let self else { return }
             defer { self.reconcileTask = nil }
-            await self.engine.reconcile(liveWindowIDs: live, livePIDs: livePIDs)
+            let invalidated = await self.driver.invalidatedWindowIDs()
+            guard !Task.isCancelled, !self.isTerminating else { return }
+            for id in invalidated {
+                self.driver.retireReference(id)
+                self.engine.noteWindowReferenceLost(windowID: id)
+            }
+            await self.engine.reconcile(liveWindowIDs: before, livePIDs: livePIDs)
             guard !Task.isCancelled, !self.isTerminating else { return }
             let after = Set(self.engine.state.allWindows.compactMap(\.windowID))
             for gone in before.subtracting(after) {
@@ -1020,6 +1073,7 @@ final class WindowManager {
         layoutReapplyTask?.cancel()
         layoutReapplyTask = Task { [weak self] in
             guard let self, generation == self.layoutChangeGeneration, !self.isTerminating else { return }
+            defer { self.finishLayoutReapply(generation: generation) }
             if self.isTrusted {
                 await self.engine.reapplyLayout()
                 guard generation == self.layoutChangeGeneration, !self.isTerminating else { return }
@@ -1032,15 +1086,17 @@ final class WindowManager {
     }
 
     /// 画面変更・復帰は短時間に連発するので 1 秒でまとめてから再適用する。
-    @objc private func layoutMayHaveChanged(_ notification: Notification) {
+    @objc func layoutMayHaveChanged(_ notification: Notification) {
         guard !isTerminating else { return }
         layoutChangeGeneration &+= 1
         let generation = layoutChangeGeneration
         engine.beginLayoutTransition()
         layoutReapplyTask?.cancel()
         layoutReapplyTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.finishLayoutReapply(generation: generation) }
             try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled, let self, generation == self.layoutChangeGeneration, !self.isTerminating else { return }
+            guard !Task.isCancelled, generation == self.layoutChangeGeneration, !self.isTerminating else { return }
             guard self.isTrusted else {
                 self.engine.endLayoutTransition()
                 return
@@ -1052,10 +1108,20 @@ final class WindowManager {
         }
     }
 
+    private func finishLayoutReapply(generation: UInt64) {
+        // 古いTaskのキャンセル完了が、後から始まったレイアウト変更のバリアを解除しない。
+        guard generation == layoutChangeGeneration else { return }
+        layoutReapplyTask = nil
+        unregisteredWindowController.request()
+    }
+
     @objc private func appDidTerminate(_ notification: Notification) {
         guard !isTerminating else { return }
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         let pid = app.processIdentifier
+        if let current = NSRunningApplication(processIdentifier: pid), !current.isTerminated,
+           current.launchDate != app.launchDate { return }
+        AXWindowReferenceStore.shared.endProcess(pid: pid, launchDate: app.launchDate)
         let gone = elements.filter { $0.value.pid == pid }.map(\.key)
         guard !gone.isEmpty else { return }
         logger.log("app terminated: \(app.localizedName ?? "pid \(pid)") (\(gone.count) windows kept as unbound)")

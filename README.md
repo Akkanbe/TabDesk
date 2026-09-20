@@ -161,13 +161,14 @@ AppKit の初期化・描画が Core の応答時間テストへ干渉しない�
   うっすらした枠が敷かれ、タブが「容れ物」のように見える(既定 OFF。クリックは素通し)
 - メニューバーの「タブサムネイルを表示」を ON にすると、タブを切り替えるたびに離れたタブの
   代表ウィンドウが撮影され、タブ行の下にサムネイルとして表示される(既定 OFF)。
+  同名・同位置の窓など、公開情報では撮影対象を一意に特定できない場合は、その回の撮影を省略する。
   初回 ON 時に**画面収録**の権限を求められる(付与後は再起動が必要な場合あり。
   macOS の仕様で月次の再承認ダイアログも出る)
 
 タブ構成は `~/Library/Application Support/TabDesk/state.json` に自動保存され、次回起動時に復元される。
 再起動後は bundle ID・タイトル・サイズで同じウィンドウを推定して紐付け直す。推定できなかったものは
 一覧に「(未復元)」とグレー表示され、クリックするといま開いているウィンドウを手で割り当てられる。
-登録したアプリを終了した場合も「未復元」として残り、アプリを起動し直すと自動で戻る(窓だけ閉じた場合は登録から外れる)。
+登録したアプリを終了した場合も「未復元」として残り、アプリを起動し直すと自動で戻る。窓の破棄通知を受けた場合は登録から外れるが、通知がなくAX参照の失効だけを検出した場合は、取り違えを避けるため「未復元」として残す。
 
 ログ: `~/Library/Logs/TabDesk/tabdesk.log`(メニューバーの「ログを開く」)
 
@@ -192,15 +193,19 @@ open -g 'tabdesk://status'
 open -g 'tabdesk://windows'                # 登録可能なウィンドウ一覧をログに出す
 open -g 'tabdesk://tab?name=Work'          # 選択中の画面に作成
 open -g 'tabdesk://tab?display=1'          # 画面 index を指定(名前は画面ごとの連番)
-open -g 'tabdesk://add?wid=123&tab=Work'   # tab 省略時は選択中の画面のアクティブタブ
+open -g 'tabdesk://add?ref=<UUID>&tab=Work'   # tab 省略時は選択中の画面のアクティブタブ
 open -g 'tabdesk://activate?name=Work'
-open -g 'tabdesk://remove?wid=123'
+open -g 'tabdesk://remove?ref=<UUID>'
 open -g 'tabdesk://edit?on=1'
 open -g 'tabdesk://restore'               # 未復元エントリの紐付けをやり直す(strict=1 で厳しめ)
 open -g 'tabdesk://save'                  # 今すぐ保存
 open -g 'tabdesk://dump'                  # 座標の突き合わせ(診断)
 open -g 'tabdesk://quit'
 ```
+
+`<UUID>` は `windows` / `dump`（PoCは `list`）に表示される `ref` に置き換えてください。
+これは実行中のAX参照の識別子で、OSの窓番号や保存された登録UUIDとは別です。
+従来の `wid=<OSの窓番号>` も公開情報で一意に照合できる場合は使えます。曖昧な場合は操作せず、ログにエラーを出します。
 
 ## タイルモード
 
@@ -272,20 +277,19 @@ PoC を証明書で署名し直す場合は `PRODUCT=TabDeskPoC CODESIGN_IDENTIT
 ```bash
 scripts/poc.sh status
 scripts/poc.sh list                         # ウィンドウ一覧をログに出す
-scripts/poc.sh 'add?set=A&wid=123,456'
-scripts/poc.sh 'place?wid=123&where=left'   # left | right | full
+scripts/poc.sh 'add?set=A&ref=<UUID1>,<UUID2>'
+scripts/poc.sh 'place?ref=<UUID>&where=left'   # left | right | full
 scripts/poc.sh 'show?set=B'
 scripts/poc.sh 'bench?rounds=10&parallel=1'
 scripts/poc.sh 'watch?on=1&mode=debounced&ms=250'   # スナップバック監視(mode=immediate で即時)
 scripts/poc.sh 'edit?on=1'                  # 編集モード
-scripts/poc.sh 'move?wid=123&x=100&y=50&w=800&h=600'  # 任意 frame へ移動(AX 座標)
+scripts/poc.sh 'move?ref=<UUID>&x=100&y=50&w=800&h=600'  # 任意 frame へ移動(AX 座標)
 scripts/poc.sh log                          # ログ末尾を表示
 ```
 
 ## 構成
 
 ```text
-Sources/AXShim/    私有関数 _AXUIElementGetWindow を dlsym で解決する C シム(私有 API 依存はここだけ)
 Sources/TabDesk/       本体アプリ: サイドバー(NSPanel)・メニューバー・AX 通知とエンジンの配線
 Sources/TabDeskCore/   コアモジュール: データモデル・TabEngine(切替/復元/整合性)・AX ラッパー
 Tests/TabDeskCoreTests/ エンジンのユニットテスト(偽ドライバ使用)
@@ -294,3 +298,11 @@ Resources/<Product>/   各アプリの Info.plist(TabDesk / TabDeskPoC)
 scripts/           ビルド・操作スクリプト
 docs/              仕様書
 ```
+
+
+### 未登録ウィンドウを前面に保つ
+
+メニューバーの「未登録のウィンドウを最前面に保つ」をONにすると、タブ未登録の通常窓が登録済み窓に隠れた際に前へ戻します（既定OFF、設定は保存）。
+タブ切替後と約2秒間隔で補正し、未登録窓への入力フォーカス移動を許容します。
+最小化・別Space・フルスクリーン等の窓は呼び戻しません。OSの特殊な浮動パネルより上に固定する機能ではありません。
+動作範囲と試験内容は [未登録ウィンドウ設定](docs/26_unregistered_windows_on_top.md) を参照してください。

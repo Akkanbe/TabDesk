@@ -17,12 +17,12 @@ private func regressionEntry(
 }
 
 private func regressionCandidate(
-    _ windowID: CGWindowID, bundleID: String = "test.browser", title: String,
+    _ windowID: WindowReferenceID, bundleID: String = "test.browser", title: String,
     size: CGSize = regressionSize
 ) -> WindowMatcher.Candidate {
     WindowMatcher.Candidate(
         windowID: windowID,
-        pid: pid_t(windowID),
+        pid: pid_t(windowID.fixtureNumber),
         bundleID: bundleID,
         title: title,
         size: size)

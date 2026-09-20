@@ -64,6 +64,7 @@ public enum L10n {
         case windowOperationFailed
         case showSidebar
         case collapseSidebar
+        case unregisteredWindowsOnTop
         case alwaysOnTop
         case followFocus
         case launchAtLogin

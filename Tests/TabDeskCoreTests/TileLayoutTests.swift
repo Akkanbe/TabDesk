@@ -10,7 +10,7 @@ struct TileLayoutTests {
             id: id,
             frame: CGRect(x: 300, y: 100, width: 400, height: 300),
             identity: WindowIdentity(bundleID: "test.app", appName: "App", title: "T", registeredSize: CGSize(width: 400, height: 300)),
-            windowID: bound ? CGWindowID.random(in: 1...99999) : nil,
+            windowID: bound ? WindowReferenceID() : nil,
             pid: bound ? 100 : nil)
     }
 

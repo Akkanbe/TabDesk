@@ -11,7 +11,7 @@ struct MigrationTests {
         ManagedWindow(
             frame: CGRect(x: 300, y: 100, width: 500, height: 400),
             identity: WindowIdentity(bundleID: "test.\(name)", appName: name, title: name, registeredSize: CGSize(width: 500, height: 400)),
-            windowID: bound ? CGWindowID.random(in: 1...99999) : nil,
+            windowID: bound ? WindowReferenceID() : nil,
             pid: bound ? 100 : nil,
             displayID: display)
     }

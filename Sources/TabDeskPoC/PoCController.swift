@@ -1,6 +1,5 @@
 import AppKit
 import ApplicationServices
-import AXShim
 import TabDeskCore
 
 /// v0 検証項目を実行するコントローラ。UI と URL スキームの両方から同じメソッドを叩く。
@@ -30,7 +29,7 @@ final class PoCController {
 
     let logger: PoCLogger
     private(set) var records: [WindowRecord] = []
-    private(set) var entries: [CGWindowID: Entry] = [:]
+    private(set) var entries: [WindowReferenceID: Entry] = [:]
     private(set) var activeSet: SetName?
     private(set) var watching = false
     var parallel = false
@@ -49,7 +48,7 @@ final class PoCController {
     private static let maxRestoreAttempts = 3
 
     private var observers: [pid_t: AppWindowObserver] = [:]
-    private var pendingRestores: [CGWindowID: DispatchWorkItem] = [:]
+    private var pendingRestores: [WindowReferenceID: DispatchWorkItem] = [:]
 
     init(logger: PoCLogger) {
         self.logger = logger
@@ -62,7 +61,7 @@ final class PoCController {
     func status() {
         let screen = ScreenGeometry.primaryScreen
         logger.log("status: accessibility=\(isTrusted ? "granted" : "NOT granted") " +
-            "_AXUIElementGetWindow=\(AXShimIsAvailable() ? "available" : "MISSING") " +
+            "windowIdentity=public-AX " +
             "primaryScreen=\(screen.map { "\(ScreenGeometry.fullFrameAX(of: $0))" } ?? "none") " +
             "visible=\(screen.map { "\(ScreenGeometry.visibleFrameAX(of: $0))" } ?? "none") " +
             "contentArea=\(contentArea.map { "\($0)" } ?? "none")")
@@ -83,18 +82,10 @@ final class PoCController {
         let sw = Stopwatch()
         let (found, stats) = WindowEnumerator.standardWindows()
         records = found
-        let axIDs = Set(records.map(\.window.windowID))
-        let cgIDs = WindowEnumerator.onScreenWindowIDs()
-        let onScreenNotInAX = cgIDs.subtracting(axIDs).count
-        logger.log("refresh: \(records.count) standard windows in \(fmt(sw.elapsedMs)) ms; " +
-            "AX∩CG=\(axIDs.intersection(cgIDs).count) AX-only(minimized等)=\(axIDs.subtracting(cgIDs).count) " +
-            "CG-only(非標準/他アプリ)=\(onScreenNotInAX)")
+        logger.log("refresh: \(records.count) standard windows in \(fmt(sw.elapsedMs)) ms; public AX references")
         logger.log("refresh: \(stats)")
-        if !stats.windowIDFailures.isEmpty {
-            logger.log("refresh: ⚠ _AXUIElementGetWindow failed for some elements — 検証項目 2 要確認")
-        }
         // 閉じられたウィンドウをセットから外す。
-        for (wid, entry) in entries where (try? entry.window.frame()) == nil {
+        for (wid, entry) in entries where entry.window.referenceStatus() == .invalidated {
             logger.log("refresh: drop closed window \(wid) (\(entry.appName) / \(entry.title))")
             entries.removeValue(forKey: wid)
         }
@@ -105,14 +96,14 @@ final class PoCController {
     func list() {
         for r in records {
             let set = entries[r.window.windowID]?.set.rawValue ?? "-"
-            logger.log("  [\(set)] wid=\(r.window.windowID) pid=\(r.window.pid) \(r.appName) | \(r.title) | " +
+            logger.log("  [\(set)] ref=\(r.window.windowID) pid=\(r.window.pid) \(r.appName) | \(r.title) | " +
                 "\(r.frame.map { fmt($0) } ?? "?")\(r.isMinimized ? " (minimized)" : "")")
         }
     }
 
     // MARK: - セット管理
 
-    func add(_ wids: [CGWindowID], to set: SetName) {
+    func add(_ wids: [WindowReferenceID], to set: SetName) {
         for wid in wids {
             guard let r = records.first(where: { $0.window.windowID == wid }) else {
                 logger.log("add: wid \(wid) not in list (refresh first?)")
@@ -139,7 +130,7 @@ final class PoCController {
         onChanged?()
     }
 
-    func remove(_ wids: [CGWindowID]) {
+    func remove(_ wids: [WindowReferenceID]) {
         for wid in wids {
             guard let entry = entries[wid] else { continue }
             // 退避位置のまま追跡を手放すと、以後戻す手段がなくなる。固定位置へ戻せたときだけ外す。
@@ -153,7 +144,7 @@ final class PoCController {
     }
 
     /// 追跡を手放す前に固定位置へ戻す。失敗時は entry を保持し、画面隅の窓を追跡不能にしない。
-    private func release(_ entry: Entry, windowID: CGWindowID, reason: String) -> Bool {
+    private func release(_ entry: Entry, windowID: WindowReferenceID, reason: String) -> Bool {
         do {
             let actual = try entry.window.setFrame(entry.recordedFrame)
             // raise 不能でもframeが戻っていれば追跡を手放してよい。
@@ -190,7 +181,7 @@ final class PoCController {
             width: visible.width - Self.sidebarWidth, height: visible.height)
     }
 
-    func place(_ wids: [CGWindowID], _ placement: Placement) {
+    func place(_ wids: [WindowReferenceID], _ placement: Placement) {
         guard let area = contentArea else { return }
         let target: CGRect
         switch placement {
@@ -221,7 +212,7 @@ final class PoCController {
         onChanged?()
     }
 
-    func park(_ wids: [CGWindowID]) {
+    func park(_ wids: [WindowReferenceID]) {
         guard let screen = ScreenGeometry.primaryScreen else { return }
         let point = ScreenGeometry.parkPoint(on: screen)
         for wid in wids {
@@ -245,7 +236,7 @@ final class PoCController {
         onChanged?()
     }
 
-    func restore(_ wids: [CGWindowID]) {
+    func restore(_ wids: [WindowReferenceID]) {
         for wid in wids {
             guard var entry = entries[wid] else { continue }
             let sw = Stopwatch()
@@ -267,7 +258,7 @@ final class PoCController {
     }
 
     /// 任意の frame へ移動する。セット未登録のウィンドウも対象(検証で動かした窓を元へ戻す用途)。
-    func move(_ wid: CGWindowID, to frame: CGRect) {
+    func move(_ wid: WindowReferenceID, to frame: CGRect) {
         let window: AXWindow
         let name: String
         if let e = entries[wid] {
@@ -303,7 +294,7 @@ final class PoCController {
             case park(CGPoint)
             case restore(CGRect)
         }
-        let wid: CGWindowID
+        let wid: WindowReferenceID
         let window: AXWindow
         let kind: Kind
     }
@@ -328,7 +319,7 @@ final class PoCController {
         }
 
         let sw = Stopwatch()
-        let failures: [(CGWindowID, String)]
+        let failures: [(WindowReferenceID, String)]
         if parallel {
             failures = Self.runParallel(ops, logger: logger)
         } else {
@@ -367,8 +358,8 @@ final class PoCController {
         }
     }
 
-    private nonisolated static func runSequential(_ ops: [Op]) -> [(CGWindowID, String)] {
-        var failures: [(CGWindowID, String)] = []
+    private nonisolated static func runSequential(_ ops: [Op]) -> [(WindowReferenceID, String)] {
+        var failures: [(WindowReferenceID, String)] = []
         for op in ops {
             do { try run(op) } catch { failures.append((op.wid, "\(error)")) }
         }
@@ -377,9 +368,9 @@ final class PoCController {
 
     /// pid ごとに別スレッドで実行する。AX 呼び出しは相手アプリへの同期 IPC なので、
     /// 1 アプリが遅くても他アプリの移動はブロックされない。
-    private nonisolated static func runParallel(_ ops: [Op], logger: PoCLogger) -> [(CGWindowID, String)] {
+    private nonisolated static func runParallel(_ ops: [Op], logger: PoCLogger) -> [(WindowReferenceID, String)] {
         let groups = Dictionary(grouping: ops, by: \.window.pid)
-        let failures = Locked<[(CGWindowID, String)]>([])
+        let failures = Locked<[(WindowReferenceID, String)]>([])
         let timings = Locked<[String]>([])
         let finishedPIDs = Locked<Set<pid_t>>([])
         let group = DispatchGroup()
@@ -452,7 +443,7 @@ final class PoCController {
                     pid: pid,
                     requiredNotifications: [kAXWindowMovedNotification, kAXWindowResizedNotification]
                 ) { [weak self] notification, element in
-                    self?.handleWindowChange(notification, element)
+                    self?.handleWindowChange(notification, element, pid: pid)
                 }
             } catch {
                 logger.log("watch: observer for pid \(pid) FAILED: \(error)")
@@ -460,9 +451,10 @@ final class PoCController {
         }
     }
 
-    private func handleWindowChange(_ notification: String, _ element: AXUIElement) {
-        var wid: CGWindowID = 0
-        guard AXShimGetWindowID(element, &wid) == .success, var entry = entries[wid] else { return }
+    private func handleWindowChange(_ notification: String, _ element: AXUIElement, pid: pid_t) {
+        guard let matched = entries.first(where: { $0.value.window.pid == pid && CFEqual($0.value.window.element, element) }) else { return }
+        let wid = matched.key
+        var entry = matched.value
         // 退避操作そのものが kAXWindowMoved を発火させる(show()/park() の復帰後にランループで届く)。
         // 退避中ウィンドウの通知を編集モードで「新しい固定位置」として記録すると右下隅が基準になって
         // しまうので、編集モード判定より先に弾く。
@@ -498,7 +490,7 @@ final class PoCController {
         }
     }
 
-    private func scheduleRestore(wid: CGWindowID, attempt: Int, reason: String) {
+    private func scheduleRestore(wid: WindowReferenceID, attempt: Int, reason: String) {
         pendingRestores[wid]?.cancel()
         let item = DispatchWorkItem { [weak self] in
             self?.performDebouncedRestore(wid: wid, attempt: attempt, reason: reason)
@@ -507,7 +499,7 @@ final class PoCController {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(debounceMs), execute: item)
     }
 
-    private func performDebouncedRestore(wid: CGWindowID, attempt: Int, reason: String) {
+    private func performDebouncedRestore(wid: WindowReferenceID, attempt: Int, reason: String) {
         pendingRestores[wid] = nil
         guard var entry = entries[wid], !entry.isParked, entry.set == activeSet, !editMode else { return }
         guard let current = try? entry.window.frame() else { return }
@@ -545,7 +537,23 @@ final class PoCController {
         let command = comps.host ?? ""
         var q: [String: String] = [:]
         for item in comps.queryItems ?? [] { q[item.name] = item.value ?? "" }
-        let wids = (q["wid"] ?? "").split(separator: ",").compactMap { CGWindowID($0.trimmingCharacters(in: .whitespaces)) }
+        var wids: [WindowReferenceID] = []
+        if let refs = q["ref"] {
+            let tokens = refs.split(separator: ",")
+            wids = tokens.compactMap { WindowReferenceID(uuidString: $0.trimmingCharacters(in: .whitespaces)) }
+            guard !tokens.isEmpty, wids.count == tokens.count else { logger.log("url: invalid ref"); return }
+        } else if let numbers = q["wid"] {
+            let windows = Set(records.map(\.window)).union(entries.values.map(\.window))
+            for token in numbers.split(separator: ",") {
+                guard let number = CGWindowID(token.trimmingCharacters(in: .whitespaces)) else { logger.log("url: invalid wid"); return }
+                let matches = windows.filter { WindowServerMatch.windowNumber(for: $0) == number }
+                guard matches.count == 1, let window = matches.first else {
+                    logger.log("url: wid unavailable or ambiguous; use ref from list")
+                    return
+                }
+                wids.append(window.windowID)
+            }
+        }
         let on = (q["on"] ?? "1") != "0"
         logger.log("url: \(url.absoluteString)")
 
@@ -589,7 +597,7 @@ final class PoCController {
             guard wids.count == 1, let x = Double(q["x"] ?? ""), let y = Double(q["y"] ?? ""),
                 let w = Double(q["w"] ?? ""), let h = Double(q["h"] ?? "")
             else {
-                logger.log("url: move needs wid=<one>&x=&y=&w=&h=")
+                logger.log("url: move needs ref=<one>&x=&y=&w=&h=")
                 return
             }
             move(wids[0], to: CGRect(x: x, y: y, width: w, height: h))
