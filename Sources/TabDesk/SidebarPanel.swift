@@ -539,13 +539,8 @@ final class SidebarPanel: NSPanel {
         guard let box = sender.representedObject as? WindowRecordBox,
             let tabID = manager.engine.activeTabID(on: displayID)  // v4: 自画面のアクティブタブへ
         else { return }
-        Task { [manager, logger] in
-            do {
-                try await manager.register(box.record, into: tabID)
-            } catch {
-                logger.log("register failed: \(error)")
-                manager.onOperationError?(String(describing: error))
-            }
+        runOperation("register", notify: true) { [manager] in
+            try await manager.register(box.record, into: tabID)
         }
     }
 
@@ -585,12 +580,8 @@ final class SidebarPanel: NSPanel {
     }
 
     private func activate(_ tabID: UUID) {
-        Task { [manager, logger] in
-            do {
-                try await manager.activate(tabID)  // フォーカス連動の抑止つき入口
-            } catch {
-                logger.log("activate failed: \(error)")
-            }
+        runOperation("activate", notify: false) { [manager] in
+            try await manager.activate(tabID)  // フォーカス連動の抑止つき入口
         }
     }
 
@@ -651,13 +642,8 @@ final class SidebarPanel: NSPanel {
     }
 
     private func setLayout(_ tabID: UUID, _ layout: TabLayout) {
-        Task { [manager, logger] in
-            do {
-                try await manager.setTabLayout(tabID, layout)
-            } catch {
-                logger.log("setTabLayout failed: \(error)")
-                manager.onOperationError?(String(describing: error))
-            }
+        runOperation("setTabLayout", notify: true) { [manager] in
+            try await manager.setTabLayout(tabID, layout)
         }
     }
 
@@ -672,31 +658,33 @@ final class SidebarPanel: NSPanel {
 
     /// ウィンドウを一覧内で 1 つ上/下へ移動する(columns の列順)。範囲外は Core が弾く。
     private func moveWindow(_ id: UUID, offset: Int) {
-        Task { [manager, logger] in
-            do {
-                try await manager.moveWindow(id, offset: offset)
-            } catch {
-                logger.log("moveWindow failed: \(error)")
-            }
+        runOperation("moveWindow", notify: false) { [manager] in
+            try await manager.moveWindow(id, offset: offset)
         }
     }
 
     private func delete(_ tabID: UUID) {
-        Task { [manager, logger] in
-            do {
-                try await manager.deleteTab(tabID)  // Core 削除と AX 資源の清掃をまとめて行う
-            } catch {
-                logger.log("delete failed: \(error)")
-            }
+        runOperation("delete", notify: false) { [manager] in
+            _ = try await manager.deleteTab(tabID)  // Core 削除と AX 資源の清掃をまとめて行う
         }
     }
 
     private func unregister(_ id: UUID) {
+        runOperation("unregister", notify: false) { [manager] in
+            _ = try await manager.unregister(id)
+        }
+    }
+
+    /// タブ・窓の非同期操作を実行し、失敗をログに残す。`notify` が true なら利用者にも知らせる。
+    private func runOperation(
+        _ label: String, notify: Bool, _ operation: @escaping @MainActor () async throws -> Void
+    ) {
         Task { [manager, logger] in
             do {
-                try await manager.unregister(id)
+                try await operation()
             } catch {
-                logger.log("unregister failed: \(error)")
+                logger.log("\(label) failed: \(error)")
+                if notify { manager.onOperationError?(String(describing: error)) }
             }
         }
     }

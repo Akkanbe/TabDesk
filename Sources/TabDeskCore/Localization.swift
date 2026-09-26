@@ -58,7 +58,6 @@ public enum L10n {
         case occupiedMerge
         case cannotMerge
         case tilesTooSmall
-        case tileOperationFailed
         case tileTabUnavailable
         case tileSuffix
         case windowOperationFailed
@@ -178,12 +177,20 @@ public enum L10n {
         return Bundle.module
     }()
 
-    static func bundle(for language: AppLanguage) -> Bundle {
+    /// 行の描画ごとに何十回も呼ばれるので、lproj の探索は言語ごとに 1 回だけ行う。
+    private static let languageBundles: [AppLanguage: Bundle] = Dictionary(
+        uniqueKeysWithValues: AppLanguage.allCases.map { ($0, loadBundle(for: $0)) })
+
+    private static func loadBundle(for language: AppLanguage) -> Bundle {
         guard let url = resourceBundle.url(forResource: language.rawValue, withExtension: "lproj"),
               let bundle = Bundle(url: url) else {
             preconditionFailure("Missing localization resources: \(language.rawValue)")
         }
         return bundle
+    }
+
+    static func bundle(for language: AppLanguage) -> Bundle {
+        languageBundles[language] ?? loadBundle(for: language)
     }
 
     public static func text(_ key: Key, _ arguments: CVarArg...) -> String {

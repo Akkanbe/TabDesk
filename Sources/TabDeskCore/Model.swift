@@ -206,11 +206,6 @@ public struct WorkspaceState: Codable, Sendable, Hashable {
         tabs.filter { ($0.displayID ?? primaryID) == displayID }
     }
 
-    /// 指定ディスプレイのアクティブタブ。
-    public func activeTab(on displayID: DisplayID) -> Tab? {
-        activeTabIDs[displayID].flatMap(tab(withID:))
-    }
-
     /// 実ウィンドウ ID から登録情報を引く。
     public func managedWindow(forWindowID windowID: WindowReferenceID) -> (tab: Tab, window: ManagedWindow)? {
         for tab in tabs {

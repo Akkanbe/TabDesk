@@ -135,7 +135,6 @@
 "occupiedMerge" = "Both tiles contain windows. Move one to an empty tile or remove it before merging.";
 "cannotMerge" = "Only sibling tiles can be merged. Merge the nested splits first.";
 "tilesTooSmall" = "Tiles must be at least 40 points wide and high.";
-"tileOperationFailed" = "Could Not Complete the Tile Operation";
 "tileTabUnavailable" = "The tab was removed or switched out of Tiles layout.";
 "tileSuffix" = " — Tiles";
 "windowOperationFailed" = "Could Not Complete the Window Operation";

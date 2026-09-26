@@ -69,8 +69,8 @@ public enum WindowMatcher {
                 if !saved.isEmpty, saved == candidate.title {
                     score += exactTitleScore
                 } else if !saved.isEmpty, !candidate.title.isEmpty,
-                    candidate.title.hasPrefix(saved) || saved.hasPrefix(candidate.title)
-                        || candidate.title.contains(saved) || saved.contains(candidate.title)
+                    // 前方一致は部分一致に含まれる。
+                    candidate.title.contains(saved) || saved.contains(candidate.title)
                 {
                     score += partialTitleScore
                 }

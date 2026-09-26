@@ -1643,9 +1643,8 @@ public final class TabEngine {
                   current.window.windowID == op.windowID, current.window.pid == op.pid,
                   !isDisplayDisconnected(current.window) else { return result }
             let area = display(for: current.window)?.contentArea ?? layout.contentArea
-            let visible = frame.intersection(area)
             // 最小サイズ制約による差は許すが、ほぼ画面外に残った窓を解放成功にしない。
-            let isVisible = !visible.isNull && visible.width >= min(32, frame.width) && visible.height >= min(32, frame.height)
+            let isVisible = Self.isAdequatelyVisible(frame, in: area)
             return OpResult(op: op, actual: isVisible ? frame : nil,
                             error: isVisible ? nil : "window remained outside its content area after release", note: result.note)
         } catch {
@@ -1692,8 +1691,7 @@ public final class TabEngine {
             if result.error == nil, let actual = result.actual, case .restore = result.op.kind,
                let bound = state.managedWindow(id: result.op.managedID) {
                 let area = display(for: bound.window)?.contentArea ?? layout.contentArea
-                let visible = actual.intersection(area)
-                if visible.isNull || visible.width < min(32, actual.width) || visible.height < min(32, actual.height) {
+                if !Self.isAdequatelyVisible(actual, in: area) {
                     result = await settleRestore(result)
                 }
             }
@@ -1761,8 +1759,7 @@ public final class TabEngine {
             case .restore(let requested, _):
                 if let actual = result.actual {
                     let area = display(for: currentBinding.window)?.contentArea ?? layout.contentArea
-                    let visible = actual.intersection(area)
-                    if visible.isNull || visible.width < min(32, actual.width) || visible.height < min(32, actual.height) {
+                    if !Self.isAdequatelyVisible(actual, in: area) {
                         // 書き込みが成功を返しても、退避位置に残った結果は正常な配置として保存しない。
                         failures.append(OperationFailure(managedID: result.op.managedID,
                             message: "window remained outside its content area after restore"))
@@ -1996,6 +1993,13 @@ public final class TabEngine {
     /// 窓が属するディスプレイ。未記録(nil = v1 データ)や切断中は主ディスプレイに fallback する。
     /// 注意: 呼び手は先に isDisplayDisconnected を確認すること。ここでの主 fallback が正当なのは
     /// nil(= 主の意味)の場合だけで、切断中の窓に使うと「主の領域へ clamp」してしまう。
+    /// 窓がコンテンツ領域内に十分見えているか(32pt 四方以上。窓自体がそれより小さければ全体)。
+    /// 退避位置(画面の隅)に残った窓を配置成功と誤認しないための判定。
+    static func isAdequatelyVisible(_ frame: CGRect, in area: CGRect) -> Bool {
+        let visible = frame.intersection(area)
+        return !visible.isNull && visible.width >= min(32, frame.width) && visible.height >= min(32, frame.height)
+    }
+
     private func display(for window: ManagedWindow) -> DisplayLayout? {
         layout.display(id: window.displayID) ?? layout.primaryDisplay
     }

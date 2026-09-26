@@ -19,10 +19,7 @@ public enum WindowServerMatch {
     static func match(_ id: WindowReferenceID, references: [Reference], candidates: [Candidate], requireTitleMatch: Bool = true) -> CGWindowID? {
         func agrees(_ reference: Reference, _ candidate: Candidate) -> Bool {
             guard reference.pid == candidate.pid,
-                  abs(reference.frame.minX - candidate.frame.minX) <= 1,
-                  abs(reference.frame.minY - candidate.frame.minY) <= 1,
-                  abs(reference.frame.width - candidate.frame.width) <= 1,
-                  abs(reference.frame.height - candidate.frame.height) <= 1 else { return false }
+                  ScreenGeometry.approximatelyEqual(reference.frame, candidate.frame, tolerance: 1) else { return false }
             if requireTitleMatch, let a = reference.title, let b = candidate.title, !a.isEmpty, !b.isEmpty { return a == b }
             return true
         }

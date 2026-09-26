@@ -67,10 +67,6 @@ public final class AXWindowDriver: WindowDriver {
         windows.withValue { $0[windowID] }?.retireReference()
     }
 
-    public func knows(_ windowID: WindowReferenceID) -> Bool {
-        windows.withValue { $0[windowID] != nil }
-    }
-
     private func window(_ windowID: WindowReferenceID) throws -> AXWindow {
         guard let w = windows.withValue({ $0[windowID] }) else {
             throw WindowDriverError.unknownWindow(windowID)

@@ -958,7 +958,7 @@ final class WindowManager {
         }
     }
 
-    /// 登録・紐付けが失敗したとき、他に使い手のない observer を片付ける。
+    /// 登録・紐付けの失敗時や窓の破棄後に、他に使い手のない observer を片付ける。
     private func dropObserverIfUnused(pid: pid_t) {
         guard observerIsUnused(pid: pid) else { return }
         observers[pid]?.invalidate()
@@ -982,23 +982,20 @@ final class WindowManager {
 
     private func handle(notification: String, element: AXUIElement, pid: pid_t) {
         guard !isTerminating else { return }
+        // 壊れた要素からは ID が取れないので、どの通知も登録時の要素と比較して引く。
+        guard let windowID = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) })?.key
+        else { return }
         switch notification {
         case kAXWindowMovedNotification, kAXWindowResizedNotification:
-            guard let entry = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) }) else { return }
-            let wid = entry.key
-            engine.windowFrameDidChange(windowID: wid)
+            engine.windowFrameDidChange(windowID: windowID)
         case kAXFocusedWindowChangedNotification:
-            guard let entry = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) }) else { return }
-            let wid = entry.key
-            recordFocusedWindow(wid)
+            recordFocusedWindow(windowID)
         case kAXUIElementDestroyedNotification:
-            // 壊れた要素からは ID が取れないので、登録時の要素と比較する。
-            guard let entry = elements.first(where: { $0.value.pid == pid && CFEqual($0.value.element, element) }) else { return }
             // アプリごと終了した場合は除去せず「未復元」として保持する(再起動後に自動で戻す)。
             let appTerminated = NSRunningApplication(processIdentifier: pid)?.isTerminated ?? true
-            driver.retireReference(entry.key)
-            engine.noteWindowDestroyed(windowID: entry.key, appTerminated: appTerminated)
-            forgetWindow(entry.key)
+            driver.retireReference(windowID)
+            engine.noteWindowDestroyed(windowID: windowID, appTerminated: appTerminated)
+            forgetWindow(windowID)
         default:
             break
         }
@@ -1009,11 +1006,7 @@ final class WindowManager {
         guard let entry = elements.removeValue(forKey: windowID) else { return }
         observers[entry.pid]?.removeNotification(kAXUIElementDestroyedNotification, element: entry.element)
         // 同じ pid の登録/紐付けが await 中なら observer を残す(捨てると後から commit した窓が通知なしになる)。
-        if observerIsUnused(pid: entry.pid) {
-            observers[entry.pid]?.invalidate()
-            observers.removeValue(forKey: entry.pid)
-            focusPollingPIDs.remove(entry.pid)
-        }
+        dropObserverIfUnused(pid: entry.pid)
     }
 
     // MARK: - ポーリングと NSWorkspace
