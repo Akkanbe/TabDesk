@@ -39,8 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.messageText = L10n.text(.windowOperationFailed)
             alert.informativeText = message
             alert.addButton(withTitle: L10n.text(.close))
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
+            alert.runModalInFront()
         }
         manager.onSaveStatusChanged = { [weak self] in self?.updateSaveStatus() }
         updateSaveStatus()
@@ -342,8 +341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: L10n.text(.close))
         alert.addButton(withTitle: L10n.text(.openSaveFolder))
         if manager.canRetrySave { alert.addButton(withTitle: L10n.text(.retry)) }
-        NSApp.activate(ignoringOtherApps: true)
-        switch alert.runModal() {
+        switch alert.runModalInFront() {
         case .alertSecondButtonReturn:
             NSWorkspace.shared.open(manager.store.fileURL.deletingLastPathComponent())
         case .alertThirdButtonReturn:
@@ -359,7 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let alert = NSAlert()
             alert.messageText = L10n.text(.hotkeyApplyError)
             alert.informativeText = errors.joined(separator: "\n")
-            alert.runModal()
+            alert.runModalInFront()
         }
     }
 
@@ -385,8 +383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func presentWindowRecovery(status: String? = nil) {
         guard !manager.isTerminating else { return }
         let alert = WindowRecoveryGuide.alert(status: status)
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertSecondButtonReturn { showSidebar() }
+        if alert.runModalInFront() == .alertSecondButtonReturn { showSidebar() }
     }
 
     @objc private func retryWindowSearch() {
@@ -540,6 +537,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let area = manager.layout.contentArea
             let cocoaRect = NSRect(
                 x: area.minX, y: (NSScreen.screens.first?.frame.height ?? 0) - area.minY - 200, width: 300, height: 200)
+            probeWindow?.orderOut(nil)  // 連続実行で前の窓を取り残さない
             let probe = NSWindow(contentRect: cocoaRect, styleMask: [.borderless], backing: .buffered, defer: false)
             probe.backgroundColor = .systemRed
             probe.level = .floating
@@ -547,10 +545,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             probe.orderFrontRegardless()
             probeWindow = probe
             logger.log("probe: red window at cocoa=\(probe.frame) cg=\(cgBounds(CGWindowID(probe.windowNumber)).map { "\($0)" } ?? "?")")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self, weak probe] in
                 MainActor.assumeIsolated {
-                    self?.probeWindow?.orderOut(nil)
-                    self?.probeWindow = nil
+                    // 後から出した窓を前のタイマーが早く消さないよう、自分が出した窓だけ片付ける。
+                    guard let self, let probe, self.probeWindow === probe else { return }
+                    probe.orderOut(nil)
+                    self.probeWindow = nil
                 }
             }
         case "dump":

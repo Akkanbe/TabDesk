@@ -24,6 +24,17 @@ struct TilePlacementIssuesTests {
         #expect(afterRemoval.isEmpty)
     }
 
+    /// 同じタイル番号・同名の窓が複数あっても、問題窓が一覧から消えない。
+    @Test func duplicateIssueTitlesAreAllListed() {
+        _ = NSApplication.shared
+        let issues = [TilePlacementIssue(windowID: UUID(), tileID: UUID(), tileNumber: 1, windowName: "App — Document"),
+                      TilePlacementIssue(windowID: UUID(), tileID: UUID(), tileNumber: 1, windowName: "App — Document")]
+        let view = TilePlacementIssuesView()
+        view.update(issues, canSelect: true)
+        #expect(view.picker.numberOfItems == 2)
+        #expect(view.picker.itemArray.compactMap { $0.representedObject as? UUID } == issues.map(\.windowID))
+    }
+
     @Test func issueSelectionSurvivesTranslationAndRecoveryRemovesRows() throws {
         _ = NSApplication.shared
         let issues = [TilePlacementIssue(windowID: UUID(), tileID: UUID(), tileNumber: 1, windowName: "App — Document"),

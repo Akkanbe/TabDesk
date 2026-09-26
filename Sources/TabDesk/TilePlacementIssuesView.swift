@@ -67,9 +67,11 @@ final class TilePlacementIssuesView: NSStackView {
         picker.setAccessibilityLabel(L10n.text(.tileIssuesTitle, String(issues.count)))
         picker.removeAllItems()
         for issue in issues {
-            picker.addItem(withTitle: issue.title)
-            picker.lastItem?.representedObject = issue.windowID
-            picker.lastItem?.toolTip = issue.title
+            // addItem(withTitle:) は同名項目を置き換えるため、同名の問題窓は NSMenu に直接追加する。
+            let item = NSMenuItem(title: issue.title, action: nil, keyEquivalent: "")
+            item.representedObject = issue.windowID
+            item.toolTip = issue.title
+            picker.menu?.addItem(item)
             if issue.windowID == selection { picker.selectItem(at: picker.numberOfItems - 1) }
         }
         selectionChanged()

@@ -233,7 +233,7 @@ final class HotkeySettingsController: NSWindowController, NSWindowDelegate {
             let alert = NSAlert()
             alert.messageText = L10n.text(.resumeFailed)
             alert.informativeText = issues.joined(separator: "\n") + L10n.text(.resumeHelp)
-            alert.runModal()
+            alert.runModalInFront()
         }
     }
 

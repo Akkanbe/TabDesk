@@ -1486,6 +1486,26 @@ struct VanishedWindowTests {
         #expect(engine.state.managedWindow(id: managed.id)?.window.windowID == 2, "must not be removed after rebinding")
     }
 
+    /// 猶予中の bind が place で失敗したら消滅保留へ戻し、猶予経過で通常どおり除去する。
+    /// (以前は保留が失われ、閉じた窓のエントリが未紐付けのまま残り続けた)
+    @Test func failedRebindDuringGraceKeepsTheVanishDecision() async throws {
+        let (engine, driver) = makeEngine()
+        engine.vanishGracePeriod = .milliseconds(30)
+        let a = engine.createTab(name: "A")
+        driver.add(1, frame: content)
+        let managed = try await engine.register(windowID: 1, pid: 100, identity: identity("x"), frame: content, into: a.id)
+        driver.kill(1)
+        engine.noteWindowDestroyed(windowID: 1)
+
+        // 窓 2 は既に存在しない(place の読み書きがすべて失敗する)
+        await #expect(throws: (any Error).self) { try await engine.bind(managed.id, windowID: 2, pid: 100) }
+        #expect(engine.state.managedWindow(id: managed.id)?.window.isBound == false)
+
+        try await Task.sleep(for: .milliseconds(60))
+        await engine.reconcile(liveWindowIDs: [99], livePIDs: [100])
+        #expect(engine.state.managedWindow(id: managed.id) == nil, "猶予経過 + アプリ生存 = 閉じられた窓として除去")
+    }
+
     @Test func slowRebindClaimsTheEntryBeforeGraceResolutionCanRemoveIt() async throws {
         let (engine, driver) = makeEngine()
         engine.vanishGracePeriod = .milliseconds(30)

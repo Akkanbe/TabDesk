@@ -145,10 +145,18 @@ public struct Tab: Codable, Sendable, Hashable, Identifiable {
         windows = try c.decode([ManagedWindow].self, forKey: .windows)
         lastFocusedWindowID = try c.decodeIfPresent(UUID.self, forKey: .lastFocusedWindowID)
         layout = (try? c.decode(TabLayout.self, forKey: .layout)) ?? .free
-        tiles = try c.decodeIfPresent(TilePartition.self, forKey: .tiles)
-        try tiles?.validate()
         displayID = try c.decodeIfPresent(DisplayID.self, forKey: .displayID)  // キー無し(v3 以前)= nil = 主
-        if layout == .tiled { try prepareTiles() }
+        // タイル構成が壊れていても、このタブだけ自由配置へ降格して窓を保持する(TabEngine.init と同じ方針)。
+        // throw するとファイル全体が破損扱いになり、他のタブまで失うため。
+        // tiles キーが無い tiled タブは、prepareTiles が列分割を生成する(従来どおり)。
+        do {
+            tiles = try c.decodeIfPresent(TilePartition.self, forKey: .tiles)
+            try tiles?.validate()
+        } catch {
+            tiles = nil
+            if layout == .tiled { layout = .free }
+        }
+        if layout == .tiled, (try? prepareTiles()) == nil { layout = .free }
     }
 }
 

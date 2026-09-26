@@ -54,6 +54,26 @@ struct MigrationTests {
         #expect(migrated.tabs[1].lastFocusedWindowID == w2.id, "窓と同じタブに付いていく")
     }
 
+    /// tiled タブの分割では、兄弟タブへ区画の識別子を共有させず、窓のタイル位置は保つ。
+    @Test func tiledSplitGivesSiblingsFreshTileIDs() throws {
+        let left = UUID(), right = UUID()
+        let tiles = TilePartition.split(id: UUID(), axis: .horizontal, ratio: 0.5, first: .tile(left), second: .tile(right))
+        var w1 = window("a", display: nil); w1.tileID = left
+        var w2 = window("b", display: "second"); w2.tileID = right
+        let tab = Tab(name: "T", windows: [w1, w2], layout: .tiled, tiles: tiles)
+
+        let migrated = WorkspaceState(tabs: [tab]).migratedForPerDisplayTabs(primaryID: primary)
+
+        #expect(migrated.tabs.count == 2)
+        let keeper = migrated.tabs[0], sibling = migrated.tabs[1]
+        #expect(keeper.tiles == tiles, "keeper は元の区画をそのまま持つ")
+        let siblingTiles = try #require(sibling.tiles)
+        #expect(Set(siblingTiles.tileIDs).isDisjoint(with: tiles.tileIDs), "兄弟は区画 ID を共有しない")
+        #expect(siblingTiles.id != tiles.id)
+        #expect(sibling.windows[0].tileID == siblingTiles.tileIDs[1], "右タイルの窓は新しい右タイルへ")
+        #expect(keeper.windows[0].tileID == left)
+    }
+
     @Test func layoutIsCopiedToSiblings() {
         let tab = Tab(name: "T", windows: [window("a", display: nil), window("b", display: "second")], layout: .columns)
         let migrated = WorkspaceState(tabs: [tab]).migratedForPerDisplayTabs(primaryID: primary)

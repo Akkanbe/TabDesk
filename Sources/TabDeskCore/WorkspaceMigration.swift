@@ -58,9 +58,14 @@ extension WorkspaceState {
                 let tabDisplayID: DisplayID? =
                     (key == primaryID && windows.allSatisfy { $0.displayID == nil })
                     ? nil : key
+                // 兄弟タブは区画の識別子を元タブと共有しない(copyWithNewIDs の不変量)。
+                // 窓のタイル割り当ては新しい ID へ付け替えて位置を保つ。
+                var tileMapping: [UUID: UUID] = [:]
+                let tiles = isKeeper ? tab.tiles : tab.tiles?.copyWithNewIDs(mapping: &tileMapping)
                 let normalized = windows.map { window in
                     var w = window
                     w.displayID = tabDisplayID
+                    if !isKeeper { w.tileID = w.tileID.flatMap { tileMapping[$0] } }
                     return w
                 }
                 let containsLastFocused = tab.lastFocusedWindowID.map { id in
@@ -72,7 +77,7 @@ extension WorkspaceState {
                     windows: normalized,
                     lastFocusedWindowID: containsLastFocused ? tab.lastFocusedWindowID : nil,
                     layout: tab.layout,
-                    displayID: tabDisplayID, tiles: tab.tiles))
+                    displayID: tabDisplayID, tiles: tiles))
                 if !isKeeper { suffix += 1 }
             }
         }

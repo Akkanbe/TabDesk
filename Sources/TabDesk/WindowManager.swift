@@ -739,18 +739,21 @@ final class WindowManager {
                 let value, CFGetTypeID(value) == AXUIElementGetTypeID()
             else { return nil }
             let element = unsafeDowncast(value, to: AXUIElement.self)
-            AXUIElementSetMessagingTimeout(element, 1.0)
-            guard let window = try? AXWindow(element: element, pid: pid), window.isStandard,
-                !window.isLayoutSuspended, !window.isMinimized
-            else { return nil }
+            // 要素のタイムアウトは AXWindow.init が設定する。
+            guard let window = try? AXWindow(element: element, pid: pid), window.isStandard else { return nil }
+            // 除外判定と record に同じスナップショットを使う(WindowEnumerator と同じ理由:
+            // 二重に読むと、その間の状態遷移で判定と record が食い違う)。
+            let layoutSuspension = window.layoutSuspension
+            let minimized = window.isMinimized
+            guard layoutSuspension == false, !minimized else { return nil }
             return WindowRecord(
                 window: window,
                 appName: appName,
                 bundleID: bundleID,
                 title: window.title,
                 frame: try? window.frame(),
-                isMinimized: window.isMinimized,
-                layoutSuspension: window.layoutSuspension)
+                isMinimized: minimized,
+                layoutSuspension: layoutSuspension)
         }
         guard !isTerminating, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
         guard let record else {
@@ -767,10 +770,13 @@ final class WindowManager {
             return
         }
         let tabID: UUID
+        let createdTab: Bool
         if let active = engine.activeTabID(on: display.id) {
             tabID = active
+            createdTab = false
         } else {
             tabID = engine.createTab(on: display.id).id
+            createdTab = true
             logger.log("register-focused: created tab on display \(display.id)")
         }
         do {
@@ -778,6 +784,14 @@ final class WindowManager {
             logger.log("register-focused: \(record.appName) — \(record.title)")
         } catch {
             logger.log("register-focused failed: \(error)")
+            // この登録のために作ったタブが空のまま残らないよう片付ける。
+            if createdTab, engine.state.tab(withID: tabID)?.windows.isEmpty == true {
+                do {
+                    try await engine.deleteTab(tabID)
+                } catch {
+                    logger.log("register-focused: could not remove the empty tab: \(error)")
+                }
+            }
             onOperationError?(String(describing: error))
         }
     }

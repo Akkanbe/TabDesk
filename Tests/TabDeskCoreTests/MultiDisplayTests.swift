@@ -291,6 +291,30 @@ struct MultiDisplayTests {
         _ = moving
     }
 
+    /// 移籍先の tiled タブに空きタイルが無ければ移籍せず、元の記録 frame へスナップバックする。
+    /// (以前は何もせず戻っていたため、窓が移動先画面に置き去りになり reconcile が再試行を繰り返した)
+    @Test func crossDisplayDragIntoFullTiledTabSnapsBack() async throws {
+        let (engine, driver, _) = makeEngine()
+        let source = engine.createTab(name: "A", on: "main")
+        let dest = engine.createTab(on: "second")  // 既定 tiled・1 タイル
+        let primaryFrame = CGRect(x: 300, y: 100, width: 500, height: 400)
+        driver.add(1, frame: primaryFrame)
+        driver.add(3, frame: CGRect(x: 2400, y: 200, width: 800, height: 600))
+        let moving = try await engine.register(windowID: 1, pid: 100, identity: identity("m1"), frame: primaryFrame, into: source.id)
+        try await engine.register(windowID: 3, pid: 300, identity: identity("ext"), frame: CGRect(x: 2400, y: 200, width: 800, height: 600), into: dest.id)
+        engine.editMode = true
+
+        driver.moveExternally(1, to: CGRect(x: 2500, y: 300, width: 500, height: 400))
+        engine.windowFrameDidChange(windowID: 1)
+        try await Task.sleep(for: .milliseconds(150))
+
+        let current = try #require(engine.state.managedWindow(id: moving.id))
+        #expect(current.tab.id == source.id, "満杯の tiled タブへは移籍しない")
+        #expect(current.window.frame == primaryFrame, "記録 frame は変えない")
+        #expect(driver.currentFrame(1) == primaryFrame, "実窓は元の位置へ戻す")
+        #expect(engine.state.tab(withID: dest.id)?.windows.count == 1)
+    }
+
     /// columns タブからの画面間ドラッグは移籍せず、列へスナップバックする(列が唯一の正)。
     @Test func crossDisplayDragFromColumnsSnapsBack() async throws {
         let (engine, driver, _) = makeEngine()

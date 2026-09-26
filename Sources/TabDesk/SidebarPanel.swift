@@ -63,10 +63,10 @@ final class SidebarPanel: NSPanel {
     static let alwaysOnTopSetting = PersistedToggle(key: "SidebarAlwaysOnTop", defaultValue: true)
 
     /// true: 常に最前面(他の窓に隠れない)。false: 通常の窓と同じ階層(隠れることがある。メニューバーから再表示)。
+    /// 設定の保存は SidebarController が行う(パネルは表示への反映だけ)。
     var alwaysOnTop: Bool {
         didSet {
             level = alwaysOnTop ? .floating : .normal
-            Self.alwaysOnTopSetting.value = alwaysOnTop
             if alwaysOnTop { orderFrontRegardless() }
         }
     }
@@ -505,6 +505,8 @@ final class SidebarPanel: NSPanel {
             self.isLoadingWindows = false
             sender.title = L10n.text(.addWindow)
             sender.isEnabled = self.manager.engine.activeTabID(on: self.displayID) != nil
+            // 列挙中に画面が外れてパネルが閉じられていたら、消えた画面の座標にメニューを出さない。
+            guard self.isVisible else { return }
             self.presentAddWindowMenu(candidates, unavailableApps: unavailable, anchor: sender)
         }
     }
@@ -552,7 +554,7 @@ final class SidebarPanel: NSPanel {
         Task { [weak self, weak anchor] in
             guard let self else { return }
             let candidates = await self.manager.availableWindows()
-            guard let anchor else { return }
+            guard let anchor, self.isVisible else { return }  // 列挙中に閉じられたパネルには出さない
             self.presentAssignMenu(candidates, for: window, anchor: anchor)
         }
     }

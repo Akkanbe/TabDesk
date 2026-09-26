@@ -100,8 +100,12 @@ final class SidebarController: NSObject {
     }
 
     /// 「常に最前面」を全パネルへ反映する(設定は共有)。
+    /// 保存はここで 1 回だけ行う。パネルが 0 枚(画面構成の変化中など)でも切り替えを失わない。
     var alwaysOnTop: Bool {
         get { SidebarPanel.alwaysOnTopSetting.value }
-        set { panels.values.forEach { $0.alwaysOnTop = newValue } }
+        set {
+            SidebarPanel.alwaysOnTopSetting.value = newValue
+            panels.values.forEach { $0.alwaysOnTop = newValue }
+        }
     }
 }

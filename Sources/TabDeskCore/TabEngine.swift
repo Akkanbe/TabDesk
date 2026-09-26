@@ -526,12 +526,13 @@ public final class TabEngine {
                 }
                 return
             }
+            // 消滅判定の猶予中に新しい窓への紐付けを開始した場合、place の IPC 待ち中に
+            // resolveVanished が entry を削除しないよう、この時点で古い消滅保留を取り消す
+            // (clearRuntimeTracking が消す)。place が失敗したら下の catch で戻す。
+            let pendingVanish = vanished[id]
             // fullscreen / park は実ウィンドウとの binding 固有の状態。前の binding の残骸を
             // 新しい窓へ持ち越さない。
             clearRuntimeTracking(for: id)
-            // 消滅判定の猶予中に新しい窓への紐付けを開始した場合、place の IPC 待ち中に
-            // resolveVanished が entry を削除しないよう、この時点で古い消滅保留を取り消す。
-            vanished.removeValue(forKey: id)
             let intoActive = isActiveTab(found.tab)
             let requestedFrame: CGRect
             let frame: CGRect
@@ -548,9 +549,19 @@ public final class TabEngine {
                 // 退避先も窓のディスプレイの隅。
                 let recorded = clamped(found.window.frame, for: found.window)
                 requestedFrame = recorded
-                let outcome = try await place(
-                    windowID: windowID, frame: recorded, intoActive: intoActive,
-                    parkPoint: parkPoint(for: found.window))
+                let outcome: PlacementOutcome
+                do {
+                    outcome = try await place(
+                        windowID: windowID, frame: recorded, intoActive: intoActive,
+                        parkPoint: parkPoint(for: found.window))
+                } catch {
+                    // 紐付けに失敗した entry を消滅保留へ戻す。戻さないと閉じた窓の entry が
+                    // 未紐付けのまま resolveVanished の対象外になり、残り続ける。
+                    if let pendingVanish, state.managedWindow(id: id)?.window.isBound == false {
+                        vanished[id] = pendingVanish
+                    }
+                    throw error
+                }
                 switch outcome {
                 case .placed(let actual):
                     frame = actual
@@ -1179,7 +1190,9 @@ public final class TabEngine {
         let target = clamped(current, in: area)
         if approximatelyEqual(target, current) {
             if crossDisplay, let display {
-                await reassignForEditedCrossDisplayMove(id: id, to: display, frame: current, appName: appName)
+                if await !reassignForEditedCrossDisplayMove(id: id, to: display, frame: current, appName: appName) {
+                    await snapBackRejectedMove(windowID: windowID, to: found.window.frame, appName: appName)
+                }
             } else {
                 updateFrame(id, current)
                 log("edit: recorded \(current) for \(appName)")
@@ -1201,7 +1214,9 @@ public final class TabEngine {
                 display.map({ layout.display(id: $0.id) != nil }) ?? true
             else { return }
             if crossDisplay, let display {
-                await reassignForEditedCrossDisplayMove(id: id, to: display, frame: actual, appName: appName)
+                if await !reassignForEditedCrossDisplayMove(id: id, to: display, frame: actual, appName: appName) {
+                    await snapBackRejectedMove(windowID: windowID, to: rebound.window.frame, appName: appName)
+                }
             } else {
                 updateFrame(id, actual)
                 log("edit: nudged into content area and recorded \(actual) for \(appName)")
@@ -1220,9 +1235,10 @@ public final class TabEngine {
     /// removeFromState / clearRuntimeTracking を**通らない**移動なので、binding・vanished 猶予・
     /// 復元世代・parked/fullscreen 状態は生きた窓と一緒に保たれる。
     /// 呼び出しは performRestore の直列区間内(前提の再検証は呼び手が済ませている)。
+    /// 移籍できなかった場合は false を返す。窓は移動先画面に居るので、呼び手がスナップバックする。
     private func reassignForEditedCrossDisplayMove(
         id: UUID, to display: DisplayLayout, frame: CGRect, appName: String
-    ) async {
+    ) async -> Bool {
         let destTab: Tab
         if let activeID = activeTabID(on: display.id), let tab = state.tab(withID: activeID) {
             destTab = tab
@@ -1230,16 +1246,16 @@ public final class TabEngine {
             // 自由配置の窓をドラッグして作る移籍先は、掴んだ窓の自由配置を引き継ぐ。
             destTab = createTab(on: display.id, layout: .free)
         }
-        guard let source = windowLocation(of: id) else { return }
+        guard let source = windowLocation(of: id) else { return false }
         let sourceTab = state.tabs[source.tabIndex]
         guard sourceTab.id != destTab.id, let destIndex = state.tabs.firstIndex(where: { $0.id == destTab.id })
-        else { return }
+        else { return false }
         let destinationTile: UUID?
         if destTab.layout == .tiled {
             let occupied = Set(destTab.windows.compactMap(\.tileID))
             guard let empty = destTab.tiles?.tileIDs.first(where: { !occupied.contains($0) }) else {
-                log("edit: destination has no empty tile; keeping source assignment")
-                return
+                log("edit: destination has no empty tile; snapping back")
+                return false
             }
             destinationTile = empty
         } else { destinationTile = nil }
@@ -1255,12 +1271,22 @@ public final class TabEngine {
         next.tabs[destIndex].lastFocusedWindowID = id  // ユーザーが掴んでいる窓
         state = next
         log("edit: moved \(appName) to display \(display.id) → tab \(destTab.name)")
-        // columns は両側で組み直す(直列区間内なので直接呼べる)。
-        if sourceTab.layout != .free {
-            await retileUnlocked(sourceTab.id)
-        }
-        if state.tabs[destIndex].layout != .free {
-            await retileUnlocked(destTab.id)
+        // columns は両側で組み直す(直列区間内なので直接呼べる)。free の判定は retileUnlocked が行う。
+        // 1 回目の await 中に UI からタブの挿入・並べ替えが入り得るので、index ではなく ID で渡す。
+        await retileUnlocked(sourceTab.id)
+        await retileUnlocked(destTab.id)
+        return true
+    }
+
+    /// 移籍を断った画面間ドラッグの窓を、元の画面の記録 frame へ戻す。
+    /// 戻さないと窓が移動先画面に残り、reconcile が同じ移籍失敗を繰り返す。
+    private func snapBackRejectedMove(windowID: WindowReferenceID, to recorded: CGRect, appName: String) async {
+        let driver = self.driver
+        do {
+            let actual = try await executor.run { try driver.setFrame(recorded, of: windowID) }
+            log("edit: snapped \(appName) back to \(actual)")
+        } catch {
+            log("edit: could not snap \(appName) back: \(error)")
         }
     }
 

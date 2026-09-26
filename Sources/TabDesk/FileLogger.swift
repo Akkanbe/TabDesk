@@ -30,6 +30,8 @@ final class FileLogger: @unchecked Sendable {
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
+        // 固定書式のログはユーザーのロケール(アラビア数字以外・12 時間制など)に左右させない。
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "HH:mm:ss.SSS"
         return f
     }()

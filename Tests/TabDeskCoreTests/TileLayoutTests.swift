@@ -108,6 +108,34 @@ struct TileLayoutTests {
         #expect(tab.representativeWindow == nil)
     }
 
+    /// 壊れたタイル構成のタブは自由配置へ降格して読む。ファイル全体を破損扱いにしない。
+    @Test func invalidTilesDegradeOnlyThatTabToFree() throws {
+        let broken = Tab(name: "Broken", windows: [window()], layout: .tiled,
+                         tiles: .split(id: UUID(), axis: .vertical, ratio: .nan, first: .tile(UUID()), second: .tile(UUID())))
+        let healthy = Tab(name: "Healthy", windows: [window()], layout: .columns)
+        // JSONEncoder は NaN を書けないので、有効な比率で書いてから文字列置換で壊す。
+        var encodable = broken
+        encodable.tiles = .split(id: UUID(), axis: .vertical, ratio: 0.5, first: .tile(UUID()), second: .tile(UUID()))
+        let json = String(decoding: try JSONEncoder().encode(WorkspaceState(tabs: [encodable, healthy])), as: UTF8.self)
+            .replacingOccurrences(of: "\"ratio\":0.5", with: "\"ratio\":2")
+        #expect(json.contains("\"ratio\":2"))
+
+        let decoded = try JSONDecoder().decode(WorkspaceState.self, from: Data(json.utf8))
+        #expect(decoded.tabs.count == 2)
+        #expect(decoded.tabs[0].layout == .free)
+        #expect(decoded.tabs[0].tiles == nil)
+        #expect(decoded.tabs[0].windows.count == 1, "窓は失わない")
+        #expect(decoded.tabs[1].layout == .columns, "他のタブは影響を受けない")
+    }
+
+    /// tiles キーの無い tiled タブは、従来どおり列分割を生成して tiled のまま読む。
+    @Test func tiledTabWithoutTilesKeyStillGetsColumns() throws {
+        let tab = Tab(name: "T", windows: [window(), window()], layout: .tiled)
+        let decoded = try JSONDecoder().decode(Tab.self, from: JSONEncoder().encode(tab))
+        #expect(decoded.layout == .tiled)
+        #expect(decoded.tiles?.tileIDs.count == 2)
+    }
+
     @Test func layoutRoundTripsThroughCoding() throws {
         let tab = Tab(name: "Tiled", windows: [window()], layout: .columns)
         let data = try JSONEncoder().encode(tab)
